@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // Day-0 Debian Node Bootstrap Script
-# Path: riscv-data-kit/bootstrap-debian.sh
+# Path: riscv-data-kit/os/bootstrap-debian.sh
 # Description: Idempotent user creation, group assignment, passwordless sudo,
 #              UTF-8 locale, and hostname configuration for Debian nodes.
 #
@@ -225,31 +225,41 @@ if [[ -n "$TARGET_HOSTNAME" ]]; then
     fi
 fi
 
-# ------------------------------------------------------------------------------
-# CVE-2026-98432 Kernel IPv4 TCP RCU Use-After-Free Mitigation
-# ------------------------------------------------------------------------------
-echo ">>> [SECURITY] Converging CVE-2026-98432 TCP option filter & MPTCP lockdown..."
-cat << 'SYSCTL_EOF' > /etc/sysctl.d/99-cve-2026-98432-tcp.conf
-net.mptcp.enabled = 0
-net.ipv4.tcp_migrate_req = 0
+# ==============================================================================
+# 4. CVE-2026-98432 KERNEL IPv4 TCP RCU USE-AFTER-FREE MITIGATION
+# ==============================================================================
+SYSCTL_CVE_FILE="/etc/sysctl.d/99-cve-2026-98432-tcp.conf"
+NFT_CVE_FILE="/etc/nftables.d/cve-2026-98432.nft"
+UNIT_CVE_FILE="/etc/systemd/system/cve-2026-98432-guard.service"
+
+if [[ -f "$SYSCTL_CVE_FILE" && -f "$NFT_CVE_FILE" && -f "$UNIT_CVE_FILE" ]] \
+   && systemctl is-active --quiet cve-2026-98432-guard.service \
+   && nft list table ip cve_2026_98432 >/dev/null 2>&1; then
+    log_skip "CVE-2026-98432 TCP option filter & MPTCP lockdown already active"
+else
+    log_info "Converging CVE-2026-98432 TCP option filter & MPTCP lockdown..."
+
+    cat << 'SYSCTL_EOF' > "$SYSCTL_CVE_FILE"
+-net.mptcp.enabled = 0
+-net.ipv4.tcp_migrate_req = 0
 SYSCTL_EOF
-sysctl --system >/dev/null
+    sysctl --system >/dev/null
 
-if ! command -v nft >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables
-fi
+    if ! command -v nft >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq nftables
+    fi
 
-mkdir -p /etc/nftables.d
-cat << 'NFT_EOF' > /etc/nftables.d/cve-2026-98432.nft
+    mkdir -p /etc/nftables.d
+    cat << 'NFT_EOF' > "$NFT_CVE_FILE"
 add table ip cve_2026_98432
 flush table ip cve_2026_98432
 add chain ip cve_2026_98432 pre { type filter hook prerouting priority -300; policy accept; }
 add rule ip cve_2026_98432 pre meta l4proto tcp ip hdrlength gt 5 counter drop
 NFT_EOF
 
-nft -f /etc/nftables.d/cve-2026-98432.nft
+    nft -f "$NFT_CVE_FILE"
 
-cat << 'UNIT_EOF' > /etc/systemd/system/cve-2026-98432-guard.service
+    cat << 'UNIT_EOF' > "$UNIT_CVE_FILE"
 [Unit]
 Description=CVE-2026-98432 IPv4 TCP Options Raw Prerouting Drop Guard
 DefaultDependencies=no
@@ -265,8 +275,10 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 UNIT_EOF
 
-systemctl daemon-reload
-systemctl enable --now cve-2026-98432-guard.service >/dev/null
+    systemctl daemon-reload
+    systemctl enable --now cve-2026-98432-guard.service >/dev/null
+    log_ok "Configured CVE-2026-98432 raw prerouting drop guard and MPTCP lockdown"
+fi
 
 # ----------------------------------------------------------------------------------
 log_info "Day-0 Debian bootstrap complete. Node is pregamed and ready for forge.sh."
