@@ -203,6 +203,8 @@ if [[ "$DEBLOAT_UBUNTU" == "true" ]]; then
     # 3.1 Lock boot target to headless console
     if [[ "$(systemctl get-default)" != "multi-user.target" ]]; then
         systemctl set-default multi-user.target
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
         systemctl stop gdm3 2>/dev/null || true
         log_ok "Boot target set to headless multi-user.target"
     else
