@@ -1,6 +1,6 @@
 <div align="center">
 
-# riscv-data-kit
+# RVDK // riscv-data-kit
 
 **Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection & Kernel Tuning Toolkit for RISC-V Data Engineering and Edge ML Systems.**
 
