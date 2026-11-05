@@ -1,9 +1,9 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/drewv-labs/riscv-data-kit/main/.github/images/rvdk-banner.svg" alt="RVDK Banner" width="220"/>
+  <img src="https://raw.githubusercontent.com/drewv-labs/riscv-data-kit/main/.github/images/rvdk-banner.svg" alt="RVDK Banner" width="100%"/>
 
-**Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection & Kernel Tuning Toolkit for  
-[RISC-V](https://riscv.org/) Data Engineering and Edge ML Systems.**
+  **Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection & Kernel Tuning Toolkit for  
+  [RISC-V](https://riscv.org/) Data Engineering and Edge ML Systems.**
 
 </div>
 
