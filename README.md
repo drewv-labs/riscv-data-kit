@@ -99,7 +99,7 @@ sudo ./starfive/visionfive2/flash-sd.sh --device /dev/sdX --image /path/to/starf
 
 ## Links!  
 
-[RISC-V Internationl](https://riscv.org/)  
+[RISC-V International](https://riscv.org/)  
 [RISC-V Summit North America 2027](https://riscvnasummit.com/2027)  
 [RISE Project](https://riseproject.dev/)  
 
