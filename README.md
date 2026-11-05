@@ -4,7 +4,8 @@
 
 # RVDK // riscv-data-kit
 
-**Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection & Kernel Tuning Toolkit for RISC-V Data Engineering and Edge ML Systems.**
+**Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection & Kernel Tuning Toolkit for  
+[RISC-V](https://riscv.org/) Data Engineering and Edge ML Systems.**
 
 </div>
 
@@ -16,7 +17,7 @@ The `riscv-data-kit` (RVDK) transforms out-of-the-box `riscv64` single-board com
 
 ## Architectural Overview
 
-Vendor [RISC-V](https://riscv.org/) OS images frequently ship with desktop GUI bloat, aggressive background timers, locked hardware performance counters, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard package upgrades. `RVDK` decouples Day-0 bring-up into two strictly idempotent layers:
+Vendor RISC-V OS images frequently ship with desktop GUI bloat, aggressive background timers, locked hardware performance counters, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard package upgrades. `RVDK` decouples Day-0 bring-up into two strictly idempotent layers:
 
 1. **Layer 1 — OS Normalization (`os/`):** Converges Debian and Ubuntu root filesystems into lean, headless server baselines (`multi-user.target`). Configures operator identity, `NOPASSWD` sudoers, deterministic locales (`en_US.UTF-8`), Ubuntu `snapd` and GNOME eradication with APT pin locks, and raw `nftables` prerouting plus `sysctl` kernel network hardening (`CVE-2026-98432` IPv4 option drop and MPTCP lockdown).
 2. **Layer 2 — Silicon & BSP Hardening (`<vendor>/<board>/`):** Applies SoC-specific bootloader and kernel protections (`--force-confdef` / `--force-confold` for vendor `extlinux` and DTB preservation), masks unstable SoC sleep targets, configures active PWM thermal control, and unlocks L1/L2/L3 hardware PMU counters (`kernel.perf_event_paranoid = -1`) for cycle-accurate profiling.
