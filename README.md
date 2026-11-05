@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="./.github/images/RISC-V-logo.png" alt="RISC-V Logo" width="400">
-
-# RVDK // riscv-data-kit
+<img src=".github/images/rvdk-banner.svg" alt="RVDK // riscv-data-kit Banner" width="100%" />
 
 **Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection & Kernel Tuning Toolkit for  
 [RISC-V](https://riscv.org/) Data Engineering and Edge ML Systems.**
@@ -95,16 +93,20 @@ sudo ./starfive/visionfive2/flash-sd.sh --device /dev/sdX --image /path/to/starf
 * **Cycle-Accurate PMU Readiness:** Exposes hardware performance counters (`cycles`, `instructions`, `L1-dcache-load-misses`, `dTLB-load-misses`) out of the box for `perf stat` and distributed telemetry agents.
 * **Zero-Bloat Execution Profile:** Strips desktop compositors, crash reporters, and background package timers to eliminate OS scheduling jitter during microarchitectural and database benchmarks.
 
----  
+---
 
-## Links!  
+## Ecosystem & Community Links
 
-[RISC-V Internationl](https://riscv.org/)  
-[RISC-V Summit North America 2027](https://riscvnasummit.com/2027)  
-[RISE Project](https://riseproject.dev/)  
+* [RISC-V International](https://riscv.org/)
+* [RISC-V Summit North America 2027](https://riscv.org/event/risc-v-summit-north-america/)
+* [RISE Project (RISC-V Software Ecosystem)](https://riseproject.dev/)
+* [PostgreSQL](https://www.postgresql.org/)
+* [PostgreSQL 18.6 Release Notes (io_uring)](https://www.postgresql.org/docs/18/release-18-6.html)
 
-[PostgreSQL](https://www.postgresql.org/)  
-[PostgreSQL 18.6 Release Notes (io_uring)](https://www.postgresql.org/docs/release/18.6/)
+---
+
+###### Trademarks & Non-Affiliation Notice
+> **`riscv-data-kit` (RVDK)** is an independent open-source project developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **StarFive**, or **Milk-V**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
 
 ---
 

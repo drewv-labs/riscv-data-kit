@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="100%">
+  <defs>
+    <linearGradient id="drewv-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0342ff" />
+      <stop offset="50%" stop-color="#6803ff" />
+      <stop offset="100%" stop-color="#00E5FF" />
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#161B22" stroke-width="1" />
+    </pattern>
+  </defs>
+
+  <!-- Void Black Substrate + Subtle Silicon Grid -->
+  <rect width="1200" height="320" rx="12" fill="#090A0C" stroke="#21262D" stroke-width="2" />
+  <rect width="1200" height="320" rx="12" fill="url(#grid)" opacity="0.65" />
+
+  <!-- Left & Right PCB Bus Traces -->
+  <g fill="none" stroke-linecap="square" stroke-linejoin="miter" opacity="0.85">
+    <path d="M 0 90 L 140 90 L 180 130 L 260 130" stroke="#0342ff" stroke-width="3" />
+    <path d="M 0 160 L 220 160" stroke="#6803ff" stroke-width="3" />
+    <path d="M 0 230 L 140 230 L 180 190 L 240 190" stroke="#00E5FF" stroke-width="2" />
+    <circle cx="260" cy="130" r="4.5" fill="#0342ff" />
+    <circle cx="220" cy="160" r="4.5" fill="#6803ff" />
+    <circle cx="240" cy="190" r="4" fill="#00E5FF" />
+
+    <path d="M 1200 90 L 1060 90 L 1020 130 L 940 130" stroke="#00E5FF" stroke-width="3" />
+    <path d="M 1200 160 L 980 160" stroke="#6803ff" stroke-width="3" />
+    <path d="M 1200 230 L 1060 230 L 1020 190 L 960 190" stroke="#0342ff" stroke-width="2" />
+    <circle cx="940" cy="130" r="4.5" fill="#00E5FF" />
+    <circle cx="980" cy="160" r="4.5" fill="#6803ff" />
+    <circle cx="960" cy="190" r="4" fill="#0342ff" />
+  </g>
+
+  <!-- Top Lab Provenance Label -->
+  <text x="600" y="68" fill="#8B939C" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="14" font-weight="600" text-anchor="middle" letter-spacing="5">
+    DREW-V LABS // INDIE RESEARCH
+  </text>
+
+  <!-- Primary RVDK Title -->
+  <text x="600" y="158" fill="#FFFFFF" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="60" font-weight="800" text-anchor="middle" letter-spacing="2">
+    RVDK <tspan fill="url(#drewv-grad)">//</tspan> riscv-data-kit
+  </text>
+
+  <!-- Accent Divider -->
+  <rect x="380" y="188" width="440" height="3" rx="1.5" fill="url(#drewv-grad)" />
+
+  <!-- Target Architecture Subtitle -->
+  <text x="600" y="232" fill="#00E5FF" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="15" font-weight="600" text-anchor="middle" letter-spacing="3">
+    RVA20 · RVA22 · RVA23 · DAY-0 BARE-METAL & DATA ENGINEERING
+  </text>
+
+  <!-- Hardware & Kernel Spec Footer -->
+  <text x="600" y="268" fill="#8B939C" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="13" text-anchor="middle" letter-spacing="2">
+    [ BSP GUARD ]   [ PMU UNLOCK ]   [ SV39 HUGEPAGES ]   [ 4KN NVME / IO_URING ]
+  </text>
+</svg>
