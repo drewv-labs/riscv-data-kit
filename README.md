@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="./.github/images/RISC-V-logo.png" alt="RISC-V Logo" width="400">
+
 # RVDK // riscv-data-kit
 
 **Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection & Kernel Tuning Toolkit for RISC-V Data Engineering and Edge ML Systems.**
@@ -8,13 +10,13 @@
 
 ---
 
-`riscv-data-kit` transforms out-of-the-box `riscv64` single-board computers and workstations into deterministic, headless data and inference appliances. It provides vendor-isolated Board Support Package (BSP) guards, hardware Performance Monitoring Unit (PMU) counter exposure, `Sv39` HugePage allocation, PCIe/NVMe storage tuning, and recovery media builders across **SiFive**, **StarFive**, and **Milk-V** silicon.
+The `riscv-data-kit` (RVDK) transforms out-of-the-box `riscv64` single-board computers and workstations into deterministic, headless data and inference appliances. It provides vendor-isolated Board Support Package (BSP) guards, hardware Performance Monitoring Unit (PMU) counter exposure, `Sv39` HugePage allocation, PCIe/NVMe storage tuning, and recovery media builders across **[SiFive](https://www.sifive.com/)**, **[StarFive](https://www.starfivetech.com/en/)**, and **[Milk-V](https://milkv.io/)** silicon with more to come.
 
 ---
 
 ## Architectural Overview
 
-Vendor RISC-V OS images frequently ship with desktop GUI bloat, aggressive background timers, locked hardware performance counters, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard package upgrades. `riscv-data-kit` decouples Day-0 bring-up into two strictly idempotent layers:
+Vendor [RISC-V](https://riscv.org/) OS images frequently ship with desktop GUI bloat, aggressive background timers, locked hardware performance counters, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard package upgrades. `RVDK` decouples Day-0 bring-up into two strictly idempotent layers:
 
 1. **Layer 1 — OS Normalization (`os/`):** Converges Debian and Ubuntu root filesystems into lean, headless server baselines (`multi-user.target`). Configures operator identity, `NOPASSWD` sudoers, deterministic locales (`en_US.UTF-8`), Ubuntu `snapd` and GNOME eradication with APT pin locks, and raw `nftables` prerouting plus `sysctl` kernel network hardening (`CVE-2026-98432` IPv4 option drop and MPTCP lockdown).
 2. **Layer 2 — Silicon & BSP Hardening (`<vendor>/<board>/`):** Applies SoC-specific bootloader and kernel protections (`--force-confdef` / `--force-confold` for vendor `extlinux` and DTB preservation), masks unstable SoC sleep targets, configures active PWM thermal control, and unlocks L1/L2/L3 hardware PMU counters (`kernel.perf_event_paranoid = -1`) for cycle-accurate profiling.
@@ -91,6 +93,17 @@ sudo ./starfive/visionfive2/flash-sd.sh --device /dev/sdX --image /path/to/starf
 * **Vendor BSP & DTB Isolation:** Prevents upstream `apt` kernel upgrades from overwriting board-specific device trees, PCIe ATU mappings, or custom U-Boot bootscripts.
 * **Cycle-Accurate PMU Readiness:** Exposes hardware performance counters (`cycles`, `instructions`, `L1-dcache-load-misses`, `dTLB-load-misses`) out of the box for `perf stat` and distributed telemetry agents.
 * **Zero-Bloat Execution Profile:** Strips desktop compositors, crash reporters, and background package timers to eliminate OS scheduling jitter during microarchitectural and database benchmarks.
+
+---  
+
+## Links!  
+
+[RISC-V Internationl](https://riscv.org/)  
+[RISC-V Summit North America 2027](https://riscvnasummit.com/2027)  
+[RISE Project](https://riseproject.dev/)  
+
+[PostgreSQL](https://www.postgresql.org/)  
+[PostgreSQL 18.6 Release Notes (io_uring)](https://www.postgresql.org/docs/release/18.6/)
 
 ---
 
