@@ -97,17 +97,12 @@ sudo ./starfive/visionfive2/flash-sd.sh --device /dev/sdX --image /path/to/starf
 
 ## Ecosystem & Community Links
 
-<<<<<<< HEAD
 * [RISC-V International](https://riscv.org/)
 * [RISC-V Summit North America 2027](https://riscv.org/event/risc-v-summit-north-america/)
 * [RISE Project (RISC-V Software Ecosystem)](https://riseproject.dev/)
 * [PostgreSQL](https://www.postgresql.org/)
 * [PostgreSQL 18.6 Release Notes (io_uring)](https://www.postgresql.org/docs/18/release-18-6.html)
-=======
-[RISC-V International](https://riscv.org/)  
-[RISC-V Summit North America 2027](https://riscvnasummit.com/2027)  
-[RISE Project](https://riseproject.dev/)  
->>>>>>> 72edc41b8a5ec161d6ab992b366be9914abb74f3
+
 
 ---
 
