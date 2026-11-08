@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# DREW-V Labs // RVDK Universal Bare-Metal Dispatcher & CLI (`rvdk`)
+# Path: riscv-data-kit/forge.sh
+#
+# Usage (One-Shot Curl Day-0 OS + BSP Forge + CLI Install):
+#   curl -fsSL https://rvdk.drewv-labs.dev/forge.sh | sudo bash -s -- --user drew --hostname brakerbench-vf2 --nopasswd
+#
+# Usage (Local CLI after install-cli.sh or forge.sh):
+#   sudo rvdk [day0|bsp|os|postgresql|storage/nvme-4kn|storage/btrfs-raid|mosquitto|nfs-vault|update]
+# ==============================================================================
+set -Eeuo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+    else
+        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/forge.sh | sudo bash" >&2
+        exit 1
+    fi
+fi
+
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
+[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+
+ENGINE_DIR="${REAL_HOME}/.rvdk/engine"
+RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
+
+log_rvdk()  { printf "\033[1;36m[RVDK]\033[0m %s\n" "$1"; }
+log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+
+# 1. Parse subcommand (defaults to "day0" = OS + BSP)
+MODULE="day0"
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        day0|bsp|os|postgresql|postgresql/*|mosquitto|nfs-vault|storage/*|update|self-update)
+            MODULE="$1"
+            shift
+            ;;
+        install)
+            MODULE="${2:-day0}"
+            shift $(( $# >= 2 ? 2 : 1 ))
+            ;;
+    esac
+fi
+
+SOC_PATH="${RVDK_SOC:-}"
+OS_ID="${RVDK_OS:-}"
+FORWARD_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --soc) SOC_PATH="${2:-}"; shift 2 ;;
+        --os)  OS_ID="${2:-}"; shift 2 ;;
+        *)     FORWARD_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# 2. Ensure ~/.rvdk/engine and /usr/local/bin/rvdk are installed
+SCRIPT_SELF="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_SELF" ]]; then
+    SCRIPT_REAL="$(readlink -f "$SCRIPT_SELF" 2>/dev/null || realpath "$SCRIPT_SELF" 2>/dev/null || echo "$SCRIPT_SELF")"
+    CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
+else
+    CANDIDATE_ROOT=""
+fi
+
+if [[ "$MODULE" == "update" || "$MODULE" == "self-update" ]]; then
+    if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
+        exec bash "${CANDIDATE_ROOT}/install-cli.sh"
+    else
+        curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash
+        exit 0
+    fi
+fi
+
+if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
+    LOCAL_ROOT="$CANDIDATE_ROOT"
+    [[ ! -L /usr/local/bin/rvdk ]] && ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/rvdk
+else
+    curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
+    LOCAL_ROOT="$ENGINE_DIR"
+fi
+
+# 3. Auto-detect Silicon SoC from /proc/device-tree/model
+DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+if [[ -z "$SOC_PATH" ]]; then
+    case "$DT_MODEL" in
+        *"Premier P550"*|*"EIC7700"*|*"Megrez"*|*"StarPro64"*)
+            SOC_PATH="eswin/eic7700x" ;;
+        *"VisionFive 2"*|*"JH7110"*|*"Mars"*|*"Star64"*|*"OrangePi RV"*)
+            SOC_PATH="starfive/jh7110" ;;
+        *"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
+            SOC_PATH="spacemit/k3" ;;
+        *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*|*"OrangePi RV2"*|*"OrangePi R2S"*|*"BPI-F3"*)
+            SOC_PATH="spacemit/k1" ;;
+        *"Titan"*|*"DP1000"*)
+            SOC_PATH="ultrarisc/dp1000" ;;
+        *)
+            log_fatal "Unrecognized RISC-V Device Tree: '${DT_MODEL}'. Pass --soc <vendor/soc>." ;;
+    esac
+fi
+
+# 4. Auto-detect OS Distribution from /etc/os-release
+if [[ -z "$OS_ID" ]]; then
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        OS_ID="${ID:-unknown}"
+    else
+        log_fatal "Cannot detect OS: /etc/os-release missing. Pass --os <debian|ubuntu|bianbu>."
+    fi
+fi
+OS_ID="$(tr '[:upper:]' '[:lower:]' <<< "$OS_ID")"
+
+log_rvdk "Target: ${SOC_PATH} (${DT_MODEL}) | OS: ${OS_ID} | Module: ${MODULE}"
+
+resolve_os_script() {
+    local base_dir="$1"
+    for candidate in \
+        "${base_dir}/forge-${OS_ID}.sh" \
+        "${base_dir}/forge_${OS_ID}.sh" \
+        "${base_dir}/bootstrap-${OS_ID}.sh" \
+        "${base_dir}/bootstrap.sh"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 5. Dispatch Module
+case "$MODULE" in
+    day0)
+        # StarFive JH7110 Debian: run BSP repo fix prior to generic OS apt calls
+        if [[ "$SOC_PATH" == "starfive/jh7110" && "$OS_ID" == "debian" ]]; then
+            BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
+            OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
+            log_rvdk "Stage 1/2: Silicon BSP & APT Repo Migration (${BSP_SCRIPT})..."
+            bash "$BSP_SCRIPT" "${FORWARD_ARGS[@]}"
+            log_rvdk "Stage 2/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
+            bash "$OS_SCRIPT" "${FORWARD_ARGS[@]}"
+        else
+            OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
+            BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
+            log_rvdk "Stage 1/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
+            bash "$OS_SCRIPT" "${FORWARD_ARGS[@]}"
+            log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
+            bash "$BSP_SCRIPT" "${FORWARD_ARGS[@]}"
+        fi
+        ;;
+    os)
+        OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
+        exec bash "$OS_SCRIPT" "${FORWARD_ARGS[@]}"
+        ;;
+    bsp)
+        BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
+        exec bash "$BSP_SCRIPT" "${FORWARD_ARGS[@]}"
+        ;;
+    postgresql)
+        exec bash "${LOCAL_ROOT}/postgresql/latest/forge.sh" "${FORWARD_ARGS[@]}"
+        ;;
+    *)
+        TARGET_MOD="${LOCAL_ROOT}/${MODULE}/forge.sh"
+        [[ ! -f "$TARGET_MOD" ]] && log_fatal "Module script not found: ${TARGET_MOD}"
+        exec bash "$TARGET_MOD" "${FORWARD_ARGS[@]}"
+        ;;
+esac
