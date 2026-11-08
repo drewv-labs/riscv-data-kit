@@ -2,19 +2,20 @@
 # ==============================================================================
 # DREW-V Labs // StarFive VisionFive 2 (JH7110) SD/eMMC Image Flasher
 # Path: drewv-labs/riscv-data-kit/starfive/visionfive2/flash-sd.sh
-# Description: Validates target removable media, unmounts active partitions,
-#              and flashes a raw (.img) or compressed (.bz2/.xz/.gz/.zst)
-#              StarFive JH7110 OS image to the raw block device (/dev/rdiskX
-#              on macOS or /dev/sdX on Linux) with hardware safety guards.
+# Description: Validates target removable media, resolves a custom (--image),
+#              cached (~/.rvdk/cache/), or remote (rvdk.drewv-labs.dev) StarFive
+#              JH7110 OS image with SHA-256 verification, unmounts active
+#              partitions, and flashes the raw block device (/dev/rdiskX on
+#              macOS or /dev/sdX on Linux).
 #
-# Usage (Shorthand macOS):
+# Usage (Default RVDK Cache / Auto-Download):
 #   diskutil list external physical
-#   export VF2IMG="/path/to/starfive-jh7110-VF2-SD.img"
 #   ./starfive/visionfive2/flash-sd.sh 4
+#   ./starfive/visionfive2/flash-sd.sh --device /dev/sdX
 #
-# Usage (Explicit Flags - macOS or Linux):
-#   ./starfive/visionfive2/flash-sd.sh --device 4 --image /path/to/image.img.bz2
-#   ./starfive/visionfive2/flash-sd.sh --device /dev/sdX --image /path/to/image.img
+# Usage (Custom Local Image Override):
+#   ./starfive/visionfive2/flash-sd.sh 4 --image /path/to/custom.img.zst
+#   ./starfive/visionfive2/flash-sd.sh --device 4 --image /path/to/custom.img
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -25,18 +26,29 @@ log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 TARGET_ARG=""
-IMAGE_PATH="${VF2IMG:-}"
+IMAGE_PATH=""
 FORCE_LARGE_DISK="false"
 SKIP_CONFIRM="false"
 MAX_SAFE_BYTES=$((256 * 1024 * 1024 * 1024)) # 256 GiB guard against wiping backup drives
 
+# Resolve invoking user's home directory even if script is called via sudo
+REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+REAL_HOME="$(eval echo "~${REAL_USER}")"
+
+DEFAULT_IMG_NAME="starfive-jh7110-202510-minimal-desktop-wayland.img.zst"
+CACHE_DIR="${RVDK_CACHE_DIR:-${REAL_HOME}/.rvdk/cache}"
+RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev}"
+
 usage() {
     cat << 'EOF'
 Usage:
-  export VF2IMG="/path/to/starfive-jh7110-VF2-SD.img"
-  ./flash-sd.sh <disk_number_or_path> [image_path]
+  ./flash-sd.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
+  ./flash-sd.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
 
-  ./flash-sd.sh --device <N|/dev/diskN|/dev/sdX> --image </path/to/image.img[.bz2|.xz|.gz|.zst]> [--yes] [--force]
+Image Resolution Order:
+  1. --image /path/to/img (if provided)
+  2. ~/.rvdk/cache/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
+  3. https://rvdk.drewv-labs.dev/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
 EOF
     exit 1
 }
@@ -52,28 +64,21 @@ while [[ $# -gt 0 ]]; do
         *)
             if [[ -z "$TARGET_ARG" ]]; then
                 TARGET_ARG="$1"
-            elif [[ -z "$IMAGE_PATH" ]]; then
-                IMAGE_PATH="$1"
             else
-                log_fatal "Unexpected positional argument: $1"
+                log_fatal "Unexpected positional argument: $1 (use --image /path/to/img for custom images)"
             fi
             shift
             ;;
     esac
 done
 
-# Expand leading tilde if present
-IMAGE_PATH="${IMAGE_PATH/#\~/$HOME}"
-
 [[ -z "$TARGET_ARG" ]] && log_fatal "Missing target disk identifier. Run 'diskutil list external physical' and pass the disk number (e.g., 4)."
-[[ -z "$IMAGE_PATH" ]] && log_fatal "Missing image path. Export VF2IMG=/path/to/image.img or pass --image /path/to/image.img."
-[[ ! -f "$IMAGE_PATH" ]] && log_fatal "Image file not found: $IMAGE_PATH"
-
-OS_TYPE="$(uname -s)"
 
 # ==============================================================================
 # 1. PLATFORM-SPECIFIC DEVICE RESOLUTION & HARDWARE SAFETY INTERLOCKS
 # ==============================================================================
+OS_TYPE="$(uname -s)"
+
 if [[ "$OS_TYPE" == "Darwin" ]]; then
     # Normalize "4", "disk4", "/dev/disk4", or "/dev/rdisk4" -> DISK_NUM="4"
     if [[ "$TARGET_ARG" =~ ^(/dev/r?disk|r?disk)?([0-9]+)$ ]]; then
@@ -131,16 +136,62 @@ else
     log_info "Target Linux Media : ${RAW_DEV} (${MEDIA_NAME})"
 fi
 
-log_info "Source OS Image    : ${IMAGE_PATH}"
+# ==============================================================================
+# 2. RESOLVE IMAGE (--image -> ~/.rvdk/cache/ -> https://rvdk.drewv-labs.dev/)
+# ==============================================================================
+if [[ -n "$IMAGE_PATH" ]]; then
+    IMAGE_PATH="${IMAGE_PATH/#\~/$REAL_HOME}"
+    [[ ! -f "$IMAGE_PATH" ]] && log_fatal "Custom image file not found: $IMAGE_PATH"
+    log_info "Using custom image : ${IMAGE_PATH}"
+else
+    mkdir -p "$CACHE_DIR"
+    IMAGE_PATH="${CACHE_DIR}/${DEFAULT_IMG_NAME}"
+    SHA_PATH="${IMAGE_PATH}.sha256"
+    REMOTE_IMG_URL="${RVDK_MIRROR_URL}/${DEFAULT_IMG_NAME}"
+
+    if [[ -f "$IMAGE_PATH" ]]; then
+        log_ok "Found cached RVDK image: ${IMAGE_PATH}"
+    else
+        log_info "No cached image at ${IMAGE_PATH}; pulling from ${REMOTE_IMG_URL}..."
+        curl -fL --retry 3 -C - "$REMOTE_IMG_URL" -o "${IMAGE_PATH}.part"
+        mv -f "${IMAGE_PATH}.part" "$IMAGE_PATH"
+        chown "${REAL_USER}" "$IMAGE_PATH" 2>/dev/null || true
+        log_ok "Downloaded and cached ${IMAGE_PATH}"
+    fi
+
+    if [[ ! -f "$SHA_PATH" ]]; then
+        curl -fsSL "${REMOTE_IMG_URL}.sha256" -o "$SHA_PATH" 2>/dev/null || true
+        chown "${REAL_USER}" "$SHA_PATH" 2>/dev/null || true
+    fi
+
+    if [[ -f "$SHA_PATH" ]]; then
+        EXPECTED_SHA="$(awk '{print $1}' "$SHA_PATH")"
+        if command -v shasum >/dev/null 2>&1; then
+            ACTUAL_SHA="$(shasum -a 256 "$IMAGE_PATH" | awk '{print $1}')"
+        else
+            ACTUAL_SHA="$(sha256sum "$IMAGE_PATH" | awk '{print $1}')"
+        fi
+        if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+            rm -f "$IMAGE_PATH" "$SHA_PATH"
+            log_fatal "SHA-256 mismatch on ${IMAGE_PATH}! Expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}. Deleted corrupt cache file."
+        fi
+        log_ok "Verified SHA-256   : ${ACTUAL_SHA}"
+    fi
+fi
+
+IMG_SIZE_BYTES="$(wc -c < "$IMAGE_PATH" | tr -dc '0-9')"
+if (( IMG_SIZE_BYTES < 104857600 )); then
+    log_fatal "Safety Interlock: ${IMAGE_PATH} is only ${IMG_SIZE_BYTES} bytes (< 100 MiB). Refusing to flash!"
+fi
 
 if [[ "$SKIP_CONFIRM" != "true" ]]; then
-    printf "\033[1;33m[CONFIRM]\033[0m Destroy all data on %s (%s) and flash image? [y/N]: " "$BLOCK_DEV" "$MEDIA_NAME"
+    printf "\033[1;33m[CONFIRM]\033[0m Destroy all data on %s (%s) and flash %s? [y/N]: " "$BLOCK_DEV" "$MEDIA_NAME" "$(basename "$IMAGE_PATH")"
     read -r reply
     [[ ! "$reply" =~ ^[Yy]$ ]] && log_fatal "Flash aborted by user."
 fi
 
 # ==============================================================================
-# 2. UNMOUNT TARGET PARTITIONS
+# 3. UNMOUNT TARGET PARTITIONS
 # ==============================================================================
 if [[ "$OS_TYPE" == "Darwin" ]]; then
     log_info "Unmounting ${BLOCK_DEV} via diskutil..."
@@ -153,7 +204,7 @@ else
 fi
 
 # ==============================================================================
-# 3. FLASH IMAGE (RAW OR STREAM-DECOMPRESSED) & SYNC
+# 4. FLASH IMAGE (RAW OR STREAM-DECOMPRESSED) & SYNC
 # ==============================================================================
 DD_BS="4m"
 [[ "$OS_TYPE" != "Darwin" ]] && DD_BS="4M"
@@ -162,6 +213,9 @@ log_info "Flashing image to ${RAW_DEV} (bs=${DD_BS})..."
 sudo -v
 
 case "$IMAGE_PATH" in
+    *.zst)
+        zstd -dc "$IMAGE_PATH" | sudo dd of="$RAW_DEV" bs="$DD_BS" status=progress
+        ;;
     *.bz2)
         bzip2 -dc "$IMAGE_PATH" | sudo dd of="$RAW_DEV" bs="$DD_BS" status=progress
         ;;
@@ -170,9 +224,6 @@ case "$IMAGE_PATH" in
         ;;
     *.gz)
         gzip -dc "$IMAGE_PATH" | sudo dd of="$RAW_DEV" bs="$DD_BS" status=progress
-        ;;
-    *.zst)
-        zstd -dc "$IMAGE_PATH" | sudo dd of="$RAW_DEV" bs="$DD_BS" status=progress
         ;;
     *)
         sudo dd if="$IMAGE_PATH" of="$RAW_DEV" bs="$DD_BS" status=progress
