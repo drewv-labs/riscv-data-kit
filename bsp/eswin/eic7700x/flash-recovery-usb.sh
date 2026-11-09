@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // SiFive HiFive Premier P550 (EIC7700X) Recovery USB Builder
-# Path: drewv-labs/riscv-data-kit/sifive/hifive-premier-p550/prepare-recovery-usb.sh
+# Path: drewv-labs/riscv-data-kit/sifive/hifive-premier-p550/flash-recovery-usb.sh
 # Description: Validates removable USB media, resolves a custom (--image),
 #              cached (~/.rvdk/cache/), or remote (rvdk.drewv-labs.dev) SiFive
 #              P550 Ubuntu 24.04 image with SHA-256 verification, decompresses
@@ -10,12 +10,12 @@
 #
 # Usage (Default RVDK Cache / Auto-Download):
 #   diskutil list external physical
-#   ./sifive/hifive-premier-p550/prepare-recovery-usb.sh 4
-#   ./sifive/hifive-premier-p550/prepare-recovery-usb.sh --device /dev/sdX
+#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh 4
+#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh --device /dev/sdX
 #
 # Usage (Custom Local Image Override):
-#   ./sifive/hifive-premier-p550/prepare-recovery-usb.sh 4 --image /path/to/custom.img.zst
-#   ./sifive/hifive-premier-p550/prepare-recovery-usb.sh --device /dev/sdX --image /path/to/custom.img
+#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh 4 --image /path/to/custom.img.zst
+#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh --device /dev/sdX --image /path/to/custom.img
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -40,14 +40,14 @@ DEFAULT_IMG_NAME="sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst"
 UBOOT_PAYLOAD_NAME="ubuntu-24.04-preinstalled-server-riscv64.img"
 CACHE_DIR="${RVDK_CACHE_DIR:-${REAL_HOME}/.rvdk/cache}"
 STAGE_DIR="${CACHE_DIR}/p550-usb-stage"
-RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev}"
+RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev/releases/latest/download}"
 UPSTREAM_FALLBACK_URL="https://github.com/sifiveinc/hifive-premier-p550-ubuntu/releases/download/2025.11.00/ubuntu-24.04-preinstalled-server-riscv64.img.xz"
 
 usage() {
     cat << 'EOF'
 Usage:
-  ./prepare-recovery-usb.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
-  ./prepare-recovery-usb.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
+  ./flash-recovery-usb.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
+  ./flash-recovery-usb.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
 
 Image Resolution Order:
   1. --image /path/to/img (if provided)

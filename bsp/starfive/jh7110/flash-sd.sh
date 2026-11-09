@@ -37,7 +37,7 @@ REAL_HOME="$(eval echo "~${REAL_USER}")"
 
 DEFAULT_IMG_NAME="starfive-jh7110-202510-minimal-desktop-wayland.img.zst"
 CACHE_DIR="${RVDK_CACHE_DIR:-${REAL_HOME}/.rvdk/cache}"
-RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev}"
+RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev/releases/latest/download}"
 
 usage() {
     cat << 'EOF'
