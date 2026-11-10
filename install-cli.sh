@@ -60,12 +60,12 @@ else
     sudo -u "$REAL_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
 fi
 
-chmod +x "${ENGINE_DIR}/forge.sh" "${ENGINE_DIR}/install-cli.sh" 2>/dev/null || true
+chmod +x "${ENGINE_DIR}/bootstrap.sh" "${ENGINE_DIR}/install-cli.sh" 2>/dev/null || true
 
 # 3. Link /usr/local/bin/rvdk
-ln -sf "${ENGINE_DIR}/forge.sh" /usr/local/bin/rvdk
+ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/local/bin/rvdk
 COMMIT_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo "main")"
-log_ok "Linked /usr/local/bin/rvdk -> ${ENGINE_DIR}/forge.sh (${COMMIT_SHA})"
+log_ok "Linked /usr/local/bin/rvdk -> ${ENGINE_DIR}/bootstrap.sh (${COMMIT_SHA})"
 
 if [[ "$QUIET_MODE" == "false" ]]; then
     DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
