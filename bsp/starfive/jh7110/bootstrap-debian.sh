@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // StarFive JH7110 (SiFive U74) Debian BSP Forge
-# Path: riscv-data-kit/bsp/starfive/jh7110/forge-debian.sh
-#       (Alias: boards/starfive/visionfive2/forge-debian.sh)
+# Path: riscv-data-kit/bsp/starfive/jh7110/bootstrap-debian.sh
 # Description: Idempotent Layer 2 BSP hardening for StarFive JH7110 on Debian:
 #              - Protects vendor U-Boot hooks (/etc/kernel/postinst.d/zz-u-boot-menu)
 #              - Migrates dead 2023 debian-ports snapshot to official Debian sid

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // RVDK Module: Declarative Native Kernel Btrfs RAID 10 Builder
-# Path: riscv-data-kit/storage/btrfs-raid/forge.sh
+# Path: riscv-data-kit/mods/btrfs-raid/forge.sh
 #
 # Usage:
-#   sudo rvdk storage/btrfs-raid [--force-wipe-raid]
-#   curl -fsSL https://rvdk.drewv-labs.dev/storage/btrfs-raid/forge.sh | sudo bash
+#   sudo rvdk mods/btrfs-raid [--force-wipe-raid]
+#   curl -fsSL https://rvdk.drewv-labs.dev/mods/btrfs-raid/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
 

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // StarFive VisionFive 2 (JH7110) SD/eMMC Image Flasher
-# Path: drewv-labs/riscv-data-kit/starfive/visionfive2/flash-sd.sh
 # Description: Validates target removable media, resolves a custom (--image),
 #              cached (~/.rvdk/cache/), or remote (rvdk.drewv-labs.dev) StarFive
 #              JH7110 OS image with SHA-256 verification, unmounts active
@@ -10,12 +9,12 @@
 #
 # Usage (Default RVDK Cache / Auto-Download):
 #   diskutil list external physical
-#   ./starfive/visionfive2/flash-sd.sh 4
-#   ./starfive/visionfive2/flash-sd.sh --device /dev/sdX
+#   ./utils/flash-starfive-visionfive2-debian-sd.sh 4
+#   ./utils/flash-starfive-visionfive2-debian-sd.sh --device /dev/sdX
 #
 # Usage (Custom Local Image Override):
-#   ./starfive/visionfive2/flash-sd.sh 4 --image /path/to/custom.img.zst
-#   ./starfive/visionfive2/flash-sd.sh --device 4 --image /path/to/custom.img
+#   ./utils/flash-starfive-visionfive2-debian-sd.sh 4 --image /path/to/custom.img.zst
+#   ./utils/flash-starfive-visionfive2-debian-sd.sh --device 4 --image /path/to/custom.img
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -42,13 +41,13 @@ RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev/releases/latest/
 usage() {
     cat << 'EOF'
 Usage:
-  ./flash-sd.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
-  ./flash-sd.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
+  ./flash-starfive-visionfive2-debian-sd.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
+  ./flash-starfive-visionfive2-debian-sd.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
 
 Image Resolution Order:
   1. --image /path/to/img (if provided)
   2. ~/.rvdk/cache/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
-  3. https://rvdk.drewv-labs.dev/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
+  3. https://rvdk.drewv-labs.dev/releases/latest/download/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
 EOF
     exit 1
 }

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // RVDK Universal Bare-Metal Dispatcher & CLI (`rvdk`)
-# Path: riscv-data-kit/forge.sh
+# Path: riscv-data-kit/bootstrap.sh
 #
-# Usage (One-Shot Curl Day-0 OS + BSP Forge + CLI Install):
-#   curl -fsSL https://rvdk.drewv-labs.dev/forge.sh | sudo bash -s -- --user drew --hostname brakerbench-vf2 --nopasswd
+# Usage (One-Shot Curl Day-0 OS + BSP Bootstrapper + CLI Install):
+#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname brakerbench-vf2 --nopasswd
 #
-# Usage (Local CLI after install-cli.sh or forge.sh):
-#   sudo rvdk [day0|bsp|os|postgresql|storage/nvme-4kn|storage/btrfs-raid|mosquitto|nfs-vault|update]
+# Usage (Local CLI after install-cli.sh or bootstrap.sh):
+#   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|utils/*|update]
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -15,13 +15,13 @@ if [[ $EUID -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
     else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/forge.sh | sudo bash" >&2
+        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
         exit 1
     fi
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
 [[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
 
 ENGINE_DIR="${REAL_HOME}/.rvdk/engine"
@@ -34,7 +34,7 @@ log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 MODULE="day0"
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        day0|bsp|os|postgresql|postgresql/*|mosquitto|nfs-vault|storage/*|update|self-update)
+        day0|bsp|os|postgresql|postgresql/*|utils/*|mods/*|update|self-update)
             MODULE="$1"
             shift
             ;;
@@ -77,13 +77,20 @@ fi
 
 if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
-    [[ ! -L /usr/local/bin/rvdk ]] && ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/rvdk
+    [[ ! -L /usr/local/bin/rvdk ]] && ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/local/bin/rvdk
 else
     curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
     LOCAL_ROOT="$ENGINE_DIR"
 fi
 
-# 3. Auto-detect Silicon SoC from /proc/device-tree/model
+# 3. Dispatch Host Utilities Early (Allows macOS/x86_64 workstations to run rvdk utils/* without a RISC-V DTB)
+if [[ "$MODULE" == utils/* ]]; then
+    TARGET_UTIL="${LOCAL_ROOT}/${MODULE%.sh}.sh"
+    [[ ! -f "$TARGET_UTIL" ]] && log_fatal "Utility script not found: ${TARGET_UTIL}"
+    exec bash "$TARGET_UTIL" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+fi
+
+# 4. Auto-detect Silicon SoC from /proc/device-tree/model
 DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
 if [[ -z "$SOC_PATH" ]]; then
     case "$DT_MODEL" in
@@ -102,7 +109,7 @@ if [[ -z "$SOC_PATH" ]]; then
     esac
 fi
 
-# 4. Auto-detect OS Distribution from /etc/os-release
+# 5. Auto-detect OS Distribution from /etc/os-release
 if [[ -z "$OS_ID" ]]; then
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
@@ -116,14 +123,14 @@ OS_ID="$(tr '[:upper:]' '[:lower:]' <<< "$OS_ID")"
 
 log_rvdk "Target: ${SOC_PATH} (${DT_MODEL}) | OS: ${OS_ID} | Module: ${MODULE}"
 
+# Strictly match OS-specific scripts (excludes bootstrap.sh symlink to prevent recursion)
 resolve_os_script() {
     local base_dir="$1"
     for candidate in \
-        "${base_dir}/forge-${OS_ID}.sh" \
-        "${base_dir}/forge_${OS_ID}.sh" \
         "${base_dir}/bootstrap-${OS_ID}.sh" \
-        "${base_dir}/bootstrap.sh"; do
-        if [[ -f "$candidate" ]]; then
+        "${base_dir}/forge-${OS_ID}.sh" \
+        "${base_dir}/forge_${OS_ID}.sh"; do
+        if [[ -f "$candidate" && ! -L "$candidate" ]]; then
             echo "$candidate"
             return 0
         fi
@@ -131,7 +138,7 @@ resolve_os_script() {
     return 1
 }
 
-# 5. Dispatch Module
+# 6. Dispatch Module
 case "$MODULE" in
     day0)
         # StarFive JH7110 Debian: run BSP repo fix prior to generic OS apt calls
@@ -139,32 +146,32 @@ case "$MODULE" in
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             log_rvdk "Stage 1/2: Silicon BSP & APT Repo Migration (${BSP_SCRIPT})..."
-            bash "$BSP_SCRIPT" "${FORWARD_ARGS[@]}"
+            bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             log_rvdk "Stage 2/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            bash "$OS_SCRIPT" "${FORWARD_ARGS[@]}"
+            bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         else
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             log_rvdk "Stage 1/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            bash "$OS_SCRIPT" "${FORWARD_ARGS[@]}"
+            bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
-            bash "$BSP_SCRIPT" "${FORWARD_ARGS[@]}"
+            bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         fi
         ;;
     os)
         OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
-        exec bash "$OS_SCRIPT" "${FORWARD_ARGS[@]}"
+        exec bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         ;;
     bsp)
         BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
-        exec bash "$BSP_SCRIPT" "${FORWARD_ARGS[@]}"
+        exec bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         ;;
     postgresql)
-        exec bash "${LOCAL_ROOT}/postgresql/latest/forge.sh" "${FORWARD_ARGS[@]}"
+        exec bash "${LOCAL_ROOT}/postgresql/latest/forge.sh" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         ;;
     *)
         TARGET_MOD="${LOCAL_ROOT}/${MODULE}/forge.sh"
         [[ ! -f "$TARGET_MOD" ]] && log_fatal "Module script not found: ${TARGET_MOD}"
-        exec bash "$TARGET_MOD" "${FORWARD_ARGS[@]}"
+        exec bash "$TARGET_MOD" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         ;;
 esac

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // RVDK Module: PostgreSQL 18.6 (riscv64 + io_uring + Sv39 HugePages)
-# Path: riscv-data-kit/postgresql/18-6/forge.sh
+# DREW-V Labs // RVDK Module: PostgreSQL 18.6 io_uring (riscv64 + io_uring + Sv39 HugePages)
+# Path: riscv-data-kit/postgresql/18-6-io_uring/forge.sh
 #
 # Usage (Default: Precompiled RVDK Binary Bundle):
-#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6/forge.sh | sudo bash
+#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash
 #
 # Usage (Explicit Cold Source Compile with PMU perf stat Telemetry):
-#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6/forge.sh | sudo bash -s -- --force-build
+#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash -s -- --force-build
 # ==============================================================================
 set -Eeuo pipefail
 

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // SiFive HiFive Premier P550 (EIC7700X) Recovery USB Builder
-# Path: drewv-labs/riscv-data-kit/sifive/hifive-premier-p550/flash-recovery-usb.sh
 # Description: Validates removable USB media, resolves a custom (--image),
 #              cached (~/.rvdk/cache/), or remote (rvdk.drewv-labs.dev) SiFive
 #              P550 Ubuntu 24.04 image with SHA-256 verification, decompresses
@@ -10,12 +9,12 @@
 #
 # Usage (Default RVDK Cache / Auto-Download):
 #   diskutil list external physical
-#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh 4
-#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh --device /dev/sdX
+#   ./utils/flash-sifive-p550-ubtuntu-usb.sh 4
+#   ./utils/flash-sifive-p550-ubtuntu-usb.sh --device /dev/sdX
 #
 # Usage (Custom Local Image Override):
-#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh 4 --image /path/to/custom.img.zst
-#   ./sifive/hifive-premier-p550/flash-recovery-usb.sh --device /dev/sdX --image /path/to/custom.img
+#   ./utils/flash-sifive-p550-ubtuntu-usb.sh 4 --image /path/to/custom.img.zst
+#   ./utils/flash-sifive-p550-ubtuntu-usb.sh --device /dev/sdX --image /path/to/custom.img
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -46,13 +45,13 @@ UPSTREAM_FALLBACK_URL="https://github.com/sifiveinc/hifive-premier-p550-ubuntu/r
 usage() {
     cat << 'EOF'
 Usage:
-  ./flash-recovery-usb.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
-  ./flash-recovery-usb.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
+  ./utils/flash-sifive-p550-ubtuntu-usb.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
+  ./utils/flash-sifive-p550-ubtuntu-usb.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
 
 Image Resolution Order:
   1. --image /path/to/img (if provided)
   2. ~/.rvdk/cache/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
-  3. https://rvdk.drewv-labs.dev/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
+  3. https://rvdk.drewv-labs.dev/releases/latest/download/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
 EOF
     exit 1
 }
