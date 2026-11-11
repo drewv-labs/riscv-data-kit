@@ -7,21 +7,39 @@
 #
 # Usage:
 #   curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash
+#   curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo zsh
 # ==============================================================================
-set -Eeuo pipefail
 
+# Ensure compatibility when invoked via `zsh` or `bash` (including `curl ... | sudo zsh`)
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    emulate -L ksh
+    setopt PIPE_FAIL ERR_RETURN NO_UNSET
+else
+    set -Eeuo pipefail
+fi
+
+SCRIPT_SELF="${BASH_SOURCE[0]:-}"
 if [[ $EUID -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
+        exec sudo -E bash "$SCRIPT_SELF" "$@"
     else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash" >&2
+        echo "[RVDK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash" >&2
         exit 1
     fi
 fi
 
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
-[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
+
+if command -v getent >/dev/null 2>&1; then
+    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
+elif command -v dscl >/dev/null 2>&1; then
+    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+else
+    REAL_HOME=""
+fi
+[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}" 2>/dev/null || true)"
+[[ -z "$REAL_HOME" || "$REAL_HOME" == "~"* ]] && REAL_HOME="/root"
 
 RVDK_DIR="${REAL_HOME}/.rvdk"
 CACHE_DIR="${RVDK_DIR}/cache"
@@ -36,19 +54,24 @@ for arg in "$@"; do
     esac
 done
 
-log_info() { printf "\033[1;36m[RVDK:CLI]\033[0m %s\n" "$1"; }
-log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+log_info()  { printf "\033[1;36m[RVDK:CLI]\033[0m %s\n" "$1"; }
+log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 # 1. Ensure git and curl are installed
 if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-    log_info "Installing git and curl prerequisites..."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
-    apt-get -o DPkg::Lock::Timeout=120 install -y git ca-certificates curl
+    if command -v apt-get >/dev/null 2>&1; then
+        log_info "Installing git and curl prerequisites..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
+        apt-get -o DPkg::Lock::Timeout=120 install -y git ca-certificates curl
+    else
+        log_fatal "Missing git or curl. On macOS, run 'xcode-select --install' or 'brew install git curl'."
+    fi
 fi
 
 # 2. Clone or update ~/.rvdk/engine
-install -d -m 0755 -o "$REAL_USER" -g "$REAL_USER" "$RVDK_DIR" "$CACHE_DIR"
+install -d -m 0755 -o "$REAL_USER" -g "$REAL_GRP" "$RVDK_DIR" "$CACHE_DIR"
 
 if [[ -d "${ENGINE_DIR}/.git" ]]; then
     log_info "Updating RVDK engine in ${ENGINE_DIR} (${REPO_BRANCH})..."
@@ -60,16 +83,29 @@ else
     sudo -u "$REAL_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
 fi
 
-chmod +x "${ENGINE_DIR}/bootstrap.sh" "${ENGINE_DIR}/install-cli.sh" 2>/dev/null || true
+chmod +x "${ENGINE_DIR}/bootstrap.sh" "${ENGINE_DIR}/install-cli.sh" "${ENGINE_DIR}"/utils/*.sh 2>/dev/null || true
 
 # 3. Link /usr/local/bin/rvdk
+install -d -m 0755 /usr/local/bin
 ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/local/bin/rvdk
 COMMIT_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo "main")"
 log_ok "Linked /usr/local/bin/rvdk -> ${ENGINE_DIR}/bootstrap.sh (${COMMIT_SHA})"
 
 if [[ "$QUIET_MODE" == "false" ]]; then
-    DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
-    OS_PRETTY="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-Unknown}" || echo "Unknown")"
+    DT_MODEL="Unknown"
+    if [[ -r /proc/device-tree/model ]]; then
+        DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        DT_MODEL="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m) (macOS Host)"
+    fi
+
+    OS_PRETTY="Unknown"
+    if [[ -f /etc/os-release ]]; then
+        OS_PRETTY="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-Unknown}" || echo "Unknown")"
+    elif command -v sw_vers >/dev/null 2>&1; then
+        OS_PRETTY="$(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null) ($(uname -m))"
+    fi
+
     cat <<EOF
 
 ======================================================================
@@ -83,10 +119,11 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    sudo rvdk bsp              # Run Silicon BSP hardening only
    sudo rvdk os               # Run OS normalization & CVE guard only
    sudo rvdk postgresql       # Install PostgreSQL 18.6 (RVDK cache or --force-build)
-   sudo rvdk storage/nvme-4kn # Format 4Kn NVMe + LVM vg_braker + XFS/ext4
-   sudo rvdk storage/btrfs-raid
-   sudo rvdk mosquitto
-   sudo rvdk nfs-vault
+   sudo rvdk mods/nvme-4kn    # Format 4Kn NVMe + LVM vg_braker + XFS/ext4
+   sudo rvdk mods/btrfs-raid
+   sudo rvdk mods/mosquitto
+   sudo rvdk mods/nfs-vault
+   sudo rvdk utils/<script>   # Run host media flash utilities (macOS / Linux)
    sudo rvdk update           # Pull latest RVDK engine from GitHub
 ======================================================================
 EOF

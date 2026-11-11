@@ -9,20 +9,35 @@
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
 #   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|utils/*|update]
 # ==============================================================================
-set -Eeuo pipefail
 
+# Ensure compatibility when invoked via `zsh` or `bash`
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    emulate -L ksh
+    setopt PIPE_FAIL ERR_RETURN NO_UNSET
+else
+    set -Eeuo pipefail
+fi
+
+SCRIPT_SELF="${BASH_SOURCE[0]:-}"
 if [[ $EUID -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
+        exec sudo -E bash "$SCRIPT_SELF" "$@"
     else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
+        echo "[RVDK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
         exit 1
     fi
 fi
 
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
-[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+if command -v getent >/dev/null 2>&1; then
+    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
+elif command -v dscl >/dev/null 2>&1; then
+    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+else
+    REAL_HOME=""
+fi
+[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}" 2>/dev/null || true)"
+[[ -z "$REAL_HOME" || "$REAL_HOME" == "~"* ]] && REAL_HOME="/root"
 
 ENGINE_DIR="${REAL_HOME}/.rvdk/engine"
 RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
@@ -58,7 +73,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 2. Ensure ~/.rvdk/engine and /usr/local/bin/rvdk are installed
-SCRIPT_SELF="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SELF" ]]; then
     SCRIPT_REAL="$(readlink -f "$SCRIPT_SELF" 2>/dev/null || realpath "$SCRIPT_SELF" 2>/dev/null || echo "$SCRIPT_SELF")"
     CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
@@ -77,7 +91,10 @@ fi
 
 if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
-    [[ ! -L /usr/local/bin/rvdk ]] && ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/local/bin/rvdk
+    if [[ ! -L /usr/local/bin/rvdk ]]; then
+        install -d -m 0755 /usr/local/bin
+        ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/local/bin/rvdk
+    fi
 else
     curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
     LOCAL_ROOT="$ENGINE_DIR"
@@ -91,7 +108,10 @@ if [[ "$MODULE" == utils/* ]]; then
 fi
 
 # 4. Auto-detect Silicon SoC from /proc/device-tree/model
-DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+DT_MODEL="Unknown"
+if [[ -r /proc/device-tree/model ]]; then
+    DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+fi
 if [[ -z "$SOC_PATH" ]]; then
     case "$DT_MODEL" in
         *"Premier P550"*|*"EIC7700"*|*"Megrez"*|*"StarPro64"*)
