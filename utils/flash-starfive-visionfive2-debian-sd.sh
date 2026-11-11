@@ -11,13 +11,20 @@
 #   diskutil list external physical
 #   ./utils/flash-starfive-visionfive2-debian-sd.sh 4
 #   ./utils/flash-starfive-visionfive2-debian-sd.sh --device /dev/sdX
+#   curl -fsSL https://rvdk.drewv-labs.dev/utils/flash-starfive-visionfive2-debian-sd.sh | sudo zsh -s -- 4
 #
 # Usage (Custom Local Image Override):
 #   ./utils/flash-starfive-visionfive2-debian-sd.sh 4 --image /path/to/custom.img.zst
 #   ./utils/flash-starfive-visionfive2-debian-sd.sh --device 4 --image /path/to/custom.img
 # ==============================================================================
 
-set -Eeuo pipefail
+# Ensure compatibility when invoked via `zsh` or `bash` (including `curl ... | sudo zsh -s -- ...`)
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    emulate -L ksh
+    setopt PIPE_FAIL ERR_RETURN NO_UNSET
+else
+    set -Eeuo pipefail
+fi
 
 log_info()  { printf "\033[1;36m[INFO]\033[0m %s\n" "$1"; }
 log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
@@ -79,12 +86,16 @@ done
 OS_TYPE="$(uname -s)"
 
 if [[ "$OS_TYPE" == "Darwin" ]]; then
-    # Normalize "4", "disk4", "/dev/disk4", or "/dev/rdisk4" -> DISK_NUM="4"
-    if [[ "$TARGET_ARG" =~ ^(/dev/r?disk|r?disk)?([0-9]+)$ ]]; then
-        DISK_NUM="${BASH_REMATCH[2]}"
-    else
-        log_fatal "Invalid macOS disk identifier '$TARGET_ARG' (expected disk number like '4' or '/dev/disk4')."
-    fi
+    # Normalize "4", "disk4", "/dev/disk4", or "/dev/rdisk4" -> DISK_NUM="4" (portable across bash & zsh)
+    DISK_NUM="$TARGET_ARG"
+    DISK_NUM="${DISK_NUM#/dev/}"
+    DISK_NUM="${DISK_NUM#r}"
+    DISK_NUM="${DISK_NUM#disk}"
+    case "$DISK_NUM" in
+        ""|*[!0-9]*)
+            log_fatal "Invalid macOS disk identifier '$TARGET_ARG' (expected disk number like '4' or '/dev/disk4')."
+            ;;
+    esac
 
     if (( DISK_NUM == 0 || DISK_NUM == 1 )); then
         log_fatal "Disk ${DISK_NUM} (/dev/disk${DISK_NUM}) is reserved for macOS internal system storage. Aborting!"
@@ -101,6 +112,7 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
     MEDIA_NAME="$(awk -F': *' '/Device \/ Media Name:/ {print $2}' <<< "$DISK_INFO" | xargs)"
     DISK_SIZE_LINE="$(awk -F': *' '/Disk Size:/ {print $2}' <<< "$DISK_INFO" | xargs)"
     DISK_BYTES="$(grep -oE '\([0-9]+ Bytes\)' <<< "$DISK_SIZE_LINE" | tr -dc '0-9' || echo 0)"
+    [[ -z "$DISK_BYTES" ]] && DISK_BYTES=0
 
     if [[ "$IS_INTERNAL" == "Internal" && "$IS_REMOVABLE" != "Removable" ]]; then
         log_fatal "Safety Interlock: $BLOCK_DEV ($MEDIA_NAME) is marked as an INTERNAL non-removable drive! Aborting."
@@ -113,9 +125,10 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
     log_info "Target macOS Media : ${BLOCK_DEV} -> ${RAW_DEV} (${MEDIA_NAME} | ${DISK_SIZE_LINE})"
 else
     # Linux workstation support (e.g., BabbageBox-RTX)
-    if [[ "$TARGET_ARG" =~ ^[0-9]+$ ]]; then
-        log_fatal "On Linux, specify the full block device path (e.g., --device /dev/sdX or /dev/mmcblkX)."
-    fi
+    case "$TARGET_ARG" in
+        ""|*[!0-9]*) ;;
+        *) log_fatal "On Linux, specify the full block device path (e.g., --device /dev/sdX or /dev/mmcblkX)." ;;
+    esac
     BLOCK_DEV="$TARGET_ARG"
     RAW_DEV="$TARGET_ARG"
 
@@ -126,6 +139,7 @@ else
     fi
 
     DISK_BYTES="$(lsblk -b -dn -o SIZE "$BLOCK_DEV" 2>/dev/null | head -n1 | tr -dc '0-9' || echo 0)"
+    [[ -z "$DISK_BYTES" ]] && DISK_BYTES=0
     MEDIA_NAME="$(lsblk -dn -o VENDOR,MODEL,SIZE "$BLOCK_DEV" 2>/dev/null | xargs)"
 
     if (( DISK_BYTES > MAX_SAFE_BYTES )) && [[ "$FORCE_LARGE_DISK" != "true" ]]; then
@@ -185,8 +199,16 @@ fi
 
 if [[ "$SKIP_CONFIRM" != "true" ]]; then
     printf "\033[1;33m[CONFIRM]\033[0m Destroy all data on %s (%s) and flash %s? [y/N]: " "$BLOCK_DEV" "$MEDIA_NAME" "$(basename "$IMAGE_PATH")"
-    read -r reply
-    [[ ! "$reply" =~ ^[Yy]$ ]] && log_fatal "Flash aborted by user."
+    reply=""
+    if [[ -r /dev/tty ]]; then
+        read -r reply < /dev/tty || true
+    else
+        read -r reply || true
+    fi
+    case "$reply" in
+        [Yy]|[Yy][Ee][Ss]) ;;
+        *) log_fatal "Flash aborted by user." ;;
+    esac
 fi
 
 # ==============================================================================
