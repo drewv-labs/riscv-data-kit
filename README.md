@@ -3,7 +3,7 @@
   <img src="./.github/images/rvdk-banner.png" alt="RVDK Banner" width="100%"/>
 
   **Idempotent Day-0 Bare-Metal Bootstrap, BSP Protection, Kernel Tuning & Prebuilt Package Distributor for  
-  [RISC-V](https://riscv.org/) Data Systems, Telemetry, and Edge ML Engineering R&D.**
+  [RISC-V](https://riscv.org/) Data Systems, Telemetry, and Edge ML Engineering.**
 
 </div>
 
