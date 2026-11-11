@@ -46,7 +46,7 @@ DEFAULT_IMG_NAME="sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst"
 UBOOT_PAYLOAD_NAME="ubuntu-24.04-preinstalled-server-riscv64.img"
 CACHE_DIR="${RVDK_CACHE_DIR:-${REAL_HOME}/.rvdk/cache}"
 STAGE_DIR="${CACHE_DIR}/p550-usb-stage"
-RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev/releases/download/rvdk-v1}"
+RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1}"
 UPSTREAM_FALLBACK_URL="https://github.com/sifiveinc/hifive-premier-p550-ubuntu/releases/download/2025.11.00/ubuntu-24.04-preinstalled-server-riscv64.img.xz"
 
 usage() {
@@ -58,7 +58,7 @@ Usage:
 Image Resolution Order:
   1. --image /path/to/img (if provided)
   2. ~/.rvdk/cache/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
-  3. https://rvdk.drewv-labs.dev/releases/download/rvdk-v1/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
+  3. https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
 EOF
     exit 1
 }
