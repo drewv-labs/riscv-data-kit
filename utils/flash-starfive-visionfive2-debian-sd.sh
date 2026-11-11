@@ -43,7 +43,7 @@ REAL_HOME="$(eval echo "~${REAL_USER}")"
 
 DEFAULT_IMG_NAME="starfive-jh7110-202510-minimal-desktop-wayland.img.zst"
 CACHE_DIR="${RVDK_CACHE_DIR:-${REAL_HOME}/.rvdk/cache}"
-RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev/releases/latest/download}"
+RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://rvdk.drewv-labs.dev/releases/download/rvdk-v1}"
 
 usage() {
     cat << 'EOF'
@@ -54,7 +54,7 @@ Usage:
 Image Resolution Order:
   1. --image /path/to/img (if provided)
   2. ~/.rvdk/cache/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
-  3. https://rvdk.drewv-labs.dev/releases/latest/download/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
+  3. https://rvdk.drewv-labs.dev/releases/download/rvdk-v1/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
 EOF
     exit 1
 }
