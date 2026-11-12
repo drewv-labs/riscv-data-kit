@@ -19,7 +19,9 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
+[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+
 NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
 # shellcheck disable=SC1090
 [[ -f "$NODE_ENV" ]] && source "$NODE_ENV"
@@ -52,6 +54,15 @@ else
 fi
 
 install -d -m 0750 -o mosquitto -g mosquitto "$MOSQ_DATA" /run/mosquitto
+
+# Mosquitto 2.x disallows duplicate persistence/persistence_location directives.
+# Debian package default /etc/mosquitto/mosquitto.conf ships with:
+#   persistence true
+#   persistence_location /var/lib/mosquitto/
+# Comment them out from the root config so drop-ins in conf.d/ take precedence cleanly.
+if [[ -f /etc/mosquitto/mosquitto.conf ]]; then
+    sed -i -E 's/^[[:space:]]*(persistence(_location)?[[:space:]]+)/# \1/' /etc/mosquitto/mosquitto.conf
+fi
 
 MOSQ_CONF="/etc/mosquitto/conf.d/99-rvdk-broker.conf"
 WANT_MOSQ_CONF="# DREW-V Labs // RVDK Mosquitto Telemetry Broker
