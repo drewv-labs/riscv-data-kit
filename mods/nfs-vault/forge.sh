@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // RVDK Module: NFSv4 Vault Exporter (Kernel NFSD + Ganesha VFS)
+# DREW-V Labs // RVDK Module: NFSv4 Vault Exporter (Auto: Kernel NFSD -> Ganesha)
 # Path: riscv-data-kit/mods/nfs-vault/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/nfs-vault [--subnet 10.0.10.0/24] [--data-mount /mnt/nvme_pgdata] [--ganesha]
+#   sudo rvdk mods/nfs-vault [--subnet 10.0.10.0/24] [--data-mount /mnt/nvme_pgdata]
+#   sudo rvdk mods/nfs-vault [--auto | --ganesha | --kernel | --backend <auto|ganesha|kernel>]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/nfs-vault/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
@@ -23,6 +24,9 @@ REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
 [[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
 
+# Inherit storage/subnet layout from BrakerRak node.env if present, while keeping
+# standalone RVDK's own backend default as 'auto' unless explicitly passed.
+PRESET_BACKEND="${NFS_BACKEND:-}"
 NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
 # shellcheck disable=SC1090
 [[ -f "$NODE_ENV" ]] && source "$NODE_ENV"
@@ -31,24 +35,40 @@ LAB_SUBNET="${LAB_SUBNET:-10.0.10.0/24}"
 DATA_MOUNT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
 WITH_RAID="${WITH_RAID:-false}"
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
-FORCE_GANESHA="false"
+# Standalone RVDK defaults to 'auto' (kernel -> ganesha fallback)
+REQUESTED_BACKEND="${PRESET_BACKEND:-auto}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --subnet)              LAB_SUBNET="${2:-10.0.10.0/24}"; shift 2 ;;
-        --data-mount)          DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
-        --ganesha|--userspace) FORCE_GANESHA="true"; shift ;;
+        --subnet)                           LAB_SUBNET="${2:-10.0.10.0/24}"; shift 2 ;;
+        --data-mount)                       DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
+        --backend|--nfs-backend)            REQUESTED_BACKEND="${2:-auto}"; shift 2 ;;
+        --auto|--nfs-auto)                  REQUESTED_BACKEND="auto"; shift ;;
+        --ganesha|--nfs-ganesha|--userspace) REQUESTED_BACKEND="ganesha"; shift ;;
+        --kernel|--nfs-kernel|--nfs-kernal) REQUESTED_BACKEND="kernel"; shift ;;
         *) shift ;;
     esac
 done
 
+REQUESTED_BACKEND="$(tr '[:upper:]' '[:lower:]' <<< "$REQUESTED_BACKEND")"
+case "$REQUESTED_BACKEND" in
+    auto)                        REQUESTED_BACKEND="auto" ;;
+    ganesha|nfs-ganesha|userspace) REQUESTED_BACKEND="ganesha" ;;
+    kernel|nfs-kernel|nfs-kernal|knfsd|nfsd) REQUESTED_BACKEND="kernel" ;;
+    *)
+        echo "[RVDK:FATAL] Unknown NFS backend '${REQUESTED_BACKEND}' (expected: auto | ganesha | kernel)" >&2
+        exit 1
+        ;;
+esac
+
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
-log_info() { printf "\033[1;36m[RVDK:NFSv4]\033[0m %s\n" "$1"; }
-log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+log_info()  { printf "\033[1;36m[RVDK:NFSv4]\033[0m %s\n" "$1"; }
+log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 # Reliably check whether the running kernel supports the 'nfsd' filesystem.
 # Note: Do NOT check [[ -d /proc/fs/nfsd ]] because that empty mountpoint
@@ -58,18 +78,39 @@ check_nfsd_support() {
     grep -qw nfsd /proc/filesystems 2>/dev/null
 }
 
+case "$REQUESTED_BACKEND" in
+    kernel)
+        if ! check_nfsd_support; then
+            log_fatal "Kernel $(uname -r) lacks CONFIG_NFSD ('nfsd' missing from /proc/filesystems); cannot satisfy --kernel override."
+        fi
+        NFS_MODE="kernel"
+        log_info "Backend: nfs-kernel-server (explicit kernel nfsd mode)"
+        ;;
+    ganesha)
+        NFS_MODE="ganesha"
+        log_info "Backend: nfs-ganesha (userspace FSAL_VFS on TCP :2049)"
+        ;;
+    auto)
+        if check_nfsd_support; then
+            NFS_MODE="kernel"
+            log_info "Backend: nfs-kernel-server (auto-detected CONFIG_NFSD support)"
+        else
+            NFS_MODE="ganesha"
+            log_warn "Kernel $(uname -r) lacks CONFIG_NFSD; falling back to userspace NFS-Ganesha (FSAL_VFS) on TCP :2049..."
+        fi
+        ;;
+esac
+
 apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
 
-if [[ "$FORCE_GANESHA" != "true" ]] && check_nfsd_support; then
-    NFS_MODE="kernel"
+if [[ "$NFS_MODE" == "kernel" ]]; then
+    if systemctl is-active --quiet nfs-ganesha.service 2>/dev/null || systemctl is-enabled --quiet nfs-ganesha.service 2>/dev/null; then
+        systemctl disable --now nfs-ganesha.service 2>/dev/null || true
+        systemctl reset-failed nfs-ganesha.service nfs-ganesha-lock.service 2>/dev/null || true
+    fi
     apt-get install "${APT_FLAGS[@]}" nfs-kernel-server nfs-common jq
 else
-    NFS_MODE="ganesha"
-    if [[ "$FORCE_GANESHA" == "true" ]]; then
-        log_info "Using userspace NFS-Ganesha (FSAL_VFS) per --ganesha flag..."
-    else
-        log_warn "Kernel $(uname -r) lacks CONFIG_NFSD; falling back to userspace NFS-Ganesha (FSAL_VFS) on TCP :2049..."
-    fi
+    exportfs -ua 2>/dev/null || true
     systemctl stop nfs-server.service nfs-kernel-server.service nfs-mountd.service nfsdcld.service 2>/dev/null || true
     systemctl disable nfs-server.service nfs-kernel-server.service 2>/dev/null || true
     systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-mountd.service nfsdcld.service 2>/dev/null || true
@@ -109,9 +150,6 @@ if ! printf "%s\n" "$WANT_EXPORTS" | cmp -s - "$EXPORTS_FILE" 2>/dev/null; then
 fi
 
 if [[ "$NFS_MODE" == "kernel" ]]; then
-    if systemctl is-active --quiet nfs-ganesha.service 2>/dev/null; then
-        systemctl disable --now nfs-ganesha.service 2>/dev/null || true
-    fi
     if ! mountpoint -q /proc/fs/nfsd 2>/dev/null; then
         mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true
     fi
@@ -140,6 +178,14 @@ NFS_CORE_PARAM {
 
 NFSV4 {
     Graceless = true;
+}
+
+# Bounded metadata/dirent cache sized to coexist cleanly alongside PostgreSQL 18
+# Sv39 2MB HugePages on 8GB-16GB RISC-V SBCs (Chunks_LWMark * 128 <= Entries_HWMark)
+MDCACHE {
+    Entries_HWMark = 16384;
+    Chunks_HWMark = 128;
+    Chunks_LWMark = 64;
 }
 EOF
 )"
