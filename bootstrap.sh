@@ -29,6 +29,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 if command -v getent >/dev/null 2>&1; then
     REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
 elif command -v dscl >/dev/null 2>&1; then
@@ -81,7 +82,7 @@ else
 fi
 
 if [[ "$MODULE" == "update" || "$MODULE" == "self-update" ]]; then
-    if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
+    if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
         exec bash "${CANDIDATE_ROOT}/install-cli.sh" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
     else
         curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
@@ -89,14 +90,24 @@ if [[ "$MODULE" == "update" || "$MODULE" == "self-update" ]]; then
     fi
 fi
 
-if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
+# If symlinked into a different user's ~/.rvdk/engine (e.g. factory 'user' after switching to admin user),
+# migrate into the active user's ~/.rvdk/engine so purging the factory user never breaks /usr/local/bin/rvdk.
+if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]] && ! [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
     if [[ ! -L /usr/local/bin/rvdk ]]; then
         install -d -m 0755 /usr/local/bin
         ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/local/bin/rvdk
     fi
 else
-    curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
+    if [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" && ! -d "${ENGINE_DIR}/.git" ]]; then
+        install -d -m 0755 -o "$REAL_USER" -g "$REAL_GRP" "${REAL_HOME}/.rvdk" "${REAL_HOME}/.rvdk/cache"
+        cp -a "$CANDIDATE_ROOT" "$ENGINE_DIR"
+        chown -R "${REAL_USER}:${REAL_GRP}" "$ENGINE_DIR"
+        install -d -m 0755 /usr/local/bin
+        ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/local/bin/rvdk
+    else
+        curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
+    fi
     LOCAL_ROOT="$ENGINE_DIR"
 fi
 
