@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // SiFive HiFive Premier P550 (ESWIN EIC7700X) BSP Bootstrapper
-# Path: riscv-data-kit/sifive/hifive-premier-p550/bootstrap.sh
-# Description: Silicon, bootloader, thermal, network (end0), and PMU counter
-#              hardening for SiFive HiFive Premier P550 on Ubuntu or Debian.
+# Path: riscv-data-kit/bsp/eswin/eic7700x/bootstrap-ubuntu.sh
+# Description: Silicon, bootloader, thermal, network (end0), cpufreq performance
+#              governor lock, and PMU counter hardening for EIC7700X (Ubuntu/Debian).
 #
 # Usage:
-#   sudo ./sifive/hifive-premier-p550/bootstrap.sh
+#   sudo rvdk bsp
+#   sudo ./bsp/eswin/eic7700x/bootstrap-ubuntu.sh
 # ==============================================================================
 
 set -euo pipefail
@@ -18,7 +19,7 @@ APT_FLAGS=(-y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-c
 log_info() { printf "\033[1;36m[INFO]\033[0m %s\n" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[1;31m[WARN]\033[0m %s\n" "$1"; }
+log_warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 
 if [[ $EUID -ne 0 ]]; then
     echo "Escalating privileges via sudo..."
@@ -109,7 +110,48 @@ else
 fi
 
 # ==============================================================================
-# 5. SOM PWM FAN CONTROLLER & HARDWARE PMU COUNTER UNLOCK
+# 5. LOCK CPUFREQ PERFORMANCE GOVERNOR (+ POWERPROFILESCTL GUARD)
+# ==============================================================================
+if command -v powerprofilesctl >/dev/null 2>&1; then
+    CUR_PPD="$(powerprofilesctl get 2>/dev/null || true)"
+    if [[ "$CUR_PPD" != "performance" ]]; then
+        if powerprofilesctl set performance 2>/dev/null; then
+            log_ok "Pinned Ubuntu power-profiles-daemon to 'performance'"
+        fi
+    else
+        log_skip "power-profiles-daemon already set to 'performance'"
+    fi
+fi
+
+GOV_UNIT="/etc/systemd/system/eic7700x-cpufreq-performance.service"
+GOV_UNIT_CONTENT='[Unit]
+Description=Lock ESWIN EIC7700X SiFive P550 Harts to Performance Governor
+After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "[ -x /usr/bin/powerprofilesctl ] && /usr/bin/powerprofilesctl set performance >/dev/null 2>&1 || true; for g in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do [ -f \"$g\" ] && echo performance > \"$g\" || true; done"
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target'
+
+if ! printf "%s\n" "$GOV_UNIT_CONTENT" | cmp -s - "$GOV_UNIT" 2>/dev/null; then
+    printf "%s\n" "$GOV_UNIT_CONTENT" > "$GOV_UNIT"
+    systemctl daemon-reload
+    systemctl enable --now eic7700x-cpufreq-performance.service >/dev/null
+    if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+        log_ok "Enabled persistent P550 performance governor service ($GOV_UNIT)"
+    else
+        log_ok "Armed P550 performance governor service ($GOV_UNIT; running kernel uses firmware-fixed clock)"
+    fi
+else
+    systemctl start eic7700x-cpufreq-performance.service 2>/dev/null || true
+    log_skip "P550 performance governor service already active"
+fi
+
+# ==============================================================================
+# 6. SOM PWM FAN CONTROLLER & HARDWARE PMU COUNTER UNLOCK
 # ==============================================================================
 if apt-cache show fancontrol-config-p550-premier >/dev/null 2>&1; then
     if ! dpkg -s fancontrol-config-p550-premier >/dev/null 2>&1; then
