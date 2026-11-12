@@ -19,7 +19,9 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
+[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+
 NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
 # shellcheck disable=SC1090
 [[ -f "$NODE_ENV" ]] && source "$NODE_ENV"
@@ -38,11 +40,32 @@ while [[ $# -gt 0 ]]; do
 done
 
 export DEBIAN_FRONTEND=noninteractive
-APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o DPkg::Options::="--force-confdef" -o DPkg::Options::="--force-confold")
 
 log_info() { printf "\033[1;36m[RVDK:NFSv4]\033[0m %s\n" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+log_warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+
+# Check for kernel nfsd support prior to attempting nfs-kernel-server start
+check_nfsd_support() {
+    # If /proc/fs/nfsd already exists/mounted or nfsd module is loadable/built-in
+    if [[ -d /proc/fs/nfsd ]] || grep -qw nfsd /proc/filesystems 2>/dev/null; then
+        return 0
+    fi
+    if modprobe nfsd 2>/dev/null; then
+        return 0
+    fi
+    # Check kernel config if available
+    local kver
+    kver="$(uname -r)"
+    local kconf="/boot/config-${kver}"
+    if [[ -f "$kconf" ]] && grep -qE "^CONFIG_NFSD=[my]" "$kconf" 2>/dev/null; then
+        modprobe nfsd 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
 
 apt-get update -q
 apt-get install "${APT_FLAGS[@]}" nfs-kernel-server nfs-common jq
@@ -67,11 +90,20 @@ fi
 
 if [[ ! -f "$EXPORTS_FILE" ]] || [[ "$(cat "$EXPORTS_FILE")" != "$WANT_EXPORTS" ]]; then
     printf "%s" "$WANT_EXPORTS" > "$EXPORTS_FILE"
-    systemctl enable --now nfs-kernel-server
-    exportfs -ra
-    log_ok "Exported NFSv4 vaults to ${LAB_SUBNET} (${EXPORTS_FILE})"
-else
-    systemctl enable --now nfs-kernel-server 2>/dev/null || true
-    exportfs -ra
-    log_skip "NFSv4 exports already converged (${EXPORTS_FILE})"
 fi
+
+if ! check_nfsd_support; then
+    log_warn "Linux kernel $(uname -r) lacks in-tree NFSD support (CONFIG_NFSD not enabled or module missing)."
+    log_warn "nfs-kernel-server cannot mount /proc/fs/nfsd on this kernel. Exports configured in ${EXPORTS_FILE}."
+    systemctl disable nfs-kernel-server 2>/dev/null || true
+    exit 0
+fi
+
+# Ensure nfsd filesystem is mounted if not already
+if ! mountpoint -q /proc/fs/nfsd 2>/dev/null; then
+    mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true
+fi
+
+systemctl enable --now nfs-kernel-server
+exportfs -ra 2>/dev/null || true
+log_ok "Exported NFSv4 vaults to ${LAB_SUBNET} (${EXPORTS_FILE})"
