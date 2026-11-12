@@ -26,6 +26,21 @@ _RVDK_PROGBAR_SOURCED="1"
 # bash parses `\0` + 3 octal digits (`\0337` -> 0xDF) instead of ESC + '7'!
 _RVDK_ESC=$'\033'
 
+# Brand palette:
+#   RVDK Blue       : #1c49f2 -> RGB(28, 73, 242)
+#   BrakerRak Purple: #5a26e5 -> RGB(90, 38, 229)
+if [[ "${TERM:-}" == "linux" ]]; then
+    _RVDK_BADGE_SGR="${_RVDK_ESC}[44;97;1m"
+    _RVDK_BAR_SGR="${_RVDK_ESC}[1;34m"
+    _RVDK_BRAK_BADGE_SGR="${_RVDK_ESC}[45;97;1m"
+    _RVDK_BRAK_BAR_SGR="${_RVDK_ESC}[1;35m"
+else
+    _RVDK_BADGE_SGR="${_RVDK_ESC}[48;2;28;73;242;38;2;255;255;255;1m"
+    _RVDK_BAR_SGR="${_RVDK_ESC}[38;2;28;73;242;1m"
+    _RVDK_BRAK_BADGE_SGR="${_RVDK_ESC}[48;2;90;38;229;38;2;255;255;255;1m"
+    _RVDK_BRAK_BAR_SGR="${_RVDK_ESC}[38;2;90;38;229;1m"
+fi
+
 _RVDK_PROG_ACTIVE="0"
 _RVDK_PROG_MODE="off"       # off | standalone | stacked
 _RVDK_PROG_OWNER="0"        # 1 if this shell owns DECSTBM teardown on EXIT
@@ -136,7 +151,7 @@ _rvdk_prog_render() {
     (( rows < 10 || cols < 40 )) && return 0
 
     local rvdk_line
-    rvdk_line="$(_rvdk_prog_format_line "RVDK" "${esc}[46;30;1m" "${esc}[1;36m" "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" "$cols")"
+    rvdk_line="$(_rvdk_prog_format_line "RVDK" "$_RVDK_BADGE_SGR" "$_RVDK_BAR_SGR" "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" "$cols")"
 
     if [[ "$_RVDK_PROG_MODE" == "stacked" ]]; then
         local scroll_end=$(( rows - 2 ))
@@ -164,7 +179,7 @@ _rvdk_prog_render() {
                 m_pct="${m_raw%%|*}"
                 m_msg="${m_raw#*|}"
                 [[ "$m_pct" =~ ^[0-9]+$ ]] || m_pct=0
-                m_line="$(_rvdk_prog_format_line "BrakerRak" "${esc}[45;37;1m" "${esc}[1;35m" "$m_pct" "$m_msg" "$cols")"
+                m_line="$(_rvdk_prog_format_line "BrakerRak" "$_RVDK_BRAK_BADGE_SGR" "$_RVDK_BRAK_BAR_SGR" "$m_pct" "$m_msg" "$cols")"
                 seq+="${esc}[${master_row};1H${m_line}${esc}[0K"
             fi
         fi
