@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // RVDK Module: NFSv4 Kernel Server Vault Exporter
-# Path: riscv-data-kit/nfs-vault/forge.sh
+# DREW-V Labs // RVDK Module: NFSv4 Vault Exporter (Kernel NFSD + Ganesha VFS)
+# Path: riscv-data-kit/mods/nfs-vault/forge.sh
 #
 # Usage:
-#   sudo rvdk nfs-vault [--subnet 10.0.10.0/24]
-#   curl -fsSL https://rvdk.drewv-labs.dev/nfs-vault/forge.sh | sudo bash
+#   sudo rvdk mods/nfs-vault [--subnet 10.0.10.0/24] [--data-mount /mnt/nvme_pgdata] [--ganesha]
+#   curl -fsSL https://rvdk.drewv-labs.dev/mods/nfs-vault/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -19,6 +19,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
 [[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
 
@@ -30,49 +31,54 @@ LAB_SUBNET="${LAB_SUBNET:-10.0.10.0/24}"
 DATA_MOUNT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
 WITH_RAID="${WITH_RAID:-false}"
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
+FORCE_GANESHA="false"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --subnet)     LAB_SUBNET="${2:-10.0.10.0/24}"; shift 2 ;;
-        --data-mount) DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
+        --subnet)              LAB_SUBNET="${2:-10.0.10.0/24}"; shift 2 ;;
+        --data-mount)          DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
+        --ganesha|--userspace) FORCE_GANESHA="true"; shift ;;
         *) shift ;;
     esac
 done
 
 export DEBIAN_FRONTEND=noninteractive
-APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o DPkg::Options::="--force-confdef" -o DPkg::Options::="--force-confold")
+APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 log_info() { printf "\033[1;36m[RVDK:NFSv4]\033[0m %s\n" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 
-# Check for kernel nfsd support prior to attempting nfs-kernel-server start
+# Reliably check whether the running kernel supports the 'nfsd' filesystem.
+# Note: Do NOT check [[ -d /proc/fs/nfsd ]] because that empty mountpoint
+# directory exists even on vendor kernels built with '# CONFIG_NFSD is not set'.
 check_nfsd_support() {
-    # If /proc/fs/nfsd already exists/mounted or nfsd module is loadable/built-in
-    if [[ -d /proc/fs/nfsd ]] || grep -qw nfsd /proc/filesystems 2>/dev/null; then
-        return 0
-    fi
-    if modprobe nfsd 2>/dev/null; then
-        return 0
-    fi
-    # Check kernel config if available
-    local kver
-    kver="$(uname -r)"
-    local kconf="/boot/config-${kver}"
-    if [[ -f "$kconf" ]] && grep -qE "^CONFIG_NFSD=[my]" "$kconf" 2>/dev/null; then
-        modprobe nfsd 2>/dev/null || true
-        return 0
-    fi
-    return 1
+    modprobe nfsd 2>/dev/null || true
+    grep -qw nfsd /proc/filesystems 2>/dev/null
 }
 
-apt-get update -q
-apt-get install "${APT_FLAGS[@]}" nfs-kernel-server nfs-common jq
+apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
 
-mkdir -p /etc/exports.d
-EXPORTS_FILE="/etc/exports.d/rvdk-vaults.exports"
-WANT_EXPORTS=""
+if [[ "$FORCE_GANESHA" != "true" ]] && check_nfsd_support; then
+    NFS_MODE="kernel"
+    apt-get install "${APT_FLAGS[@]}" nfs-kernel-server nfs-common jq
+else
+    NFS_MODE="ganesha"
+    if [[ "$FORCE_GANESHA" == "true" ]]; then
+        log_info "Using userspace NFS-Ganesha (FSAL_VFS) per --ganesha flag..."
+    else
+        log_warn "Kernel $(uname -r) lacks CONFIG_NFSD; falling back to userspace NFS-Ganesha (FSAL_VFS) on TCP :2049..."
+    fi
+    systemctl stop nfs-server.service nfs-kernel-server.service nfs-mountd.service nfsdcld.service 2>/dev/null || true
+    systemctl disable nfs-server.service nfs-kernel-server.service 2>/dev/null || true
+    systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-mountd.service nfsdcld.service 2>/dev/null || true
+    apt-get install "${APT_FLAGS[@]}" nfs-ganesha nfs-ganesha-vfs nfs-common jq
+fi
+
+EXPORT_PATHS=()
+EXPORT_FSIDS=()
+EXPORT_LINES=()
 
 ARRAY_COUNT="$(jq 'length' <<< "$RAID_ARRAYS_JSON" 2>/dev/null || echo 0)"
 if [[ "$WITH_RAID" == "true" ]] && (( ARRAY_COUNT > 0 )); then
@@ -80,30 +86,111 @@ if [[ "$WITH_RAID" == "true" ]] && (( ARRAY_COUNT > 0 )); then
         ARR_MOUNT="$(jq -r ".[$i].mount" <<< "$RAID_ARRAYS_JSON")"
         ARR_FSID="$(jq -r ".[$i].nfs_fsid // $(( (i + 1) * 10 ))" <<< "$RAID_ARRAYS_JSON")"
         mkdir -p "$ARR_MOUNT"
-        WANT_EXPORTS+="${ARR_MOUNT} ${LAB_SUBNET}(rw,sync,no_subtree_check,no_root_squash,fsid=${ARR_FSID})"$'\n'
+        EXPORT_PATHS+=("$ARR_MOUNT")
+        EXPORT_FSIDS+=("$ARR_FSID")
+        EXPORT_LINES+=("${ARR_MOUNT} ${LAB_SUBNET}(rw,sync,no_subtree_check,no_root_squash,fsid=${ARR_FSID})")
     done
 else
     FALLBACK_VAULT="${DATA_MOUNT}/nfs_vault"
-    install -d -m 0775 -o "$REAL_USER" -g "$REAL_USER" "$FALLBACK_VAULT"
-    WANT_EXPORTS="${FALLBACK_VAULT} ${LAB_SUBNET}(rw,sync,no_subtree_check,no_root_squash,fsid=10)"$'\n'
+    install -d -m 0775 -o "$REAL_USER" -g "$REAL_GRP" "$FALLBACK_VAULT"
+    EXPORT_PATHS+=("$FALLBACK_VAULT")
+    EXPORT_FSIDS+=("10")
+    EXPORT_LINES+=("${FALLBACK_VAULT} ${LAB_SUBNET}(rw,sync,no_subtree_check,no_root_squash,fsid=10)")
 fi
 
-if [[ ! -f "$EXPORTS_FILE" ]] || [[ "$(cat "$EXPORTS_FILE")" != "$WANT_EXPORTS" ]]; then
-    printf "%s" "$WANT_EXPORTS" > "$EXPORTS_FILE"
+mkdir -p /etc/exports.d
+EXPORTS_FILE="/etc/exports.d/rvdk-vaults.exports"
+WANT_EXPORTS="$(printf "%s\n" "${EXPORT_LINES[@]}")"
+
+EXPORTS_CHANGED="false"
+if ! printf "%s\n" "$WANT_EXPORTS" | cmp -s - "$EXPORTS_FILE" 2>/dev/null; then
+    printf "%s\n" "$WANT_EXPORTS" > "$EXPORTS_FILE"
+    EXPORTS_CHANGED="true"
 fi
 
-if ! check_nfsd_support; then
-    log_warn "Linux kernel $(uname -r) lacks in-tree NFSD support (CONFIG_NFSD not enabled or module missing)."
-    log_warn "nfs-kernel-server cannot mount /proc/fs/nfsd on this kernel. Exports configured in ${EXPORTS_FILE}."
-    systemctl disable nfs-kernel-server 2>/dev/null || true
-    exit 0
-fi
+if [[ "$NFS_MODE" == "kernel" ]]; then
+    if systemctl is-active --quiet nfs-ganesha.service 2>/dev/null; then
+        systemctl disable --now nfs-ganesha.service 2>/dev/null || true
+    fi
+    if ! mountpoint -q /proc/fs/nfsd 2>/dev/null; then
+        mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true
+    fi
+    if [[ "$EXPORTS_CHANGED" == "true" ]] || ! systemctl is-active --quiet nfs-server.service; then
+        systemctl enable --now nfs-kernel-server
+        exportfs -ra
+        log_ok "Exported NFSv4 vaults via kernel nfsd to ${LAB_SUBNET} (${EXPORTS_FILE})"
+    else
+        exportfs -ra
+        log_skip "Kernel NFSv4 exports already converged (${EXPORTS_FILE})"
+    fi
+else
+    GANESHA_CONF="/etc/ganesha/ganesha.conf"
+    mkdir -p /etc/ganesha /var/log/ganesha /var/lib/nfs/ganesha
 
-# Ensure nfsd filesystem is mounted if not already
-if ! mountpoint -q /proc/fs/nfsd 2>/dev/null; then
-    mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true
-fi
+    WANT_GANESHA="$(cat <<EOF
+# ==============================================================================
+# DREW-V Labs // RVDK Userspace NFSv4 Vault Exporter (NFS-Ganesha FSAL_VFS)
+# Managed by: riscv-data-kit/mods/nfs-vault/forge.sh
+# ==============================================================================
+NFS_CORE_PARAM {
+    Protocols = 4;
+    Enable_NLM = false;
+    Enable_RQUOTA = false;
+}
 
-systemctl enable --now nfs-kernel-server
-exportfs -ra 2>/dev/null || true
-log_ok "Exported NFSv4 vaults to ${LAB_SUBNET} (${EXPORTS_FILE})"
+NFSV4 {
+    Graceless = true;
+}
+EOF
+)"
+
+    for (( idx=0; idx<${#EXPORT_PATHS[@]}; idx++ )); do
+        E_PATH="${EXPORT_PATHS[$idx]}"
+        E_FSID="${EXPORT_FSIDS[$idx]}"
+        WANT_GANESHA+=$'\n\n'"$(cat <<EOF
+EXPORT {
+    Export_Id = ${E_FSID};
+    Path = "${E_PATH}";
+    Pseudo = "${E_PATH}";
+    Protocols = 4;
+    Transports = TCP;
+    Access_Type = None;
+    Squash = No_Root_Squash;
+    SecType = sys;
+    FSAL {
+        Name = VFS;
+    }
+    CLIENT {
+        Clients = ${LAB_SUBNET}, 127.0.0.1;
+        Access_Type = RW;
+        Squash = No_Root_Squash;
+    }
+}
+EOF
+)"
+    done
+
+    GANESHA_CHANGED="false"
+    if ! printf "%s\n" "$WANT_GANESHA" | cmp -s - "$GANESHA_CONF" 2>/dev/null; then
+        printf "%s\n" "$WANT_GANESHA" > "$GANESHA_CONF"
+        GANESHA_CHANGED="true"
+    fi
+
+    systemctl stop rpc-statd.service 2>/dev/null || true
+    systemctl enable nfs-ganesha.service >/dev/null 2>&1 || true
+
+    if [[ "$GANESHA_CHANGED" == "true" ]] || ! systemctl is-active --quiet nfs-ganesha.service; then
+        systemctl restart nfs-ganesha.service
+        systemctl reset-failed nfs-ganesha-lock.service 2>/dev/null || true
+        sleep 1
+        if ! systemctl is-active --quiet nfs-ganesha.service; then
+            echo "[RVDK:FATAL] nfs-ganesha.service failed to stay active. Recent log:" >&2
+            tail -n 30 /var/log/ganesha/ganesha.log >&2 2>/dev/null || journalctl -u nfs-ganesha.service -n 30 --no-pager >&2 || true
+            exit 1
+        fi
+        log_ok "Exported NFSv4 vaults via userspace NFS-Ganesha (FSAL_VFS) to ${LAB_SUBNET} (${GANESHA_CONF})"
+    else
+        systemctl reset-failed nfs-ganesha-lock.service 2>/dev/null || true
+        log_skip "Userspace NFSv4 exports (NFS-Ganesha) already converged (${GANESHA_CONF})"
+    fi
+fi

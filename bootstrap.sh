@@ -82,9 +82,9 @@ fi
 
 if [[ "$MODULE" == "update" || "$MODULE" == "self-update" ]]; then
     if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
-        exec bash "${CANDIDATE_ROOT}/install-cli.sh"
+        exec bash "${CANDIDATE_ROOT}/install-cli.sh" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
     else
-        curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash
+        curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         exit 0
     fi
 fi
