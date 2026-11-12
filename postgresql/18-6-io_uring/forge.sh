@@ -7,7 +7,7 @@
 #   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash
 #
 # Usage (Explicit Cold Source Compile with PMU perf stat Telemetry):
-#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash -s -- --force-build
+#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash -s -- --force-build [--noprogbar]
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -25,9 +25,26 @@ while [[ $# -gt 0 ]]; do
             DATA_MOUNT="$2"; shift 2 ;;
         --subnet)
             LAB_SUBNET="$2"; shift 2 ;;
+        --noprogbar|--no-progbar)
+            export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "PG 18.6: detecting RISC-V silicon profile..."
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -73,22 +90,27 @@ update_local_repo() {
 }
 
 # 2. Install PostgreSQL 18.6 (Default: RVDK Precompiled Bundle | Optional: --force-build)
+rvdk_prog 15 "PG 18.6: checking postgresql-${PG_VERSION} package state..."
 if dpkg -s "postgresql-${PG_VERSION}" >/dev/null 2>&1 && [[ "$FORCE_BUILD" == "false" ]]; then
     log_skip "postgresql-${PG_VERSION} is already installed (pass --force-build to recompile)"
 else
     mkdir -p "$LOCAL_REPO_DIR"
+    rvdk_prog 20 "PG 18.6: installing repository & archive prerequisites..."
     apt-get update -q
     apt-get install "${APT_FLAGS[@]}" curl ca-certificates zstd dpkg-dev gnupg lsb-release rsync
 
     if [[ "$FORCE_BUILD" == "false" ]]; then
         if ! ls "${LOCAL_REPO_DIR}"/postgresql-${PG_VERSION}_*.deb >/dev/null 2>&1; then
+            rvdk_prog 35 "PG 18.6: pulling ${TARGET_SLUG} io_uring binary bundle..."
             log_info "Pulling precompiled ${TARGET_SLUG} bundle from ${BUNDLE_URL}..."
             curl -fL --retry 3 "$BUNDLE_URL" | tar -I zstd -xf - -C "$LOCAL_REPO_DIR"
             rm -f "${LOCAL_REPO_DIR}"/*-dbgsym_*.deb
             log_ok "Extracted precompiled PostgreSQL 18.6 bundle to ${LOCAL_REPO_DIR}"
         fi
+        rvdk_prog 50 "PG 18.6: indexing local PGDG repository..."
         update_local_repo
     else
+        rvdk_prog 25 "PG 18.6: preparing cold source build (${TARGET_SLUG})..."
         log_info "Executing cold source build (--force-build) for ${TARGET_SLUG}..."
         install -d /usr/share/postgresql-common/pgdg
         curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
@@ -110,6 +132,7 @@ EOF
 
         mkdir -p "$BUILD_DIR" && chmod 775 "$BUILD_DIR" && chown -R _apt:root "$BUILD_DIR"
         if ! dpkg -s postgresql-common-dev >/dev/null 2>&1; then
+            rvdk_prog 35 "PG 18.6: compiling postgresql-common..."
             rm -rf "${BUILD_DIR:?}"/* && cd "$BUILD_DIR"
             apt-get build-dep "${APT_FLAGS[@]}" postgresql-common
             apt-get source --compile postgresql-common
@@ -117,6 +140,7 @@ EOF
             apt-get install "${APT_FLAGS[@]}" postgresql-common postgresql-common-dev
         fi
 
+        rvdk_prog 45 "PG 18.6: compiling postgresql-${PG_VERSION} (${CPU_MTUNE} + io_uring)..."
         rm -rf "${BUILD_DIR:?}"/* && cd "$BUILD_DIR"
         apt-get build-dep "${APT_FLAGS[@]}" "postgresql-${PG_VERSION}"
         apt-get source --compile "postgresql-${PG_VERSION}"
@@ -125,11 +149,13 @@ EOF
         update_local_repo
     fi
 
+    rvdk_prog 60 "PG 18.6: installing postgresql-${PG_VERSION} packages..."
     apt-get install "${APT_FLAGS[@]}" "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}"
     log_ok "Installed PostgreSQL ${PG_VERSION} (${TARGET_SLUG})"
 fi
 
 # 3. Configure Sv39 2MB HugePages & Relocate Cluster (if NVMe mount is present)
+rvdk_prog 75 "PG 18.6: reserving Sv39 2MB HugePages (${HUGEPAGES_2MB}) & PGDATA..."
 PG_GID="$(getent group postgres | cut -d: -f3)"
 cat <<EOF > /etc/sysctl.d/90-rvdk-pg18-hugepages.conf
 vm.nr_hugepages = ${HUGEPAGES_2MB}
@@ -140,6 +166,7 @@ sysctl -p /etc/sysctl.d/90-rvdk-pg18-hugepages.conf >/dev/null 2>&1 || true
 if mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
     TARGET_PGDATA="${DATA_MOUNT}/postgresql/${PG_VERSION}/main"
     if [[ ! -f "${TARGET_PGDATA}/PG_VERSION" ]]; then
+        rvdk_prog 82 "PG 18.6: migrating PGDATA cluster to ${TARGET_PGDATA}..."
         systemctl stop postgresql
         install -d -m 0700 -o postgres -g postgres "$TARGET_PGDATA"
         rsync -a "/var/lib/postgresql/${PG_VERSION}/main/" "${TARGET_PGDATA}/"
@@ -150,6 +177,7 @@ else
 fi
 
 # 4. Write Drop-In Tuning Config & Restart
+rvdk_prog 90 "PG 18.6: applying io_uring tuning & restarting cluster..."
 CONF_DIR="/etc/postgresql/${PG_VERSION}/main/conf.d"
 install -d -o postgres -g postgres "$CONF_DIR"
 cat <<EOF > "${CONF_DIR}/99-rvdk-${TARGET_SLUG}.conf"
@@ -182,4 +210,5 @@ fi
 
 systemctl enable --now postgresql
 systemctl restart postgresql
+rvdk_prog 100 "PostgreSQL 18.6 (io_uring) online"
 log_ok "PostgreSQL 18.6 online (io_method=$(sudo -u postgres psql -tAc 'SHOW io_method;'), shared_buffers=${PG_SHARED_BUFFERS})"

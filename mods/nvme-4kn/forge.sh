@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // RVDK Module: NVMe 4Kn + LVM + XFS/ext4 Storage Provisioner
-# Path: riscv-data-kit/storage/nvme-4kn/forge.sh
+# Path: riscv-data-kit/mods/nvme-4kn/forge.sh
 #
 # Usage:
-#   sudo rvdk storage/nvme-4kn [--device /dev/nvme0n1] [--mount /mnt/nvme_pgdata] [--force-wipe]
-#   curl -fsSL https://rvdk.drewv-labs.dev/storage/nvme-4kn/forge.sh | sudo bash
+#   sudo rvdk mods/nvme-4kn [--device /dev/nvme0n1] [--mount /mnt/nvme_pgdata] [--force-wipe] [--noprogbar]
+#   curl -fsSL https://rvdk.drewv-labs.dev/mods/nvme-4kn/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -40,9 +40,25 @@ while [[ $# -gt 0 ]]; do
         --label)      FS_LABEL="${2:-}"; shift 2 ;;
         --no-lvm)     USE_LVM="false"; shift ;;
         --force-wipe|--force-wipe-nvme) FORCE_WIPE="true"; shift ;;
+        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "NVMe 4Kn: validating ${NVME_DEV}..."
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -60,6 +76,7 @@ if lsblk -no MOUNTPOINT "$NVME_DEV" 2>/dev/null | grep -qE "^(/|/boot|/boot/efi)
     log_fatal "Safety Interlock: ${NVME_DEV} backs the root/boot OS filesystem! Aborting."
 fi
 
+rvdk_prog 15 "NVMe 4Kn: installing nvme-cli, lvm2 & xfsprogs..."
 apt-get update -q
 apt-get install "${APT_FLAGS[@]}" nvme-cli lvm2 xfsprogs e2fsprogs parted util-linux
 
@@ -76,6 +93,7 @@ EXISTING_FS_TYPE=""
 [[ -n "$EXISTING_FS_DEV" ]] && EXISTING_FS_TYPE="$(blkid -s TYPE -o value "$EXISTING_FS_DEV" 2>/dev/null || true)"
 
 # 2. Verify or Convert to Native 4096-Byte (4Kn) Hardware LBA Sectors
+rvdk_prog 35 "NVMe 4Kn: checking 4096B LBA sector geometry..."
 CUR_LBA="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
 if [[ -n "$EXISTING_FS_DEV" && "$CUR_LBA" == "4096" && "$FORCE_WIPE" == "false" ]]; then
     log_skip "Existing 4Kn volume '${FS_LABEL}' found on ${EXISTING_FS_DEV} (4096B sectors)"
@@ -86,6 +104,7 @@ else
 
         LBA_4K_IDX="$(nvme id-ns "$NVME_DEV" 2>/dev/null | awk '/lbads:12/ {print $2}' | tr -dc '0-9' | head -n1 || true)"
         if [[ -n "$LBA_4K_IDX" && "$CUR_LBA" != "4096" ]]; then
+            rvdk_prog 45 "NVMe 4Kn: formatting ${NVME_DEV} to 4096B LBA..."
             log_info "Formatting ${NVME_DEV} from ${CUR_LBA}B to 4096B (4Kn) sectors (LBA Format Index: ${LBA_4K_IDX})..."
             nvme format "$NVME_DEV" -l "$LBA_4K_IDX" --force
             partprobe "$NVME_DEV" 2>/dev/null || true
@@ -99,6 +118,7 @@ else
 fi
 
 # 3. Provision LVM (vg_braker/lv_pgdata with 15% snapshot reserve) & Format XFS/ext4
+rvdk_prog 60 "NVMe 4Kn: converging LVM (${VG_NAME}/${LV_NAME}) & ${NVME_FSTYPE^^}..."
 if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
     TARGET_BLOCK_DEV="$EXISTING_FS_DEV"
     log_skip "${NVME_FSTYPE^^} volume '${FS_LABEL}' already converged at ${TARGET_BLOCK_DEV}"
@@ -133,6 +153,7 @@ else
         TARGET_BLOCK_DEV="${NVME_DEV}p1"
     fi
 
+    rvdk_prog 78 "NVMe 4Kn: mkfs.${NVME_FSTYPE} (${FS_LABEL})..."
     SECTOR_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
     if [[ "$NVME_FSTYPE" == "xfs" ]]; then
         mkfs.xfs -f -s "size=${SECTOR_SZ}" -b size=4096 -L "$FS_LABEL" "$TARGET_BLOCK_DEV"
@@ -144,6 +165,7 @@ else
 fi
 
 # 4. Persist in /etc/fstab (No inline discard; nofail protection) & Mount
+rvdk_prog 90 "NVMe 4Kn: persisting /etc/fstab & mounting ${MOUNT_POINT}..."
 mkdir -p "$MOUNT_POINT"
 if [[ "$NVME_FSTYPE" == "xfs" ]]; then
     FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
@@ -167,3 +189,5 @@ if ! mountpoint -q "$MOUNT_POINT"; then
 else
     log_skip "${MOUNT_POINT} is already mounted"
 fi
+
+rvdk_prog 100 "NVMe 4Kn storage converged (${MOUNT_POINT})"

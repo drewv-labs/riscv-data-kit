@@ -10,7 +10,7 @@
 #                and unlocks SiFive U74 PMU counters.
 #
 # Usage:
-#   sudo rvdk bsp [--skip-upgrade]
+#   sudo rvdk bsp [--skip-upgrade] [--noprogbar]
 #   curl -fsSL https://rvdk.drewv-labs.dev/bsp/starfive/jh7110/forge-debian.sh | sudo bash
 # ==============================================================================
 
@@ -28,10 +28,26 @@ fi
 SKIP_UPGRADE="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-upgrade) SKIP_UPGRADE="true"; shift ;;
-        *)              shift ;;
+        --skip-upgrade)           SKIP_UPGRADE="true"; shift ;;
+        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
+        *)                        shift ;;
     esac
 done
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "JH7110 BSP: inspecting device tree..."
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(
@@ -56,6 +72,7 @@ log_info "Detected Device-Tree Model: ${DT_MODEL}"
 # ==============================================================================
 # 2. BOOTLOADER, FIT & VENDOR U-BOOT HOOK PROTECTION (zz-u-boot-menu)
 # ==============================================================================
+rvdk_prog 10 "JH7110 BSP: protecting U-Boot & FIT hooks..."
 APT_BSP_CONF="/etc/apt/apt.conf.d/90-starfive-bsp-protect"
 APT_BSP_CONTENT='Dpkg::Options {
    "--force-overwrite";
@@ -80,6 +97,7 @@ done
 # ==============================================================================
 # 3. MIGRATE 2023 SNAPSHOT REPOS, PURGE GUI & UNBLOCK T64 UPGRADE
 # ==============================================================================
+rvdk_prog 25 "JH7110 BSP: checking APT sources & keyring..."
 DESIRED_SOURCES="deb http://deb.debian.org/debian unstable main
 deb https://debianrepo-t.starfivetech.com starfive-debian main"
 
@@ -113,6 +131,7 @@ else
 fi
 
 # Strip frozen 2023 Wayland/Weston/X11/GTK packages BEFORE full-upgrade to prevent t64 collisions
+rvdk_prog 40 "JH7110 BSP: checking desktop GUI & t64 blockers..."
 VF2_GUI_PKGS=(
     "weston*" "wayland*" "x11-common" "libx11-*" "libgtk*"
     "lightdm*" "task-desktop" "plymouth"
@@ -142,9 +161,11 @@ if dpkg -l 2>/dev/null | grep -q "^ii.*libcurl3-gnutls"; then
 fi
 
 if [[ "$SKIP_UPGRADE" == "false" ]]; then
+    rvdk_prog 55 "JH7110 BSP: running apt full-upgrade & core packages..."
     log_info "Running non-interactive full-upgrade and installing core JH7110 packages..."
     apt-get update -q
     apt-get full-upgrade "${APT_FLAGS[@]}"
+    rvdk_prog 72 "JH7110 BSP: installing core build & perf packages..."
     apt-get install "${APT_FLAGS[@]}" \
         build-essential dkms pciutils nvme-cli lvm2 parted git curl wget \
         htop jq tmux bc rsync time sysstat linux-perf zstd dpkg-dev
@@ -157,6 +178,7 @@ fi
 # ==============================================================================
 # 4. PERSISTENT PRIMARY NIC (eth0) CONFIGURATION
 # ==============================================================================
+rvdk_prog 82 "JH7110 BSP: persisting eth0 & masking sleep targets..."
 if ip link show eth0 >/dev/null 2>&1; then
     if [[ -d /etc/network/interfaces.d ]]; then
         if grep -rqE "iface (eth0|end0)" /etc/network/ 2>/dev/null; then
@@ -197,6 +219,7 @@ fi
 # ==============================================================================
 # 6. LOCK 1500 MHz CPUFREQ PERFORMANCE GOVERNOR & UNLOCK U74 PMU COUNTERS
 # ==============================================================================
+rvdk_prog 92 "JH7110 BSP: locking 1500 MHz governor & U74 PMU..."
 GOV_UNIT="/etc/systemd/system/jh7110-cpufreq-performance.service"
 GOV_UNIT_CONTENT='[Unit]
 Description=Lock StarFive JH7110 SiFive U74 Harts to 1500 MHz Performance Governor
@@ -233,4 +256,5 @@ else
     log_skip "SiFive U74 PMU sysctls already configured"
 fi
 
+rvdk_prog 100 "StarFive JH7110 BSP hardening complete"
 log_info "StarFive JH7110 (Debian) BSP forge complete."

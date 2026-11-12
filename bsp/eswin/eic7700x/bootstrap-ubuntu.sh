@@ -6,7 +6,7 @@
 #              governor lock, and PMU counter hardening for EIC7700X (Ubuntu/Debian).
 #
 # Usage:
-#   sudo rvdk bsp
+#   sudo rvdk bsp [--noprogbar]
 #   sudo ./bsp/eswin/eic7700x/bootstrap-ubuntu.sh
 # ==============================================================================
 
@@ -26,6 +26,28 @@ if [[ $EUID -ne 0 ]]; then
     exec sudo -E bash "$0" "$@"
 fi
 
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
+        *)                        shift ;;
+    esac
+done
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "EIC7700X BSP: inspecting device tree..."
+
 # ==============================================================================
 # 1. VERIFY SIFIVE P550 / ESWIN EIC7700X DEVICE TREE
 # ==============================================================================
@@ -35,6 +57,7 @@ log_info "Detected Device-Tree Model: ${DT_MODEL}"
 # ==============================================================================
 # 2. BOOTLOADER & VENDOR DTB PROTECTION (Debian & Ubuntu)
 # ==============================================================================
+rvdk_prog 15 "EIC7700X BSP: protecting bootloader & DTB hooks..."
 # Prevent unattended apt upgrades from overwriting vendor U-Boot / extlinux hooks
 APT_BSP_CONF="/etc/apt/apt.conf.d/90-p550-bsp-protect"
 APT_BSP_CONTENT='Dpkg::Options {
@@ -60,6 +83,7 @@ done
 # ==============================================================================
 # 3. PERSISTENT PRIMARY NIC (end0) CONFIGURATION
 # ==============================================================================
+rvdk_prog 35 "EIC7700X BSP: persisting primary NIC (end0)..."
 if ip link show end0 >/dev/null 2>&1; then
     if command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
         if grep -rq "end0" /etc/netplan/ 2>/dev/null; then
@@ -93,6 +117,7 @@ fi
 # ==============================================================================
 # 4. EIC7700X SOC SLEEP / SUSPEND TARGET LOCKOUT
 # ==============================================================================
+rvdk_prog 55 "EIC7700X BSP: masking sleep/suspend targets..."
 SLEEP_TARGETS=(sleep.target suspend.target hibernate.target hybrid-sleep.target)
 NEED_MASK="false"
 for tgt in "${SLEEP_TARGETS[@]}"; do
@@ -112,6 +137,7 @@ fi
 # ==============================================================================
 # 5. LOCK CPUFREQ PERFORMANCE GOVERNOR (+ POWERPROFILESCTL GUARD)
 # ==============================================================================
+rvdk_prog 75 "EIC7700X BSP: locking P550 performance governor..."
 if command -v powerprofilesctl >/dev/null 2>&1; then
     CUR_PPD="$(powerprofilesctl get 2>/dev/null || true)"
     if [[ "$CUR_PPD" != "performance" ]]; then
@@ -153,6 +179,7 @@ fi
 # ==============================================================================
 # 6. SOM PWM FAN CONTROLLER & HARDWARE PMU COUNTER UNLOCK
 # ==============================================================================
+rvdk_prog 90 "EIC7700X BSP: PWM fan controller & P550 PMU unlock..."
 if apt-cache show fancontrol-config-p550-premier >/dev/null 2>&1; then
     if ! dpkg -s fancontrol-config-p550-premier >/dev/null 2>&1; then
         apt-get update -q
@@ -176,4 +203,5 @@ else
     log_skip "SiFive P550 PMU sysctls already configured"
 fi
 
+rvdk_prog 100 "SiFive Premier P550 BSP hardening complete"
 log_info "SiFive HiFive Premier P550 BSP bootstrap complete."

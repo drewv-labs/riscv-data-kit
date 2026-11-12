@@ -4,7 +4,7 @@
 # Path: riscv-data-kit/mods/nfs-vault/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/nfs-vault [--subnet 10.0.10.0/24] [--data-mount /mnt/nvme_pgdata]
+#   sudo rvdk mods/nfs-vault [--subnet 10.0.10.0/24] [--data-mount /mnt/nvme_pgdata] [--noprogbar]
 #   sudo rvdk mods/nfs-vault [--auto | --ganesha | --kernel | --backend <auto|ganesha|kernel>]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/nfs-vault/forge.sh | sudo bash
 # ==============================================================================
@@ -40,12 +40,13 @@ REQUESTED_BACKEND="${PRESET_BACKEND:-auto}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --subnet)                           LAB_SUBNET="${2:-10.0.10.0/24}"; shift 2 ;;
-        --data-mount)                       DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
-        --backend|--nfs-backend)            REQUESTED_BACKEND="${2:-auto}"; shift 2 ;;
-        --auto|--nfs-auto)                  REQUESTED_BACKEND="auto"; shift ;;
+        --subnet)                            LAB_SUBNET="${2:-10.0.10.0/24}"; shift 2 ;;
+        --data-mount)                        DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
+        --backend|--nfs-backend)             REQUESTED_BACKEND="${2:-auto}"; shift 2 ;;
+        --auto|--nfs-auto)                   REQUESTED_BACKEND="auto"; shift ;;
         --ganesha|--nfs-ganesha|--userspace) REQUESTED_BACKEND="ganesha"; shift ;;
-        --kernel|--nfs-kernel|--nfs-kernal) REQUESTED_BACKEND="kernel"; shift ;;
+        --kernel|--nfs-kernel|--nfs-kernal)  REQUESTED_BACKEND="kernel"; shift ;;
+        --noprogbar|--no-progbar)            export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
@@ -60,6 +61,21 @@ case "$REQUESTED_BACKEND" in
         exit 1
         ;;
 esac
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "NFSv4 Vault: probing backend (${REQUESTED_BACKEND})..."
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -101,6 +117,7 @@ case "$REQUESTED_BACKEND" in
         ;;
 esac
 
+rvdk_prog 30 "NFSv4 Vault: installing ${NFS_MODE} server packages..."
 apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
 
 if [[ "$NFS_MODE" == "kernel" ]]; then
@@ -117,6 +134,7 @@ else
     apt-get install "${APT_FLAGS[@]}" nfs-ganesha nfs-ganesha-vfs nfs-common jq
 fi
 
+rvdk_prog 65 "NFSv4 Vault: building export definitions (${LAB_SUBNET})..."
 EXPORT_PATHS=()
 EXPORT_FSIDS=()
 EXPORT_LINES=()
@@ -149,6 +167,7 @@ if ! printf "%s\n" "$WANT_EXPORTS" | cmp -s - "$EXPORTS_FILE" 2>/dev/null; then
     EXPORTS_CHANGED="true"
 fi
 
+rvdk_prog 85 "NFSv4 Vault: activating ${NFS_MODE} exports..."
 if [[ "$NFS_MODE" == "kernel" ]]; then
     if ! mountpoint -q /proc/fs/nfsd 2>/dev/null; then
         mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null || true
@@ -240,3 +259,5 @@ EOF
         log_skip "Userspace NFSv4 exports (NFS-Ganesha) already converged (${GANESHA_CONF})"
     fi
 fi
+
+rvdk_prog 100 "NFSv4 vault exports converged (${NFS_MODE})"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // RVDK Module: Eclipse Mosquitto MQTT Broker (:1883 + Unix Socket)
-# Path: riscv-data-kit/mosquitto/forge.sh
+# Path: riscv-data-kit/mods/mosquitto/forge.sh
 #
 # Usage:
-#   sudo rvdk mosquitto [--port 1883] [--data-mount /mnt/nvme_pgdata]
-#   curl -fsSL https://rvdk.drewv-labs.dev/mosquitto/forge.sh | sudo bash
+#   sudo rvdk mods/mosquitto [--port 1883] [--data-mount /mnt/nvme_pgdata] [--noprogbar]
+#   curl -fsSL https://rvdk.drewv-labs.dev/mods/mosquitto/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -33,9 +33,25 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)       MQTT_PORT="${2:-1883}"; shift 2 ;;
         --data-mount) DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
+        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "Mosquitto MQTT: installing packages..."
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -44,9 +60,11 @@ log_info() { printf "\033[1;36m[RVDK:MQTT]\033[0m %s\n" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 
+rvdk_prog 25 "Mosquitto MQTT: installing mosquitto & clients..."
 apt-get update -q
 apt-get install "${APT_FLAGS[@]}" mosquitto mosquitto-clients
 
+rvdk_prog 60 "Mosquitto MQTT: staging persistence & socket directories..."
 if mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
     MOSQ_DATA="${DATA_MOUNT}/mosquitto"
 else
@@ -79,6 +97,7 @@ max_queued_messages 10000
 set_tcp_nodelay true
 "
 
+rvdk_prog 85 "Mosquitto MQTT: converging listener :${MQTT_PORT} + Unix socket..."
 if [[ ! -f "$MOSQ_CONF" ]] || [[ "$(cat "$MOSQ_CONF")" != "$WANT_MOSQ_CONF" ]]; then
     printf "%s" "$WANT_MOSQ_CONF" > "$MOSQ_CONF"
     systemctl enable --now mosquitto
@@ -88,3 +107,5 @@ else
     systemctl enable --now mosquitto 2>/dev/null || true
     log_skip "Mosquitto MQTT already converged on :${MQTT_PORT} (${MOSQ_CONF})"
 fi
+
+rvdk_prog 100 "Mosquitto MQTT broker converged (:${MQTT_PORT})"

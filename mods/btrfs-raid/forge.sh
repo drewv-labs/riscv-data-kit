@@ -4,7 +4,7 @@
 # Path: riscv-data-kit/mods/btrfs-raid/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/btrfs-raid [--force-wipe-raid]
+#   sudo rvdk mods/btrfs-raid [--force-wipe-raid] [--noprogbar]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/btrfs-raid/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
@@ -29,11 +29,27 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --json) RAID_ARRAYS_JSON="${2:-[]}"; shift 2 ;;
         --force-wipe|--force-wipe-raid) FORCE_WIPE_RAID="true"; shift ;;
+        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
 
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "Btrfs RAID 10: installing btrfs-progs & jq..."
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -43,11 +59,13 @@ log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
+rvdk_prog 15 "Btrfs RAID 10: verifying btrfs-progs & jq..."
 apt-get update -q
 apt-get install "${APT_FLAGS[@]}" btrfs-progs jq util-linux
 
 ARRAY_COUNT="$(jq 'length' <<< "$RAID_ARRAYS_JSON" 2>/dev/null || echo 0)"
 if (( ARRAY_COUNT == 0 )); then
+    rvdk_prog 100 "Btrfs RAID 10: no arrays declared (skipped)"
     log_skip "RAID_ARRAYS_JSON is empty; no Btrfs RAID 10 arrays requested."
     exit 0
 fi
@@ -64,6 +82,8 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
     ARR_MAX_B="$(jq -r ".[$i].max_bytes" <<< "$RAID_ARRAYS_JSON")"
     ARR_TBSPC="$(jq -r ".[$i].tablespace // empty" <<< "$RAID_ARRAYS_JSON")"
 
+    STEP_PCT=$(( 25 + ((i * 70) / ARRAY_COUNT) ))
+    rvdk_prog "$STEP_PCT" "Btrfs RAID 10: converging ${ARR_NAME} (${ARR_LABEL})..."
     log_info "Checking ${ARR_NAME} [${ARR_TYPE^^}] (${ARR_LABEL} -> ${ARR_MOUNT})..."
     EXISTING_DEV="$(blkid -L "$ARR_LABEL" || true)"
 
@@ -143,3 +163,5 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
         fi
     fi
 done
+
+rvdk_prog 100 "Btrfs RAID 10 vaults converged"

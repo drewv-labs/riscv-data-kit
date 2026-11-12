@@ -7,7 +7,7 @@
 #   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname brakerbench-vf2 --nopasswd
 #
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
-#   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|utils/*|update]
+#   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|utils/*|update] [--noprogbar]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -67,9 +67,10 @@ FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --soc) SOC_PATH="${2:-}"; shift 2 ;;
-        --os)  OS_ID="${2:-}"; shift 2 ;;
-        *)     FORWARD_ARGS+=("$1"); shift ;;
+        --soc)                    SOC_PATH="${2:-}"; shift 2 ;;
+        --os)                     OS_ID="${2:-}"; shift 2 ;;
+        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
+        *)                        FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -152,6 +153,16 @@ if [[ -z "$OS_ID" ]]; then
 fi
 OS_ID="$(tr '[:upper:]' '[:lower:]' <<< "$OS_ID")"
 
+export RVDK_PROGBAR_LIB="${LOCAL_ROOT}/lib/progbar.sh"
+if [[ -f "$RVDK_PROGBAR_LIB" ]]; then
+    # shellcheck disable=SC1090
+    source "$RVDK_PROGBAR_LIB"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "${MODULE} (${SOC_PATH})"
 log_rvdk "Target: ${SOC_PATH} (${DT_MODEL}) | OS: ${OS_ID} | Module: ${MODULE}"
 
 # Strictly match OS-specific scripts (excludes bootstrap.sh symlink to prevent recursion)
@@ -169,7 +180,7 @@ resolve_os_script() {
     return 1
 }
 
-# 6. Dispatch Module
+# 6. Dispatch Module (Use `bash`, not `exec bash`, so standalone progress bar EXIT trap tears down cleanly)
 case "$MODULE" in
     day0)
         # StarFive JH7110 Debian: run BSP repo fix prior to generic OS apt calls
@@ -177,32 +188,37 @@ case "$MODULE" in
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             log_rvdk "Stage 1/2: Silicon BSP & APT Repo Migration (${BSP_SCRIPT})..."
-            bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE=0 RVDK_PROG_SPAN=55 bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             log_rvdk "Stage 2/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE=55 RVDK_PROG_SPAN=45 bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         else
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             log_rvdk "Stage 1/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE=0 RVDK_PROG_SPAN=55 bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
-            bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE=55 RVDK_PROG_SPAN=45 bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         fi
+        rvdk_prog 100 "Day-0 OS + Silicon BSP converged"
         ;;
     os)
         OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
-        exec bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        rvdk_prog 100 "OS normalization converged"
         ;;
     bsp)
         BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
-        exec bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        rvdk_prog 100 "Silicon BSP converged"
         ;;
     postgresql)
-        exec bash "${LOCAL_ROOT}/postgresql/latest/forge.sh" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        bash "${LOCAL_ROOT}/postgresql/latest/forge.sh" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        rvdk_prog 100 "PostgreSQL 18.6 converged"
         ;;
     *)
         TARGET_MOD="${LOCAL_ROOT}/${MODULE}/forge.sh"
         [[ ! -f "$TARGET_MOD" ]] && log_fatal "Module script not found: ${TARGET_MOD}"
-        exec bash "$TARGET_MOD" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        bash "$TARGET_MOD" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        rvdk_prog 100 "${MODULE} converged"
         ;;
 esac

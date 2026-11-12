@@ -6,7 +6,7 @@
 #              UTF-8 locale, and hostname configuration for Debian nodes.
 #
 # Usage:
-#   ./bootstrap-debian.sh --user drew --hostname brakerbox-titan --nopasswd
+#   ./bootstrap-debian.sh --user drew --hostname brakerbox-titan --nopasswd [--noprogbar]
 # ==============================================================================
 
 set -euo pipefail
@@ -17,6 +17,7 @@ TARGET_HOSTNAME=""
 NOPASSWD_SUDO="false"
 FIX_LOCALE="true"
 DEFAULT_GROUPS=("sudo" "adm" "dialout" "plugdev" "render" "video")
+ORIG_ARGS=("$@")
 
 # --- Logging Helpers ---
 log_info() { printf "\033[1;36m[INFO]\033[0m %s\n" "$1"; }
@@ -33,6 +34,7 @@ Options:
   -H, --hostname <hostname>   New system hostname to configure
   -n, --nopasswd              Enable passwordless sudo (NOPASSWD) for --user
       --skip-locale           Skip en_US.UTF-8 locale verification
+      --noprogbar             Suppress persistent bottom progress bar
   -h, --help                  Show this help message and exit
 
 Example:
@@ -74,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             FIX_LOCALE="false"
             shift
             ;;
+        --noprogbar|--no-progbar)
+            export RVDK_NO_PROGBAR="1"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -96,16 +102,31 @@ fi
 if [[ $EUID -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
         log_info "Escalating privileges via sudo..."
-        exec sudo -E bash "$0" "$@"
+        exec sudo -E bash "$0" "${ORIG_ARGS[@]}"
     else
         log_err "This script must be run as root (and 'sudo' is not installed)."
         exit 1
     fi
 fi
 
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "Debian Day-0 OS normalization..."
 export DEBIAN_FRONTEND=noninteractive
 
 # Ensure 'sudo' package itself is installed (minimal Debian images often omit it)
+rvdk_prog 5 "Verifying sudo & UTF-8 locale..."
 if ! command -v sudo >/dev/null 2>&1; then
     log_info "Installing missing 'sudo' package..."
     apt-get update -q && apt-get install -y sudo
@@ -131,6 +152,7 @@ fi
 # ==============================================================================
 # 1. USER & GROUP PROVISIONING (--user)
 # ==============================================================================
+rvdk_prog 25 "Converging user & group memberships (${TARGET_USER:-skip})..."
 if [[ -n "$TARGET_USER" ]]; then
     log_info "Processing user configuration for '${TARGET_USER}'..."
 
@@ -166,6 +188,7 @@ fi
 # ==============================================================================
 # 2. PASSWORDLESS SUDO (--nopasswd)
 # ==============================================================================
+rvdk_prog 45 "Configuring sudoers policy..."
 if [[ "$NOPASSWD_SUDO" == "true" ]]; then
     SUDOERS_FILE="/etc/sudoers.d/010_${TARGET_USER}-nopasswd"
     SUDOERS_RULE="${TARGET_USER} ALL=(ALL) NOPASSWD: ALL"
@@ -193,6 +216,7 @@ fi
 # ==============================================================================
 # 3. HOSTNAME CONFIGURATION (--hostname)
 # ==============================================================================
+rvdk_prog 65 "Configuring system hostname (${TARGET_HOSTNAME:-current})..."
 if [[ -n "$TARGET_HOSTNAME" ]]; then
     CURRENT_HOSTNAME="$(hostname)"
 
@@ -228,6 +252,7 @@ fi
 # ==============================================================================
 # 4. CVE-2026-98432 KERNEL IPv4 TCP RCU USE-AFTER-FREE MITIGATION
 # ==============================================================================
+rvdk_prog 85 "Converging CVE-2026-98432 nftables & MPTCP guard..."
 SYSCTL_CVE_FILE="/etc/sysctl.d/99-cve-2026-98432-tcp.conf"
 NFT_CVE_FILE="/etc/nftables.d/cve-2026-98432.nft"
 UNIT_CVE_FILE="/etc/systemd/system/cve-2026-98432-guard.service"
@@ -281,4 +306,5 @@ UNIT_EOF
 fi
 
 # ----------------------------------------------------------------------------------
+rvdk_prog 100 "Debian Day-0 OS normalization complete"
 log_info "Day-0 Debian bootstrap complete. Node is pregamed and ready for forge.sh."

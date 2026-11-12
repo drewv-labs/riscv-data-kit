@@ -6,7 +6,7 @@
 #              eradication for Ubuntu 24.04+ RISC-V nodes.
 #
 # Usage:
-#   ./bootstrap-ubuntu.sh --user drew --hostname brakerbox-p550 --nopasswd
+#   ./bootstrap-ubuntu.sh --user drew --hostname brakerbox-p550 --nopasswd [--noprogbar]
 #   ./bootstrap-ubuntu.sh --debloat-only
 # ==============================================================================
 
@@ -18,6 +18,7 @@ TARGET_HOSTNAME=""
 NOPASSWD_SUDO="false"
 DEBLOAT_UBUNTU="true"
 DEFAULT_GROUPS=("sudo" "adm" "dialout" "plugdev" "render" "video")
+ORIG_ARGS=("$@")
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -38,6 +39,7 @@ Options:
   -n, --nopasswd              Enable passwordless sudo (NOPASSWD) for --user
       --debloat-only          Only execute headless target, snapd, and GUI purge
       --keep-gui              Skip snapd and desktop GUI purge
+      --noprogbar             Suppress persistent bottom progress bar
   -h, --help                  Show this help message and exit
 
 Example:
@@ -83,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             DEBLOAT_UBUNTU="false"
             shift
             ;;
+        --noprogbar|--no-progbar)
+            export RVDK_NO_PROGBAR="1"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -103,16 +109,32 @@ fi
 if [[ $EUID -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
         log_info "Escalating privileges via sudo..."
-        exec sudo -E bash "$0" "$@"
+        exec sudo -E bash "$0" "${ORIG_ARGS[@]}"
     else
         log_err "This script must be run as root."
         exit 1
     fi
 fi
 
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    [[ -f "${_SCRIPT_DIR}/../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../lib/progbar.sh"
+fi
+if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_PROGBAR_CANDIDATE"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_prog_init "Ubuntu Day-0 OS normalization..."
+
 # ==============================================================================
 # 1. USER, GROUP & NOPASSWD SUDO PROVISIONING
 # ==============================================================================
+rvdk_prog 10 "Converging user & sudoers (${TARGET_USER:-skip})..."
 if [[ -n "$TARGET_USER" ]]; then
     log_info "Processing user configuration for '${TARGET_USER}'..."
 
@@ -168,6 +190,7 @@ fi
 # ==============================================================================
 # 2. HOSTNAME CONFIGURATION
 # ==============================================================================
+rvdk_prog 30 "Configuring system hostname (${TARGET_HOSTNAME:-current})..."
 if [[ -n "$TARGET_HOSTNAME" ]]; then
     CURRENT_HOSTNAME="$(hostname)"
 
@@ -198,13 +221,14 @@ fi
 # 3. HEADLESS TARGET, SNAPD ERADICATION & DESKTOP GUI PURGE
 # ==============================================================================
 if [[ "$DEBLOAT_UBUNTU" == "true" ]]; then
+    rvdk_prog 50 "Enforcing headless target & purging snapd/GUI bloat..."
     log_info "Enforcing headless Ubuntu server configuration..."
 
     # 3.1 Lock boot target to headless console
     if [[ "$(systemctl get-default)" != "multi-user.target" ]]; then
         systemctl set-default multi-user.target
-systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+        systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+        systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
         systemctl stop gdm3 2>/dev/null || true
         log_ok "Boot target set to headless multi-user.target"
     else
@@ -213,6 +237,7 @@ systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 
     # 3.2 Purge snapd & prevent Canonical from re-installing it via APT pin
     if command -v snap >/dev/null 2>&1 || dpkg -l snapd 2>/dev/null | grep -q "^ii"; then
+        rvdk_prog 60 "Purging snapd & snap mounts..."
         for s in firefox snap-store gnome-42-2204 gtk-common-themes core22 bare snapd; do
             snap remove --purge "$s" 2>/dev/null || true
         done
@@ -249,6 +274,7 @@ EOF
     done
 
     if [[ ${#PURGE_LIST[@]} -gt 0 ]]; then
+        rvdk_prog 72 "Purging Ubuntu desktop GUI packages..."
         apt-get purge "${APT_FLAGS[@]}" "${PURGE_LIST[@]}"
         apt-get autoremove "${APT_FLAGS[@]}" --purge
         apt-get clean
@@ -262,6 +288,7 @@ fi
 # ==============================================================================
 # 4. CVE-2026-98432 KERNEL IPv4 TCP RCU USE-AFTER-FREE MITIGATION
 # ==============================================================================
+rvdk_prog 85 "Converging CVE-2026-98432 nftables & MPTCP guard..."
 SYSCTL_CVE_FILE="/etc/sysctl.d/99-cve-2026-98432-tcp.conf"
 NFT_CVE_FILE="/etc/nftables.d/cve-2026-98432.nft"
 UNIT_CVE_FILE="/etc/systemd/system/cve-2026-98432-guard.service"
@@ -315,4 +342,5 @@ UNIT_EOF
 fi
 
 # ----------------------------------------------------------------------------------
-log_info "Day-0 Debian bootstrap complete. Node is pregamed and ready for forge.sh."
+rvdk_prog 100 "Ubuntu Day-0 OS normalization complete"
+log_info "Day-0 Ubuntu bootstrap complete. Node is pregamed and ready for forge.sh."
