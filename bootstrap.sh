@@ -63,6 +63,10 @@ if [[ $# -gt 0 ]]; then
             MODULE="mods/tailscale"
             shift
             ;;
+        util/*)
+            MODULE="utils/${1#util/}"
+            shift
+            ;;
         day0|bsp|os|postgresql|postgresql/*|utils/*|mods/*|update|self-update)
             MODULE="$1"
             shift
@@ -70,6 +74,7 @@ if [[ $# -gt 0 ]]; then
         install)
             MODULE="${2:-day0}"
             [[ "$MODULE" == "tailscale" ]] && MODULE="mods/tailscale"
+            [[ "$MODULE" == util/* ]] && MODULE="utils/${MODULE#util/}"
             shift $(( $# >= 2 ? 2 : 1 ))
             ;;
     esac
