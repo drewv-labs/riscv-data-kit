@@ -25,6 +25,15 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
+# Silence SSH-forwarded LC_* warnings (ZedBook / macOS SendEnv) prior to Stage 2 locale-gen
+if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
+    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
+elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
+    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
+else
+    export LANG="C" LC_ALL="C"
+fi
+
 SKIP_UPGRADE="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -28,6 +28,15 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
+# Sanitize SSH-forwarded LC_* (e.g. ZedBook / macOS SendEnv) before en_US.UTF-8 exists on target
+if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
+    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
+elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
+    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
+else
+    export LANG="C" LC_ALL="C"
+fi
+
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
 REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 if command -v getent >/dev/null 2>&1; then

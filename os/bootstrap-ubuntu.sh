@@ -116,6 +116,15 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
+# Sanitize SSH-forwarded LC_* (e.g. ZedBook / macOS SendEnv)
+if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
+    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
+elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
+    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
+else
+    export LANG="C" LC_ALL="C"
+fi
+
 _PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
 if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

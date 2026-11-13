@@ -109,6 +109,15 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
+# Sanitize SSH-forwarded LC_* (e.g. ZedBook / macOS SendEnv) prior to locale-gen
+if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
+    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
+elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
+    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
+else
+    export LANG="C" LC_ALL="C"
+fi
+
 _PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
 if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -134,10 +143,11 @@ if ! command -v sudo >/dev/null 2>&1; then
 fi
 
 # ==============================================================================
-# 0. UTF-8 LOCALE HYGIENE (Prevents macOS SSH LC_* Perl/APT warnings)
+# 0. UTF-8 LOCALE HYGIENE (Prevents ZedBook / macOS SSH LC_* Perl/APT warnings)
 # ==============================================================================
 if [[ "$FIX_LOCALE" == "true" ]]; then
-    if locale -a 2>/dev/null | grep -qi "en_US\.utf8"; then
+    if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
+        export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
         log_skip "Locale en_US.UTF-8 is already generated"
     else
         log_info "Generating en_US.UTF-8 locale..."
@@ -145,6 +155,7 @@ if [[ "$FIX_LOCALE" == "true" ]]; then
         sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
         locale-gen en_US.UTF-8
         update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+        export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
         log_ok "Configured en_US.UTF-8 locale"
     fi
 fi
