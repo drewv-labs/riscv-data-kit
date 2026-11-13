@@ -301,5 +301,8 @@ rvdk_prog_cleanup() {
         _RVDK_PROG_OWNER="0"
         unset RVDK_PROGBAR_SESSION 2>/dev/null || true
     fi
+    if [[ -n "${_RVDK_OWN_APT_STAMP:-}" ]]; then
+        rm -f "${_RVDK_OWN_APT_STAMP}" 2>/dev/null || true
+    fi
     return "$rc"
 }

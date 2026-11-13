@@ -7,7 +7,7 @@
 #   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash
 #
 # Usage (Explicit Cold Source Compile with PMU perf stat Telemetry):
-#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash -s -- --force-build [--noprogbar]
+#   curl -fsSL https://rvdk.drewv-labs.dev/postgresql/18-6-io_uring/forge.sh | sudo bash -s -- --force-build [--no-apt-update] [--noprogbar]
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -25,17 +25,21 @@ while [[ $# -gt 0 ]]; do
             DATA_MOUNT="$2"; shift 2 ;;
         --subnet)
             LAB_SUBNET="$2"; shift 2 ;;
+        --no-apt-update|--skip-apt-update)
+            export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)
             export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
@@ -44,10 +48,35 @@ else
     rvdk_prog()      { :; }
 fi
 
-rvdk_prog_init "PG 18.6: detecting RISC-V silicon profile..."
-
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_has_lists() { compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; }
+    rvdk_apt_mark_updated() {
+        export RVDK_NO_APT_UPDATE="1"
+        [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+    }
+    rvdk_apt_update() {
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" == "1" ]] && rvdk_apt_has_lists; then return 0; fi
+        apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
+        rvdk_apt_mark_updated
+    }
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        rvdk_apt_update
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
+fi
+
+rvdk_prog_init "PG 18.6: detecting RISC-V silicon profile..."
 
 log_info() { printf "\033[1;36m[RVDK:PG18]\033[0m %s\n" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
@@ -83,10 +112,31 @@ LOCAL_REPO_DIR="/opt/drewv-pgdg-riscv64/debs"
 BUILD_DIR="/opt/drewv-pgdg-riscv64/build"
 LOCAL_LIST="/etc/apt/sources.list.d/drewv-local-pgdg.list"
 
+# Normalize any existing local PGDG list/index so future `apt update` runs never emit
+# repeated `Ign: file:/opt/drewv-pgdg-riscv64/debs ... Translation-en` probes.
+if [[ -f "${LOCAL_REPO_DIR}/Packages" && ! -f "${LOCAL_REPO_DIR}/Packages.gz" ]]; then
+    gzip -9cn "${LOCAL_REPO_DIR}/Packages" > "${LOCAL_REPO_DIR}/Packages.gz" 2>/dev/null || true
+fi
+if [[ -f "$LOCAL_LIST" ]] && ! grep -q "lang=none" "$LOCAL_LIST" 2>/dev/null; then
+    echo "deb [trusted=yes lang=none] file://${LOCAL_REPO_DIR} ./" > "$LOCAL_LIST"
+fi
+
 update_local_repo() {
-    (cd "$LOCAL_REPO_DIR" && dpkg-scanpackages . /dev/null > Packages 2>/dev/null)
-    echo "deb [trusted=yes] file://${LOCAL_REPO_DIR} ./" > "$LOCAL_LIST"
-    apt-get update -o Acquire::GzipIndexes=false -q
+    (
+        cd "$LOCAL_REPO_DIR"
+        dpkg-scanpackages . /dev/null > Packages 2>/dev/null
+        gzip -9cn Packages > Packages.gz
+    )
+    echo "deb [trusted=yes lang=none] file://${LOCAL_REPO_DIR} ./" > "$LOCAL_LIST"
+    if rvdk_apt_has_lists; then
+        # Index only the local .deb repo without re-fetching upstream mirrors
+        apt-get update \
+            -o Dir::Etc::sourcelist="$LOCAL_LIST" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0" -q
+    else
+        rvdk_apt_update
+    fi
 }
 
 # 2. Install PostgreSQL 18.6 (Default: RVDK Precompiled Bundle | Optional: --force-build)
@@ -95,9 +145,8 @@ if dpkg -s "postgresql-${PG_VERSION}" >/dev/null 2>&1 && [[ "$FORCE_BUILD" == "f
     log_skip "postgresql-${PG_VERSION} is already installed (pass --force-build to recompile)"
 else
     mkdir -p "$LOCAL_REPO_DIR"
-    rvdk_prog 20 "PG 18.6: installing repository & archive prerequisites..."
-    apt-get update -q
-    apt-get install "${APT_FLAGS[@]}" curl ca-certificates zstd dpkg-dev gnupg lsb-release rsync
+    rvdk_prog 20 "PG 18.6: verifying repository & archive prerequisites..."
+    rvdk_apt_ensure curl ca-certificates zstd dpkg-dev gnupg lsb-release rsync
 
     if [[ "$FORCE_BUILD" == "false" ]]; then
         if ! ls "${LOCAL_REPO_DIR}"/postgresql-${PG_VERSION}_*.deb >/dev/null 2>&1; then
@@ -116,11 +165,20 @@ else
         curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
         CODENAME="$(lsb_release -cs 2>/dev/null || echo sid)"
         [[ "$CODENAME" =~ ^(forky|trixie|bookworm|n/a|)$ ]] && CODENAME="sid"
-        cat <<EOF > /etc/apt/sources.list.d/pgdg.list
+        PGDG_LIST="/etc/apt/sources.list.d/pgdg.list"
+        cat <<EOF > "$PGDG_LIST"
 deb-src [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main ${PG_VERSION}
 EOF
-        apt-get update -q
-        apt-get install "${APT_FLAGS[@]}" debhelper build-essential liburing-dev libzstd-dev liblz4-dev bc time
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" == "1" ]] && rvdk_apt_has_lists; then
+            apt-get update \
+                -o Dir::Etc::sourcelist="$PGDG_LIST" \
+                -o Dir::Etc::sourceparts="-" \
+                -o APT::Get::List-Cleanup="0" -q
+        else
+            apt-get update -q
+            rvdk_apt_mark_updated
+        fi
+        rvdk_apt_ensure debhelper build-essential liburing-dev libzstd-dev liblz4-dev bc time
 
         OPT_FLAGS="-O3 -pipe -march=rv64gc_zba_zbb"
         if gcc -march=rv64gc_zba_zbb -mcpu="${CPU_MTUNE}" -E -x c /dev/null >/dev/null 2>&1; then
@@ -150,6 +208,7 @@ EOF
     fi
 
     rvdk_prog 60 "PG 18.6: installing postgresql-${PG_VERSION} packages..."
+    rvdk_apt_update
     apt-get install "${APT_FLAGS[@]}" "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}"
     log_ok "Installed PostgreSQL ${PG_VERSION} (${TARGET_SLUG})"
 fi

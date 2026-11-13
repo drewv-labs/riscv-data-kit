@@ -6,7 +6,7 @@
 #              UTF-8 locale, and hostname configuration for Debian nodes.
 #
 # Usage:
-#   ./bootstrap-debian.sh --user drew --hostname brakerbox-titan --nopasswd [--noprogbar]
+#   ./bootstrap-debian.sh --user drew --hostname brakerbox-titan --nopasswd [--no-apt-update] [--noprogbar]
 # ==============================================================================
 
 set -euo pipefail
@@ -34,6 +34,7 @@ Options:
   -H, --hostname <hostname>   New system hostname to configure
   -n, --nopasswd              Enable passwordless sudo (NOPASSWD) for --user
       --skip-locale           Skip en_US.UTF-8 locale verification
+      --no-apt-update         Skip redundant apt-get update calls
       --noprogbar             Suppress persistent bottom progress bar
   -h, --help                  Show this help message and exit
 
@@ -74,6 +75,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-locale)
             FIX_LOCALE="false"
+            shift
+            ;;
+        --no-apt-update|--skip-apt-update)
+            export RVDK_NO_APT_UPDATE="1"
             shift
             ;;
         --noprogbar|--no-progbar)
@@ -118,11 +123,13 @@ else
     export LANG="C" LC_ALL="C"
 fi
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
@@ -131,14 +138,35 @@ else
     rvdk_prog()      { :; }
 fi
 
-rvdk_prog_init "Debian Day-0 OS normalization..."
 export DEBIAN_FRONTEND=noninteractive
+APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" ]] || ! compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
+            apt-get update -q
+            export RVDK_NO_APT_UPDATE="1"
+            [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+        fi
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
+fi
+
+rvdk_prog_init "Debian Day-0 OS normalization..."
 
 # Ensure 'sudo' package itself is installed (minimal Debian images often omit it)
 rvdk_prog 5 "Verifying sudo & UTF-8 locale..."
 if ! command -v sudo >/dev/null 2>&1; then
     log_info "Installing missing 'sudo' package..."
-    apt-get update -q && apt-get install -y sudo
+    rvdk_apt_ensure sudo
     log_ok "Installed 'sudo'"
 fi
 
@@ -151,7 +179,7 @@ if [[ "$FIX_LOCALE" == "true" ]]; then
         log_skip "Locale en_US.UTF-8 is already generated"
     else
         log_info "Generating en_US.UTF-8 locale..."
-        apt-get update -q && apt-get install -y locales
+        rvdk_apt_ensure locales
         sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
         locale-gen en_US.UTF-8
         update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
@@ -282,7 +310,7 @@ SYSCTL_EOF
     sysctl --system >/dev/null
 
     if ! command -v nft >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq nftables
+        rvdk_apt_ensure nftables
     fi
 
     mkdir -p /etc/nftables.d

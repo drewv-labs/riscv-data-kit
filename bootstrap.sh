@@ -7,7 +7,7 @@
 #   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname brakerbench-vf2 --nopasswd [--with-tailscale]
 #
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
-#   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|mods/tailscale|utils/*|update] [--with-tailscale] [--noprogbar]
+#   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|mods/tailscale|utils/*|update] [--no-apt-update] [--with-tailscale] [--noprogbar]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -88,6 +88,10 @@ while [[ $# -gt 0 ]]; do
             SOC_PATH="${2:-}"; shift 2 ;;
         --os)
             OS_ID="${2:-}"; shift 2 ;;
+        --no-apt-update|--skip-apt-update)
+            export RVDK_NO_APT_UPDATE="1"
+            FORWARD_ARGS+=("--no-apt-update")
+            shift ;;
         --with-tailscale|--tailscale)
             WITH_TAILSCALE="true"; shift ;;
         --tailscale-up|--ts-up)
@@ -184,6 +188,20 @@ if [[ -z "$OS_ID" ]]; then
 fi
 OS_ID="$(tr '[:upper:]' '[:lower:]' <<< "$OS_ID")"
 
+export RVDK_APT_LIB="${LOCAL_ROOT}/lib/apt.sh"
+_RVDK_OWN_APT_STAMP=""
+if [[ -z "${RVDK_APT_STAMP_FILE:-}" ]]; then
+    _RVDK_OWN_APT_STAMP="/run/rvdk-apt-$$.stamp"
+    rm -f "$_RVDK_OWN_APT_STAMP" 2>/dev/null || true
+    export RVDK_APT_STAMP_FILE="$_RVDK_OWN_APT_STAMP"
+fi
+
+sync_apt_stamp() {
+    if [[ -n "${RVDK_APT_STAMP_FILE:-}" && -f "$RVDK_APT_STAMP_FILE" ]]; then
+        export RVDK_NO_APT_UPDATE="1"
+    fi
+}
+
 export RVDK_PROGBAR_LIB="${LOCAL_ROOT}/lib/progbar.sh"
 if [[ -f "$RVDK_PROGBAR_LIB" ]]; then
     # shellcheck disable=SC1090
@@ -216,13 +234,16 @@ run_optional_tailscale() {
     local span_pct="${2:-20}"
     local ts_script="${LOCAL_ROOT}/mods/tailscale/forge.sh"
     [[ ! -f "$ts_script" ]] && log_fatal "Tailscale module not found: ${ts_script}"
+    sync_apt_stamp
     log_rvdk "Optional Add-On: Tailscale Mesh VPN (${ts_script})..."
+    local ts_args=()
+    [[ "${RVDK_NO_APT_UPDATE:-0}" == "1" ]] && ts_args+=("--no-apt-update")
     if [[ -n "$TS_AUTHKEY_CLI" ]]; then
         TS_AUTHKEY="$TS_AUTHKEY_CLI" RVDK_PROG_BASE="$base_pct" RVDK_PROG_SPAN="$span_pct" \
-            bash "$ts_script" ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"}
+            bash "$ts_script" ${ts_args[@]+"${ts_args[@]}"} ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"}
     else
         RVDK_PROG_BASE="$base_pct" RVDK_PROG_SPAN="$span_pct" \
-            bash "$ts_script" ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"}
+            bash "$ts_script" ${ts_args[@]+"${ts_args[@]}"} ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"}
     fi
 }
 
@@ -240,6 +261,7 @@ case "$MODULE" in
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             log_rvdk "Stage 1/2: Silicon BSP & APT Repo Migration (${BSP_SCRIPT})..."
             RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            sync_apt_stamp
             log_rvdk "Stage 2/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
             RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         else
@@ -247,6 +269,7 @@ case "$MODULE" in
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             log_rvdk "Stage 1/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
             RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            sync_apt_stamp
             log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
             RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         fi
@@ -286,3 +309,7 @@ case "$MODULE" in
         rvdk_prog 100 "${MODULE} converged"
         ;;
 esac
+
+if [[ -n "$_RVDK_OWN_APT_STAMP" ]]; then
+    rm -f "$_RVDK_OWN_APT_STAMP" 2>/dev/null || true
+fi

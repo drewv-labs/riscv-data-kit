@@ -4,7 +4,7 @@
 # Path: riscv-data-kit/mods/btrfs-raid/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/btrfs-raid [--force-wipe-raid] [--noprogbar]
+#   sudo rvdk mods/btrfs-raid [--force-wipe-raid] [--no-apt-update] [--noprogbar]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/btrfs-raid/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
@@ -27,20 +27,23 @@ NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
 FORCE_WIPE_RAID="${FORCE_WIPE_RAID:-false}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --json) RAID_ARRAYS_JSON="${2:-[]}"; shift 2 ;;
-        --force-wipe|--force-wipe-raid) FORCE_WIPE_RAID="true"; shift ;;
-        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
+        --json)                             RAID_ARRAYS_JSON="${2:-[]}"; shift 2 ;;
+        --force-wipe|--force-wipe-raid)     FORCE_WIPE_RAID="true"; shift ;;
+        --no-apt-update|--skip-apt-update)  export RVDK_NO_APT_UPDATE="1"; shift ;;
+        --noprogbar|--no-progbar)           export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
 
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
@@ -49,10 +52,29 @@ else
     rvdk_prog()      { :; }
 fi
 
-rvdk_prog_init "Btrfs RAID 10: installing btrfs-progs & jq..."
-
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" ]] || ! compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
+            apt-get update -q
+            export RVDK_NO_APT_UPDATE="1"
+            [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+        fi
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
+fi
+
+rvdk_prog_init "Btrfs RAID 10: verifying btrfs-progs & jq..."
 
 log_info()  { printf "\033[1;36m[RVDK:RAID10]\033[0m %s\n" "$1"; }
 log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
@@ -60,8 +82,7 @@ log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 rvdk_prog 15 "Btrfs RAID 10: verifying btrfs-progs & jq..."
-apt-get update -q
-apt-get install "${APT_FLAGS[@]}" btrfs-progs jq util-linux
+rvdk_apt_ensure btrfs-progs jq util-linux
 
 ARRAY_COUNT="$(jq 'length' <<< "$RAID_ARRAYS_JSON" 2>/dev/null || echo 0)"
 if (( ARRAY_COUNT == 0 )); then

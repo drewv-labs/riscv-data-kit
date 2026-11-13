@@ -6,7 +6,7 @@
 #              eradication for Ubuntu 24.04+ RISC-V nodes.
 #
 # Usage:
-#   ./bootstrap-ubuntu.sh --user drew --hostname brakerbox-p550 --nopasswd [--noprogbar]
+#   ./bootstrap-ubuntu.sh --user drew --hostname brakerbox-p550 --nopasswd [--no-apt-update] [--noprogbar]
 #   ./bootstrap-ubuntu.sh --debloat-only
 # ==============================================================================
 
@@ -21,7 +21,7 @@ DEFAULT_GROUPS=("sudo" "adm" "dialout" "plugdev" "render" "video")
 ORIG_ARGS=("$@")
 
 export DEBIAN_FRONTEND=noninteractive
-APT_FLAGS=(-y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 # --- Logging Helpers ---
 log_info() { printf "\033[1;36m[INFO]\033[0m %s\n" "$1"; }
@@ -39,6 +39,7 @@ Options:
   -n, --nopasswd              Enable passwordless sudo (NOPASSWD) for --user
       --debloat-only          Only execute headless target, snapd, and GUI purge
       --keep-gui              Skip snapd and desktop GUI purge
+      --no-apt-update         Skip redundant apt-get update calls
       --noprogbar             Suppress persistent bottom progress bar
   -h, --help                  Show this help message and exit
 
@@ -85,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             DEBLOAT_UBUNTU="false"
             shift
             ;;
+        --no-apt-update|--skip-apt-update)
+            export RVDK_NO_APT_UPDATE="1"
+            shift
+            ;;
         --noprogbar|--no-progbar)
             export RVDK_NO_PROGBAR="1"
             shift
@@ -125,17 +130,38 @@ else
     export LANG="C" LC_ALL="C"
 fi
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
 else
     rvdk_prog_init() { :; }
     rvdk_prog()      { :; }
+fi
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" ]] || ! compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
+            apt-get update -qq
+            export RVDK_NO_APT_UPDATE="1"
+            [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+        fi
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
 fi
 
 rvdk_prog_init "Ubuntu Day-0 OS normalization..."
@@ -316,7 +342,7 @@ SYSCTL_EOF
     sysctl --system >/dev/null
 
     if ! command -v nft >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq nftables
+        rvdk_apt_ensure nftables
     fi
 
     mkdir -p /etc/nftables.d

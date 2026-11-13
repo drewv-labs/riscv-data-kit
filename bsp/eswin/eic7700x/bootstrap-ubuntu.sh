@@ -6,14 +6,14 @@
 #              governor lock, and PMU counter hardening for EIC7700X (Ubuntu/Debian).
 #
 # Usage:
-#   sudo rvdk bsp [--noprogbar]
+#   sudo rvdk bsp [--no-apt-update] [--noprogbar]
 #   sudo ./bsp/eswin/eic7700x/bootstrap-ubuntu.sh
 # ==============================================================================
 
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-APT_FLAGS=(-y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 # --- Logging Helpers ---
 log_info() { printf "\033[1;36m[INFO]\033[0m %s\n" "$1"; }
@@ -28,22 +28,44 @@ fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
-        *)                        shift ;;
+        --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
+        --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
+        *)                                 shift ;;
     esac
 done
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
 else
     rvdk_prog_init() { :; }
     rvdk_prog()      { :; }
+fi
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" ]] || ! compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
+            apt-get update -q
+            export RVDK_NO_APT_UPDATE="1"
+            [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+        fi
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
 fi
 
 rvdk_prog_init "EIC7700X BSP: inspecting device tree..."
@@ -182,8 +204,7 @@ fi
 rvdk_prog 90 "EIC7700X BSP: PWM fan controller & P550 PMU unlock..."
 if apt-cache show fancontrol-config-p550-premier >/dev/null 2>&1; then
     if ! dpkg -s fancontrol-config-p550-premier >/dev/null 2>&1; then
-        apt-get update -q
-        apt-get install "${APT_FLAGS[@]}" fancontrol-config-p550-premier
+        rvdk_apt_ensure fancontrol-config-p550-premier
         log_ok "Installed fancontrol-config-p550-premier"
     else
         log_skip "fancontrol-config-p550-premier already installed"

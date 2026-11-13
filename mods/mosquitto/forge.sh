@@ -4,7 +4,7 @@
 # Path: riscv-data-kit/mods/mosquitto/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/mosquitto [--port 1883] [--data-mount /mnt/nvme_pgdata] [--noprogbar]
+#   sudo rvdk mods/mosquitto [--port 1883] [--data-mount /mnt/nvme_pgdata] [--no-apt-update] [--noprogbar]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/mosquitto/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
@@ -31,18 +31,21 @@ DATA_MOUNT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --port)       MQTT_PORT="${2:-1883}"; shift 2 ;;
-        --data-mount) DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
-        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
+        --port)                             MQTT_PORT="${2:-1883}"; shift 2 ;;
+        --data-mount)                       DATA_MOUNT="${2:-/mnt/nvme_pgdata}"; shift 2 ;;
+        --no-apt-update|--skip-apt-update)  export RVDK_NO_APT_UPDATE="1"; shift ;;
+        --noprogbar|--no-progbar)           export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
 done
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
@@ -51,18 +54,36 @@ else
     rvdk_prog()      { :; }
 fi
 
-rvdk_prog_init "Mosquitto MQTT: installing packages..."
-
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" ]] || ! compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
+            apt-get update -q
+            export RVDK_NO_APT_UPDATE="1"
+            [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+        fi
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
+fi
+
+rvdk_prog_init "Mosquitto MQTT: verifying packages..."
 
 log_info() { printf "\033[1;36m[RVDK:MQTT]\033[0m %s\n" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 
-rvdk_prog 25 "Mosquitto MQTT: installing mosquitto & clients..."
-apt-get update -q
-apt-get install "${APT_FLAGS[@]}" mosquitto mosquitto-clients
+rvdk_prog 25 "Mosquitto MQTT: verifying mosquitto & clients..."
+rvdk_apt_ensure mosquitto mosquitto-clients
 
 rvdk_prog 60 "Mosquitto MQTT: staging persistence & socket directories..."
 if mountpoint -q "$DATA_MOUNT" 2>/dev/null; then

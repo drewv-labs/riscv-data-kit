@@ -4,7 +4,7 @@
 # Path: riscv-data-kit/mods/nfs-vault/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/nfs-vault [--subnet 10.0.10.0/24] [--data-mount /mnt/nvme_pgdata] [--noprogbar]
+#   sudo rvdk mods/nfs-vault [--subnet 10.0.10.0/24] [--data-mount /mnt/nvme_pgdata] [--no-apt-update] [--noprogbar]
 #   sudo rvdk mods/nfs-vault [--auto | --ganesha | --kernel | --backend <auto|ganesha|kernel>]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/nfs-vault/forge.sh | sudo bash
 # ==============================================================================
@@ -46,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --auto|--nfs-auto)                   REQUESTED_BACKEND="auto"; shift ;;
         --ganesha|--nfs-ganesha|--userspace) REQUESTED_BACKEND="ganesha"; shift ;;
         --kernel|--nfs-kernel|--nfs-kernal)  REQUESTED_BACKEND="kernel"; shift ;;
+        --no-apt-update|--skip-apt-update)   export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)            export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
     esac
@@ -53,7 +54,7 @@ done
 
 REQUESTED_BACKEND="$(tr '[:upper:]' '[:lower:]' <<< "$REQUESTED_BACKEND")"
 case "$REQUESTED_BACKEND" in
-    auto)                        REQUESTED_BACKEND="auto" ;;
+    auto)                          REQUESTED_BACKEND="auto" ;;
     ganesha|nfs-ganesha|userspace) REQUESTED_BACKEND="ganesha" ;;
     kernel|nfs-kernel|nfs-kernal|knfsd|nfsd) REQUESTED_BACKEND="kernel" ;;
     *)
@@ -62,11 +63,13 @@ case "$REQUESTED_BACKEND" in
         ;;
 esac
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
@@ -75,10 +78,29 @@ else
     rvdk_prog()      { :; }
 fi
 
-rvdk_prog_init "NFSv4 Vault: probing backend (${REQUESTED_BACKEND})..."
-
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" ]] || ! compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
+            apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
+            export RVDK_NO_APT_UPDATE="1"
+            [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+        fi
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
+fi
+
+rvdk_prog_init "NFSv4 Vault: probing backend (${REQUESTED_BACKEND})..."
 
 log_info()  { printf "\033[1;36m[RVDK:NFSv4]\033[0m %s\n" "$1"; }
 log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
@@ -117,21 +139,19 @@ case "$REQUESTED_BACKEND" in
         ;;
 esac
 
-rvdk_prog 30 "NFSv4 Vault: installing ${NFS_MODE} server packages..."
-apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
-
+rvdk_prog 30 "NFSv4 Vault: verifying ${NFS_MODE} server packages..."
 if [[ "$NFS_MODE" == "kernel" ]]; then
     if systemctl is-active --quiet nfs-ganesha.service 2>/dev/null || systemctl is-enabled --quiet nfs-ganesha.service 2>/dev/null; then
         systemctl disable --now nfs-ganesha.service 2>/dev/null || true
         systemctl reset-failed nfs-ganesha.service nfs-ganesha-lock.service 2>/dev/null || true
     fi
-    apt-get install "${APT_FLAGS[@]}" nfs-kernel-server nfs-common jq
+    rvdk_apt_ensure nfs-kernel-server nfs-common jq
 else
     exportfs -ua 2>/dev/null || true
     systemctl stop nfs-server.service nfs-kernel-server.service nfs-mountd.service nfsdcld.service 2>/dev/null || true
     systemctl disable nfs-server.service nfs-kernel-server.service 2>/dev/null || true
     systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-mountd.service nfsdcld.service 2>/dev/null || true
-    apt-get install "${APT_FLAGS[@]}" nfs-ganesha nfs-ganesha-vfs nfs-common jq
+    rvdk_apt_ensure nfs-ganesha nfs-ganesha-vfs nfs-common jq
 fi
 
 rvdk_prog 65 "NFSv4 Vault: building export definitions (${LAB_SUBNET})..."

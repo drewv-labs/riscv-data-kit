@@ -10,7 +10,7 @@
 #                and unlocks SiFive U74 PMU counters.
 #
 # Usage:
-#   sudo rvdk bsp [--skip-upgrade] [--noprogbar]
+#   sudo rvdk bsp [--skip-upgrade] [--no-apt-update] [--noprogbar]
 #   curl -fsSL https://rvdk.drewv-labs.dev/bsp/starfive/jh7110/forge-debian.sh | sudo bash
 # ==============================================================================
 
@@ -37,17 +37,20 @@ fi
 SKIP_UPGRADE="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-upgrade)           SKIP_UPGRADE="true"; shift ;;
-        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
-        *)                        shift ;;
+        --skip-upgrade)                    SKIP_UPGRADE="true"; shift ;;
+        --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
+        --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
+        *)                                 shift ;;
     esac
 done
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-if [[ -z "$_PROGBAR_CANDIDATE" && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    [[ -f "${_SCRIPT_DIR}/../../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../../lib/progbar.sh"
 fi
+
+_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../../lib/progbar.sh"
 if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
     # shellcheck disable=SC1090
     source "$_PROGBAR_CANDIDATE"
@@ -55,8 +58,6 @@ else
     rvdk_prog_init() { :; }
     rvdk_prog()      { :; }
 fi
-
-rvdk_prog_init "JH7110 BSP: inspecting device tree..."
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(
@@ -66,6 +67,34 @@ APT_FLAGS=(
     -o Dpkg::Options::="--force-confdef"
     -o Dpkg::Options::="--force-confold"
 )
+
+_APT_CANDIDATE="${RVDK_APT_LIB:-}"
+[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../../lib/apt.sh"
+if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$_APT_CANDIDATE"
+else
+    rvdk_apt_mark_updated() {
+        export RVDK_NO_APT_UPDATE="1"
+        [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+    }
+    rvdk_apt_update() {
+        if [[ "${RVDK_NO_APT_UPDATE:-0}" == "1" ]] && compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
+            return 0
+        fi
+        apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
+        rvdk_apt_mark_updated
+    }
+    rvdk_apt_ensure() {
+        local m=() p
+        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
+        [[ ${#m[@]} -eq 0 ]] && return 0
+        rvdk_apt_update
+        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
+    }
+fi
+
+rvdk_prog_init "JH7110 BSP: inspecting device tree..."
 
 log_info() { printf "\033[1;36m[RVDK:JH7110]\033[0m %s\n" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
@@ -127,6 +156,7 @@ EOF
 
     echo "$DESIRED_SOURCES" > /etc/apt/sources.list
     apt-get update -y
+    rvdk_apt_mark_updated
     log_ok "Migrated APT sources to official Debian unstable + StarFive BSP repo"
 else
     log_skip "APT sources (/etc/apt/sources.list) already pointing to official Debian unstable"
@@ -171,14 +201,17 @@ fi
 
 if [[ "$SKIP_UPGRADE" == "false" ]]; then
     rvdk_prog 55 "JH7110 BSP: running apt full-upgrade & core packages..."
-    log_info "Running non-interactive full-upgrade and installing core JH7110 packages..."
-    apt-get update -q
+    log_info "Running non-interactive full-upgrade and verifying core JH7110 packages..."
+    rvdk_apt_update
     apt-get full-upgrade "${APT_FLAGS[@]}"
-    rvdk_prog 72 "JH7110 BSP: installing core build & perf packages..."
-    apt-get install "${APT_FLAGS[@]}" \
+    rvdk_prog 72 "JH7110 BSP: verifying core build & perf packages..."
+    rvdk_apt_ensure \
         build-essential dkms pciutils nvme-cli lvm2 parted git curl wget \
         htop jq tmux bc rsync time sysstat linux-perf zstd dpkg-dev
-    apt-get install "${APT_FLAGS[@]}" "linux-headers-$(uname -r)" 2>/dev/null || true
+    K_HDR="linux-headers-$(uname -r)"
+    if ! dpkg -s "$K_HDR" >/dev/null 2>&1; then
+        apt-get install "${APT_FLAGS[@]}" "$K_HDR" 2>/dev/null || true
+    fi
     log_ok "System packages and JH7110 utilities converged"
 else
     log_skip "Skipped apt-get full-upgrade (--skip-upgrade)"
