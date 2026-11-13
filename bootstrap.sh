@@ -4,10 +4,10 @@
 # Path: riscv-data-kit/bootstrap.sh
 #
 # Usage (One-Shot Curl Day-0 OS + BSP Bootstrapper + CLI Install):
-#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname brakerbench-vf2 --nopasswd
+#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname brakerbench-vf2 --nopasswd [--with-tailscale]
 #
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
-#   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|utils/*|update] [--noprogbar]
+#   sudo rvdk [day0|bsp|os|postgresql|mods/nvme-4kn|mods/btrfs-raid|mods/mosquitto|mods/nfs-vault|mods/tailscale|utils/*|update] [--with-tailscale] [--noprogbar]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -59,12 +59,17 @@ log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 MODULE="day0"
 if [[ $# -gt 0 ]]; then
     case "$1" in
+        tailscale)
+            MODULE="mods/tailscale"
+            shift
+            ;;
         day0|bsp|os|postgresql|postgresql/*|utils/*|mods/*|update|self-update)
             MODULE="$1"
             shift
             ;;
         install)
             MODULE="${2:-day0}"
+            [[ "$MODULE" == "tailscale" ]] && MODULE="mods/tailscale"
             shift $(( $# >= 2 ? 2 : 1 ))
             ;;
     esac
@@ -72,14 +77,31 @@ fi
 
 SOC_PATH="${RVDK_SOC:-}"
 OS_ID="${RVDK_OS:-}"
+WITH_TAILSCALE="false"
+TS_AUTHKEY_CLI=""
+TS_EXTRA_ARGS=()
 FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --soc)                    SOC_PATH="${2:-}"; shift 2 ;;
-        --os)                     OS_ID="${2:-}"; shift 2 ;;
-        --noprogbar|--no-progbar) export RVDK_NO_PROGBAR="1"; shift ;;
-        *)                        FORWARD_ARGS+=("$1"); shift ;;
+        --soc)
+            SOC_PATH="${2:-}"; shift 2 ;;
+        --os)
+            OS_ID="${2:-}"; shift 2 ;;
+        --with-tailscale|--tailscale)
+            WITH_TAILSCALE="true"; shift ;;
+        --tailscale-up|--ts-up)
+            WITH_TAILSCALE="true"; TS_EXTRA_ARGS+=("--up"); shift ;;
+        --tailscale-ssh|--ts-ssh)
+            WITH_TAILSCALE="true"; TS_EXTRA_ARGS+=("--ssh"); shift ;;
+        --tailscale-authkey|--ts-authkey)
+            WITH_TAILSCALE="true"; TS_AUTHKEY_CLI="${2:-}"; shift 2 ;;
+        --tailscale-routes)
+            WITH_TAILSCALE="true"; TS_EXTRA_ARGS+=("--advertise-routes" "${2:-}"); shift 2 ;;
+        --noprogbar|--no-progbar)
+            export RVDK_NO_PROGBAR="1"; shift ;;
+        *)
+            FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -189,45 +211,78 @@ resolve_os_script() {
     return 1
 }
 
+run_optional_tailscale() {
+    local base_pct="${1:-80}"
+    local span_pct="${2:-20}"
+    local ts_script="${LOCAL_ROOT}/mods/tailscale/forge.sh"
+    [[ ! -f "$ts_script" ]] && log_fatal "Tailscale module not found: ${ts_script}"
+    log_rvdk "Optional Add-On: Tailscale Mesh VPN (${ts_script})..."
+    if [[ -n "$TS_AUTHKEY_CLI" ]]; then
+        TS_AUTHKEY="$TS_AUTHKEY_CLI" RVDK_PROG_BASE="$base_pct" RVDK_PROG_SPAN="$span_pct" \
+            bash "$ts_script" ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"}
+    else
+        RVDK_PROG_BASE="$base_pct" RVDK_PROG_SPAN="$span_pct" \
+            bash "$ts_script" ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"}
+    fi
+}
+
 # 6. Dispatch Module (Use `bash`, not `exec bash`, so standalone progress bar EXIT trap tears down cleanly)
 case "$MODULE" in
     day0)
+        if [[ "$WITH_TAILSCALE" == "true" ]]; then
+            S1_SPAN=45; S2_BASE=45; S2_SPAN=35
+        else
+            S1_SPAN=55; S2_BASE=55; S2_SPAN=45
+        fi
         # StarFive JH7110 Debian: run BSP repo fix prior to generic OS apt calls
         if [[ "$SOC_PATH" == "starfive/jh7110" && "$OS_ID" == "debian" ]]; then
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             log_rvdk "Stage 1/2: Silicon BSP & APT Repo Migration (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE=0 RVDK_PROG_SPAN=55 bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             log_rvdk "Stage 2/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            RVDK_PROG_BASE=55 RVDK_PROG_SPAN=45 bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         else
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             log_rvdk "Stage 1/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            RVDK_PROG_BASE=0 RVDK_PROG_SPAN=55 bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE=55 RVDK_PROG_SPAN=45 bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        fi
+        if [[ "$WITH_TAILSCALE" == "true" ]]; then
+            run_optional_tailscale 80 20
         fi
         rvdk_prog 100 "Day-0 OS + Silicon BSP converged"
         ;;
     os)
         OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
         bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        [[ "$WITH_TAILSCALE" == "true" ]] && run_optional_tailscale 80 20
         rvdk_prog 100 "OS normalization converged"
         ;;
     bsp)
         BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
         bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        [[ "$WITH_TAILSCALE" == "true" ]] && run_optional_tailscale 80 20
         rvdk_prog 100 "Silicon BSP converged"
         ;;
     postgresql)
         bash "${LOCAL_ROOT}/postgresql/latest/forge.sh" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        [[ "$WITH_TAILSCALE" == "true" ]] && run_optional_tailscale 85 15
         rvdk_prog 100 "PostgreSQL 18.6 converged"
         ;;
     *)
         TARGET_MOD="${LOCAL_ROOT}/${MODULE}/forge.sh"
         [[ ! -f "$TARGET_MOD" ]] && log_fatal "Module script not found: ${TARGET_MOD}"
-        bash "$TARGET_MOD" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        if [[ "$MODULE" == "mods/tailscale" && -n "$TS_AUTHKEY_CLI" ]]; then
+            TS_AUTHKEY="$TS_AUTHKEY_CLI" bash "$TARGET_MOD" ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        elif [[ "$MODULE" == "mods/tailscale" ]]; then
+            bash "$TARGET_MOD" ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        else
+            bash "$TARGET_MOD" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            [[ "$WITH_TAILSCALE" == "true" ]] && run_optional_tailscale 80 20
+        fi
         rvdk_prog 100 "${MODULE} converged"
         ;;
 esac

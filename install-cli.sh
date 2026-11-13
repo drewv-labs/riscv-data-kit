@@ -87,12 +87,12 @@ if [[ -d "${ENGINE_DIR}/.git" ]]; then
     sudo -u "$REAL_USER" git -C "$ENGINE_DIR" fetch origin "$REPO_BRANCH" -q
     sudo -u "$REAL_USER" git -C "$ENGINE_DIR" reset --hard "origin/${REPO_BRANCH}" -q
 else
-    log_info "Cloning ${REPO_URL} into ${ENGINE_DIR}..."
+    log_info "Cloning ${REPO_URL} into ${ENGINE_DIR}... "
     rm -rf "$ENGINE_DIR"
     sudo -u "$REAL_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
 fi
 
-chmod +x "${ENGINE_DIR}/bootstrap.sh" "${ENGINE_DIR}/install-cli.sh" "${ENGINE_DIR}"/lib/*.sh "${ENGINE_DIR}"/utils/*.sh 2>/dev/null || true
+chmod +x "${ENGINE_DIR}/bootstrap.sh" "${ENGINE_DIR}/install-cli.sh" "${ENGINE_DIR}"/lib/*.sh "${ENGINE_DIR}"/mods/*/forge.sh "${ENGINE_DIR}"/utils/*.sh 2>/dev/null || true
 
 # 3. Link /usr/local/bin/rvdk
 install -d -m 0755 /usr/local/bin
@@ -132,6 +132,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    sudo rvdk mods/btrfs-raid
    sudo rvdk mods/mosquitto
    sudo rvdk mods/nfs-vault
+   sudo rvdk mods/tailscale   # Install static riscv64 Tailscale VPN [--ssh|--up]
    sudo rvdk utils/<script>   # Run host media flash utilities (macOS / Linux)
    sudo rvdk update           # Pull latest RVDK engine from GitHub
 ======================================================================
