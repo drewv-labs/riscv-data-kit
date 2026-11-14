@@ -1,0 +1,20 @@
+{
+  "board": "sifive/p550",
+  "tag": "p550",
+  "name": "SiFive HiFive Premier P550",
+  "soc": "eswin/eic7700x",
+  "default_os": "ubuntu-24.04",
+  "media": {
+    "usb": {
+      "script": "flash-usb.sh",
+      "description": "U-Boot ext4 recovery USB stick for eMMC installation (es_fs write usb 0 -> mmc 0)",
+      "image": "sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst",
+      "uboot_payload": "ubuntu-24.04-preinstalled-server-riscv64.img",
+      "min_size_gib": 8
+    }
+  },
+  "quirks": [
+    "fusb",
+    "hdmi"
+  ]
+}

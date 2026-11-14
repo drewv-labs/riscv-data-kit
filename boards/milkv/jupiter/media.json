@@ -1,0 +1,9 @@
+{
+  "board": "milkv/jupiter",
+  "tag": "jptr1",
+  "name": "Milk-V Jupiter (M1/K1)",
+  "soc": "spacemit/k1",
+  "default_os": "bianbu",
+  "media": {},
+  "quirks": []
+}

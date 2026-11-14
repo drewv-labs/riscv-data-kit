@@ -1,0 +1,9 @@
+{
+  "board": "ultrarisc/titan",
+  "tag": "titan",
+  "name": "UltraRISC / Milk-V Titan (DP1000)",
+  "soc": "ultrarisc/dp1000",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

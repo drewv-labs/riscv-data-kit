@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // SiFive HiFive Premier P550 (EIC7700X) Recovery USB Builder
-# Description: Validates removable USB media, resolves a custom (--image),
-#              cached (~/.rvdk/cache/), or remote (rvdk.drewv-labs.dev) SiFive
-#              P550 Ubuntu 24.04 image with SHA-256 verification, decompresses
-#              to a staging payload, and builds a U-Boot compatible ext4
-#              recovery stick (usb 0 -> mmc 0 es_fs write).
+# Path: riscv-data-kit/boards/sifive/p550/flash-usb.sh
 #
-# Usage (Default RVDK Cache / Auto-Download):
+# Description:
+#   Validates removable USB media, resolves a custom (--image), cached
+#   (~/.rvdk/cache/), or remote SiFive P550 Ubuntu 24.04 image with SHA-256
+#   verification, decompresses to a staging payload, and builds a U-Boot
+#   compatible ext4 recovery stick (`usb 0` -> `mmc 0` via `es_fs write`).
+#
+# Usage:
 #   diskutil list external physical
-#   ./utils/flash-sifive-p550-ubuntu-usb.sh 4
-#   ./utils/flash-sifive-p550-ubuntu-usb.sh --device /dev/sdX
-#   curl -fsSL https://rvdk.drewv-labs.dev/utils/flash-sifive-p550-ubuntu-usb.sh | sudo zsh -s -- 4
-#
-# Usage (Custom Local Image Override):
-#   ./utils/flash-sifive-p550-ubuntu-usb.sh 4 --image /path/to/custom.img.zst
-#   ./utils/flash-sifive-p550-ubuntu-usb.sh --device /dev/sdX --image /path/to/custom.img
+#   rvdk flash p550 usb 4
+#   rvdk flash p550 usb --device /dev/sdX
+#   rvdk flash p550 usb 4 --image /path/to/custom.img.zst
 # ==============================================================================
 
-# Ensure compatibility when invoked via `zsh` or `bash` (including `curl ... | sudo zsh -s -- ...`)
 if [[ -n "${ZSH_VERSION:-}" ]]; then
     emulate -L ksh
     setopt PIPE_FAIL ERR_RETURN NO_UNSET
@@ -26,10 +23,10 @@ else
     set -Eeuo pipefail
 fi
 
-log_info()  { printf "\033[1;36m[INFO]\033[0m %s\n" "$1"; }
+log_info()  { printf "\033[1;36m[RVDK:FLASH]\033[0m %s\n" "$1"; }
 log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 TARGET_ARG=""
 IMAGE_PATH=""
@@ -38,9 +35,15 @@ SKIP_CONFIRM="false"
 MAX_SAFE_BYTES=$((256 * 1024 * 1024 * 1024)) # 256 GiB guard against wiping backup drives
 MIN_USB_BYTES=$((8 * 1024 * 1024 * 1024))    # 8 GiB minimum for uncompressed .img
 
-# Resolve invoking user's home directory even if script is called via sudo
 REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-REAL_HOME="$(eval echo "~${REAL_USER}")"
+if command -v dscl >/dev/null 2>&1; then
+    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+elif command -v getent >/dev/null 2>&1; then
+    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
+else
+    REAL_HOME=""
+fi
+[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}")"
 
 DEFAULT_IMG_NAME="sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst"
 UBOOT_PAYLOAD_NAME="ubuntu-24.04-preinstalled-server-riscv64.img"
@@ -52,15 +55,15 @@ UPSTREAM_FALLBACK_URL="https://github.com/sifiveinc/hifive-premier-p550-ubuntu/r
 usage() {
     cat << 'EOF'
 Usage:
-  ./utils/flash-sifive-p550-ubuntu-usb.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
-  ./utils/flash-sifive-p550-ubuntu-usb.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
+  rvdk flash p550 usb <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
+  rvdk flash p550 usb --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
 
 Image Resolution Order:
   1. --image /path/to/img (if provided)
   2. ~/.rvdk/cache/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
   3. https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1/sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst
 EOF
-    exit 1
+    exit 0
 }
 
 while [[ $# -gt 0 ]]; do
@@ -82,7 +85,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$TARGET_ARG" ]] && log_fatal "Missing target USB identifier. Run 'diskutil list external physical' (macOS) or 'lsblk' (Linux)."
+[[ -z "$TARGET_ARG" ]] && log_fatal "Missing target USB identifier. Run 'diskutil list external physical' (macOS) or 'lsblk' (Linux), then run: rvdk flash p550 usb <disk>"
 
 # ==============================================================================
 # 1. PLATFORM-SPECIFIC USB DEVICE RESOLUTION & HARDWARE SAFETY INTERLOCKS
@@ -90,7 +93,6 @@ done
 OS_TYPE="$(uname -s)"
 
 if [[ "$OS_TYPE" == "Darwin" ]]; then
-    # Normalize "4", "disk4", "/dev/disk4", or "/dev/rdisk4" -> DISK_NUM="4" (portable across bash & zsh)
     DISK_NUM="$TARGET_ARG"
     DISK_NUM="${DISK_NUM#/dev/}"
     DISK_NUM="${DISK_NUM#r}"
@@ -135,10 +137,9 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
 
     log_info "Target macOS USB   : ${BLOCK_DEV} -> ${RAW_DEV} (${MEDIA_NAME} | ${DISK_SIZE_LINE})"
 else
-    # Linux workstation support (e.g., BabbageBox-RTX)
     case "$TARGET_ARG" in
         ""|*[!0-9]*) ;;
-        *) log_fatal "On Linux, specify the full block device path (e.g., --device /dev/sdX)." ;;
+        *) log_fatal "On Linux, specify the full block device path (e.g., rvdk flash p550 usb /dev/sdX)." ;;
     esac
     BLOCK_DEV="$TARGET_ARG"
     RAW_DEV="$TARGET_ARG"
@@ -166,7 +167,7 @@ if (( DISK_BYTES > MAX_SAFE_BYTES )) && [[ "$FORCE_LARGE_DISK" != "true" ]]; the
 fi
 
 # ==============================================================================
-# 2. RESOLVE IMAGE (--image -> ~/.rvdk/cache/ -> https://rvdk.drewv-labs.dev/)
+# 2. RESOLVE IMAGE (--image -> ~/.rvdk/cache/ -> RVDK Mirror / SiFive Fallback)
 # ==============================================================================
 if [[ -n "$IMAGE_PATH" ]]; then
     IMAGE_PATH="${IMAGE_PATH/#\~/$REAL_HOME}"

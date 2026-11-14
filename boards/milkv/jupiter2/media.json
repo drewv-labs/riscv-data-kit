@@ -1,0 +1,9 @@
+{
+  "board": "milkv/jupiter2",
+  "tag": "jptr2",
+  "name": "Milk-V Jupiter 2 (K3)",
+  "soc": "spacemit/k3",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

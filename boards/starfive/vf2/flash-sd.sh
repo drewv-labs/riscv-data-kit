@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // StarFive VisionFive 2 (JH7110) SD/eMMC Image Flasher
-# Description: Validates target removable media, resolves a custom (--image),
-#              cached (~/.rvdk/cache/), or remote (rvdk.drewv-labs.dev) StarFive
-#              JH7110 OS image with SHA-256 verification, unmounts active
-#              partitions, and flashes the raw block device (/dev/rdiskX on
-#              macOS or /dev/sdX on Linux).
+# Path: riscv-data-kit/boards/starfive/vf2/flash-sd.sh
 #
-# Usage (Default RVDK Cache / Auto-Download):
+# Description:
+#   Validates target removable media, resolves a custom (--image), cached
+#   (~/.rvdk/cache/), or remote StarFive JH7110 OS image with SHA-256
+#   verification, unmounts active partitions, and flashes the raw block device
+#   (/dev/rdiskX on macOS or /dev/sdX on Linux).
+#
+# Usage:
 #   diskutil list external physical
-#   ./utils/flash-starfive-visionfive2-debian-sd.sh 4
-#   ./utils/flash-starfive-visionfive2-debian-sd.sh --device /dev/sdX
-#   curl -fsSL https://rvdk.drewv-labs.dev/utils/flash-starfive-visionfive2-debian-sd.sh | sudo zsh -s -- 4
-#
-# Usage (Custom Local Image Override):
-#   ./utils/flash-starfive-visionfive2-debian-sd.sh 4 --image /path/to/custom.img.zst
-#   ./utils/flash-starfive-visionfive2-debian-sd.sh --device 4 --image /path/to/custom.img
+#   rvdk flash vf2 sd 4
+#   rvdk flash vf2 sd --device /dev/sdX
+#   rvdk flash vf2 sd 4 --image /path/to/custom.img.zst
 # ==============================================================================
 
-# Ensure compatibility when invoked via `zsh` or `bash` (including `curl ... | sudo zsh -s -- ...`)
 if [[ -n "${ZSH_VERSION:-}" ]]; then
     emulate -L ksh
     setopt PIPE_FAIL ERR_RETURN NO_UNSET
@@ -26,10 +23,10 @@ else
     set -Eeuo pipefail
 fi
 
-log_info()  { printf "\033[1;36m[INFO]\033[0m %s\n" "$1"; }
+log_info()  { printf "\033[1;36m[RVDK:FLASH]\033[0m %s\n" "$1"; }
 log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 TARGET_ARG=""
 IMAGE_PATH=""
@@ -37,9 +34,15 @@ FORCE_LARGE_DISK="false"
 SKIP_CONFIRM="false"
 MAX_SAFE_BYTES=$((256 * 1024 * 1024 * 1024)) # 256 GiB guard against wiping backup drives
 
-# Resolve invoking user's home directory even if script is called via sudo
 REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-REAL_HOME="$(eval echo "~${REAL_USER}")"
+if command -v dscl >/dev/null 2>&1; then
+    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+elif command -v getent >/dev/null 2>&1; then
+    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
+else
+    REAL_HOME=""
+fi
+[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}")"
 
 DEFAULT_IMG_NAME="starfive-jh7110-202510-minimal-desktop-wayland.img.zst"
 CACHE_DIR="${RVDK_CACHE_DIR:-${REAL_HOME}/.rvdk/cache}"
@@ -48,15 +51,15 @@ RVDK_MIRROR_URL="${RVDK_MIRROR_URL:-https://github.com/drewv-labs/riscv-data-kit
 usage() {
     cat << 'EOF'
 Usage:
-  ./flash-starfive-visionfive2-debian-sd.sh <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
-  ./flash-starfive-visionfive2-debian-sd.sh --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
+  rvdk flash vf2 sd <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
+  rvdk flash vf2 sd --device <N|/dev/diskN|/dev/sdX> [--image /path/to/img] [--yes] [--force]
 
 Image Resolution Order:
   1. --image /path/to/img (if provided)
   2. ~/.rvdk/cache/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
   3. https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1/starfive-jh7110-202510-minimal-desktop-wayland.img.zst
 EOF
-    exit 1
+    exit 0
 }
 
 while [[ $# -gt 0 ]]; do
@@ -78,7 +81,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -z "$TARGET_ARG" ]] && log_fatal "Missing target disk identifier. Run 'diskutil list external physical' and pass the disk number (e.g., 4)."
+[[ -z "$TARGET_ARG" ]] && log_fatal "Missing target disk identifier. Run 'diskutil list external physical' (macOS) or 'lsblk' (Linux), then run: rvdk flash vf2 sd <disk>"
 
 # ==============================================================================
 # 1. PLATFORM-SPECIFIC DEVICE RESOLUTION & HARDWARE SAFETY INTERLOCKS
@@ -86,7 +89,6 @@ done
 OS_TYPE="$(uname -s)"
 
 if [[ "$OS_TYPE" == "Darwin" ]]; then
-    # Normalize "4", "disk4", "/dev/disk4", or "/dev/rdisk4" -> DISK_NUM="4" (portable across bash & zsh)
     DISK_NUM="$TARGET_ARG"
     DISK_NUM="${DISK_NUM#/dev/}"
     DISK_NUM="${DISK_NUM#r}"
@@ -124,10 +126,9 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
 
     log_info "Target macOS Media : ${BLOCK_DEV} -> ${RAW_DEV} (${MEDIA_NAME} | ${DISK_SIZE_LINE})"
 else
-    # Linux workstation support (e.g., BabbageBox-RTX)
     case "$TARGET_ARG" in
         ""|*[!0-9]*) ;;
-        *) log_fatal "On Linux, specify the full block device path (e.g., --device /dev/sdX or /dev/mmcblkX)." ;;
+        *) log_fatal "On Linux, specify the full block device path (e.g., rvdk flash vf2 sd /dev/sdX)." ;;
     esac
     BLOCK_DEV="$TARGET_ARG"
     RAW_DEV="$TARGET_ARG"
@@ -150,7 +151,7 @@ else
 fi
 
 # ==============================================================================
-# 2. RESOLVE IMAGE (--image -> ~/.rvdk/cache/ -> https://rvdk.drewv-labs.dev/)
+# 2. RESOLVE IMAGE (--image -> ~/.rvdk/cache/ -> RVDK Mirror)
 # ==============================================================================
 if [[ -n "$IMAGE_PATH" ]]; then
     IMAGE_PATH="${IMAGE_PATH/#\~/$REAL_HOME}"
@@ -220,7 +221,7 @@ if [[ "$OS_TYPE" == "Darwin" ]]; then
 else
     log_info "Unmounting any active partitions on ${BLOCK_DEV}..."
     for part in "${BLOCK_DEV}"*; do
-        umount "$part" 2>/dev/null || true
+        sudo umount "$part" 2>/dev/null || true
     done
 fi
 

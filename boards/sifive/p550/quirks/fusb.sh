@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // RVDK Utility: Toggle SiFive Premier P550 FUSB303B Type-C IRQ
-# Path: riscv-data-kit/utils/toggle-sifive-p550-fusb.sh
+# DREW-V Labs // RVDK Board Quirk: SiFive Premier P550 FUSB303B Type-C IRQ
+# Path: riscv-data-kit/boards/sifive/p550/quirks/fusb.sh
+# Summary: Toggle HF106C front-panel J2 Type-E USB-C controller (fusb303b IRQ)
 #
 # Description:
 #   On the SiFive HiFive Premier P550 (HF106C carrier), the out-of-tree
-#   `fusb303b` driver controls ONLY the front-panel USB 3.2 Type-E / Type-C
-#   port (not the rear teal USB-A 3.2 ports and not the rear FT4232HL debug
-#   UART/JTAG port). When left unconnected, its threaded I2C/GPIO handler
-#   (`irq/84-fusb303b_`) can burn ~1% CPU continuously and inject IRQ jitter.
-#
-#   This opt-in utility toggles `fusb303b` off/on at runtime (unbinding the I2C
-#   client + unloading `fusb303b.ko`) and persists the choice across reboots via
-#   /etc/modprobe.d/90-rvdk-p550-fusb303b.conf (unless --ephemeral is passed).
+#   `fusb303b` driver controls ONLY the internal front-panel USB 3.2 Type-E /
+#   Type-C socket (`J2`)—NOT the rear teal USB-A 3.2 ports and NOT the rear
+#   FT4232HL debug UART/JTAG USB-C port. When left unconnected, its threaded
+#   I2C/GPIO handler (`irq/84-fusb303b_`) can burn ~1% CPU continuously on CPU0.
 #
 # Usage:
-#   sudo rvdk utils/toggle-sifive-p550-fusb.sh            # Toggle current state (on <-> off)
-#   sudo rvdk utils/toggle-sifive-p550-fusb.sh off        # Disable live IRQ + blacklist on boot
-#   sudo rvdk utils/toggle-sifive-p550-fusb.sh off --ephemeral
-#   sudo rvdk utils/toggle-sifive-p550-fusb.sh on         # Re-enable module + remove blacklist
-#   sudo rvdk utils/toggle-sifive-p550-fusb.sh status     # Inspect IRQ, I2C, and boot state
+#   sudo rvdk quirk fusb                # Toggle current state (on <-> off)
+#   sudo rvdk quirk fusb off            # Disable live IRQ + blacklist on boot
+#   sudo rvdk quirk fusb off --ephemeral
+#   sudo rvdk quirk fusb on             # Re-enable module + remove blacklist
+#   rvdk quirk fusb status              # Inspect IRQ, I2C, and boot state
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -30,10 +27,11 @@ I2C_DRV_DIR="/sys/bus/i2c/drivers/fusb303b"
 ACTION="toggle"
 EPHEMERAL="false"
 FORCE_BOARD="false"
+QUIET="false"
 
 usage() {
     cat <<EOF
-Usage: sudo rvdk utils/toggle-sifive-p550-fusb.sh [toggle|off|on|status] [--ephemeral] [--force]
+Usage: sudo rvdk quirk fusb [toggle|off|on|status] [--ephemeral] [--force]
 
 Actions:
   toggle        Flip fusb303b from active -> off, or off -> on (default)
@@ -43,7 +41,7 @@ Actions:
 
 Flags:
   --ephemeral   Apply 'off' for current boot only (do not write ${MODPROBE_CONF})
-  --force       Bypass SiFive HiFive Premier P550 / EIC7700X device-tree guard
+  --force       Bypass SiFive HiFive Premier P550 device-tree guard
 EOF
 }
 
@@ -53,9 +51,10 @@ while [[ $# -gt 0 ]]; do
         toggle)                 ACTION="toggle"; shift ;;
         off|disable|stop|0)     ACTION="off"; shift ;;
         on|enable|start|1)      ACTION="on"; shift ;;
-        status|stat|check)      ACTION="status"; shift ;;
+        status|stat|check|--status) ACTION="status"; shift ;;
         --ephemeral|--runtime)  EPHEMERAL="true"; shift ;;
         --force)                FORCE_BOARD="true"; shift ;;
+        -q|--quiet)             QUIET="true"; shift ;;
         --noprogbar|--no-progbar|--no-apt-update|--skip-apt-update)
                                 shift ;;
         -h|--help)              usage; exit 0 ;;
@@ -76,21 +75,21 @@ if [[ "$ACTION" != "status" && $EUID -ne 0 ]]; then
     fi
 fi
 
-log_info()  { printf "\033[1;36m[RVDK:FUSB303B]\033[0m %s\n" "$1"; }
-log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+log_info()  { [[ "$QUIET" == "true" ]] || printf "\033[1;36m[RVDK:QUIRK:FUSB]\033[0m %s\n" "$1"; }
+log_ok()    { [[ "$QUIET" == "true" ]] || printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
-DT_MODEL="Unknown"
-if [[ -r /proc/device-tree/model ]]; then
+DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
+if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
     DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
 fi
 
-if [[ "$FORCE_BOARD" != "true" ]]; then
+if [[ "$FORCE_BOARD" != "true" && "${RVDK_BOARD:-}" != "sifive/p550" ]]; then
     case "$DT_MODEL" in
-        *"Premier P550"*|*"EIC7700"*|*"Megrez"*|*"StarPro64"*) ;;
+        *"Premier P550"*|*"EIC7700"*) ;;
         *)
-            log_fatal "Board '${DT_MODEL}' is not an ESWIN EIC7700X / SiFive Premier P550 (pass --force to override)."
+            log_fatal "Board '${DT_MODEL}' is not a SiFive HiFive Premier P550 (pass --force to override)."
             ;;
     esac
 fi
@@ -140,7 +139,7 @@ print_status() {
     local irq_line=""
     irq_line="$(grep -E 'fusb303' /proc/interrupts 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
 
-    log_info "Board: ${DT_MODEL}"
+    printf "\033[1;36m[RVDK:QUIRK:FUSB]\033[0m Board: %s\n" "$DT_MODEL"
     printf "  • Kernel Module   : %s\n" "$mod_state"
     printf "  • Bound I2C Dev   : %s\n" "$bound"
     printf "  • IRQ Kthread     : %s\n" "$kthreads"
@@ -179,9 +178,9 @@ disable_fusb() {
 
     if [[ "$EPHEMERAL" == "false" ]]; then
         cat <<'EOF' > "$MODPROBE_CONF"
-# Managed by RVDK (utils/toggle-sifive-p550-fusb.sh)
+# Managed by RVDK (boards/sifive/p550/quirks/fusb.sh)
 # Suppresses out-of-tree front-panel Type-C controller IRQ chatter (irq/*-fusb303b_).
-# Re-enable anytime with: sudo rvdk utils/toggle-sifive-p550-fusb.sh on
+# Re-enable anytime with: sudo rvdk quirk fusb on
 blacklist fusb303b
 EOF
         chmod 0644 "$MODPROBE_CONF"
@@ -190,7 +189,7 @@ EOF
         log_info "Ephemeral mode (--ephemeral): skipped writing ${MODPROBE_CONF}"
     fi
 
-    print_status
+    [[ "$QUIET" == "true" ]] || print_status
 }
 
 enable_fusb() {
@@ -205,7 +204,6 @@ enable_fusb() {
         log_ok "Loaded kernel module fusb303b"
     fi
 
-    # If driver is present (modular or built-in) and not yet bound, bind matching I2C device(s)
     if [[ -d "$I2C_DRV_DIR" && -z "$(bound_i2c_devs)" ]]; then
         local candidates=()
         local d name compat
@@ -230,7 +228,7 @@ enable_fusb() {
         done
     fi
 
-    print_status
+    [[ "$QUIET" == "true" ]] || print_status
 }
 
 case "$ACTION" in

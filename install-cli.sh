@@ -92,7 +92,23 @@ else
     sudo -u "$REAL_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
 fi
 
-chmod +x "${ENGINE_DIR}/bootstrap.sh" "${ENGINE_DIR}/install-cli.sh" "${ENGINE_DIR}"/lib/*.sh "${ENGINE_DIR}"/mods/*/forge.sh "${ENGINE_DIR}"/utils/*.sh 2>/dev/null || true
+chmod +x \
+    "${ENGINE_DIR}/bootstrap.sh" \
+    "${ENGINE_DIR}/install-cli.sh" \
+    "${ENGINE_DIR}"/lib/*.sh \
+    "${ENGINE_DIR}"/os/*.sh \
+    "${ENGINE_DIR}"/bsp/*/*/*.sh \
+    "${ENGINE_DIR}"/boards/*/*/*.sh \
+    "${ENGINE_DIR}"/boards/*/*/quirks/*.sh \
+    "${ENGINE_DIR}"/mods/*/forge.sh \
+    "${ENGINE_DIR}"/utils/*.sh 2>/dev/null || true
+
+# Persist /etc/rvdk/kit.env cache on Linux target nodes right away if recognized
+if [[ "$(uname -s)" == "Linux" && -f "${ENGINE_DIR}/lib/kit.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${ENGINE_DIR}/lib/kit.sh"
+    rvdk_kit_resolve --refresh || true
+fi
 
 # 3. Link /usr/local/bin/rvdk
 install -d -m 0755 /usr/local/bin
@@ -101,11 +117,13 @@ COMMIT_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo "m
 log_ok "Linked /usr/local/bin/rvdk -> ${ENGINE_DIR}/bootstrap.sh (${COMMIT_SHA})"
 
 if [[ "$QUIET_MODE" == "false" ]]; then
-    DT_MODEL="Unknown"
-    if [[ -r /proc/device-tree/model ]]; then
-        DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
-    elif [[ "$(uname -s)" == "Darwin" ]]; then
-        DT_MODEL="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m) (macOS Host)"
+    DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
+    if [[ "$DT_MODEL" == "Unknown" ]]; then
+        if [[ -r /proc/device-tree/model ]]; then
+            DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+        elif [[ "$(uname -s)" == "Darwin" ]]; then
+            DT_MODEL="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m) (macOS Host)"
+        fi
     fi
 
     OS_PRETTY="Unknown"
@@ -124,17 +142,21 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    Root  : ${ENGINE_DIR}
 
  Usage:
-   sudo rvdk                  # Run full Day-0 (OS + Silicon BSP) forge
-   sudo rvdk bsp              # Run Silicon BSP hardening only
-   sudo rvdk os               # Run OS normalization & CVE guard only
-   sudo rvdk postgresql       # Install PostgreSQL 18.6 (RVDK cache or --force-build)
-   sudo rvdk mods/nvme-4kn    # Format 4Kn NVMe + LVM vg_braker + XFS/ext4
+   sudo rvdk                      # Run full Day-0 (OS + Silicon BSP) forge
+   rvdk kit                       # Inspect resolved Board/SoC/OS Kit cache
+   sudo rvdk deeptune             # Multi-layer DeepTune (--tune data|ml|ai)
+   sudo rvdk quirk <name|list>    # Toggle board quirks (e.g. hdmi, fusb)
+   rvdk flash <board> <medium>    # Flash board media (e.g. rvdk flash p550 usb 4)
+   sudo rvdk bsp                  # Run Silicon BSP hardening only
+   sudo rvdk os                   # Run OS normalization & CVE guard only
+   sudo rvdk postgresql           # Install PostgreSQL 18.6 (cache or --force-build)
+   sudo rvdk mods/nvme-4kn        # Format 4Kn NVMe + LVM vg_braker + XFS/ext4
    sudo rvdk mods/btrfs-raid
    sudo rvdk mods/mosquitto
    sudo rvdk mods/nfs-vault
-   sudo rvdk mods/tailscale   # Install static riscv64 Tailscale VPN [--ssh|--up]
-   sudo rvdk utils/<script>   # Run host media flash utilities (macOS / Linux)
-   sudo rvdk update           # Pull latest RVDK engine from GitHub
+   sudo rvdk mods/tailscale       # Install static riscv64 Tailscale VPN [--ssh|--up]
+   sudo rvdk utils/purge-user.sh  # Migrate state & purge factory default user
+   sudo rvdk update               # Pull latest RVDK engine from GitHub
 ======================================================================
 EOF
 fi
