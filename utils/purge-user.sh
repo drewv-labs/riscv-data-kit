@@ -4,15 +4,17 @@
 # Path: riscv-data-kit/utils/purge-user.sh
 #
 # Description:
-#   1. Copies /home/<target>/.brakerrak/ (node.env, snapshots, engine) and
-#      /home/<target>/.rvdk/ (engine, cache) into the active admin user's home,
-#      updating /usr/local/bin/{rvdk,brakerrak} symlinks if they pointed into
-#      /home/<target>/.
+#   1. Migrates /home/<target>/.rvdk/ (engine, cache, config.env) and any
+#      caller-specified --extra-dotdir directories into the destination admin
+#      user's home directory, updating /usr/local/bin/rvdk (and any --relink-bin
+#      symlinks) if they pointed into /home/<target>/.
 #   2. Terminates lingering sessions/processes for <target>, removes sudoers
 #      drop-ins, and purges the <target> user account + home directory.
 #
 # Usage:
 #   sudo rvdk utils/purge-user.sh <target_user> [--to-user <admin_user>] [--overwrite-env]
+#       [--extra-dotdir <rel_dir>] [--relink-bin <symlink_path>:<dest_rel_target>]
+#       [--mount-point <path>]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -50,6 +52,9 @@ main() {
     local target_user=""
     local dest_user=""
     local overwrite_env="false"
+    local cli_mount_pt=""
+    local extra_dotdirs=()
+    local relink_bins=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -65,12 +70,31 @@ main() {
                 overwrite_env="true"
                 shift
                 ;;
+            --extra-dotdir|--migrate-dotdir)
+                [[ -n "${2:-}" ]] && extra_dotdirs+=("${2#/}")
+                shift 2
+                ;;
+            --relink-bin)
+                [[ -n "${2:-}" ]] && relink_bins+=("$2")
+                shift 2
+                ;;
+            --mount-point)
+                cli_mount_pt="${2:-}"
+                shift 2
+                ;;
             -h|--help)
                 cat <<EOF
-Usage: sudo rvdk utils/purge-user.sh <target_user> [--to-user <admin_user>] [--overwrite-env]
+Usage: sudo rvdk utils/purge-user.sh <target_user> [options]
 
-Migrates /home/<target_user>/.brakerrak (node.env, snapshots, engine) and
-/home/<target_user>/.rvdk into ~/.brakerrak and ~/.rvdk, then deletes <target_user>.
+Options:
+  --to-user <admin_user>              Destination admin user (defaults to invoking sudo user)
+  --overwrite-env                     Overwrite existing *.env files in destination dotdirs
+  --extra-dotdir <rel_dir>            Additional home dot-directory to migrate (repeatable)
+  --relink-bin <bin_path>:<rel_path>  Re-point symlink if targeting purged user's home (repeatable)
+  --mount-point <path>                Data mount root for nfs_vault ownership transfer
+
+Migrates /home/<target_user>/.rvdk (and any --extra-dotdir directories) into the
+destination user's home directory, then deletes <target_user>.
 EOF
                 exit 0
                 ;;
@@ -139,60 +163,16 @@ EOF
 
     log_info "Migrating state from ${src_home} -> ${dest_home} (owner: ${dest_user}:${dest_grp})..."
 
-    # 1. Migrate .brakerrak (node.env, snapshots, engine)
-    if [[ -d "${src_home}/.brakerrak" ]]; then
-        install -d -m 0750 -o "$dest_user" -g "$dest_grp" "${dest_home}/.brakerrak" "${dest_home}/.brakerrak/snapshots"
-
-        if [[ -f "${src_home}/.brakerrak/node.env" ]]; then
-            if [[ ! -f "${dest_home}/.brakerrak/node.env" || "$overwrite_env" == "true" ]]; then
-                cp -a "${src_home}/.brakerrak/node.env" "${dest_home}/.brakerrak/node.env"
-                sed -i "s/^ADMIN_USER=\"${target_user}\"/ADMIN_USER=\"${dest_user}\"/" "${dest_home}/.brakerrak/node.env" 2>/dev/null || true
-                chown "${dest_user}:${dest_grp}" "${dest_home}/.brakerrak/node.env"
-                chmod 0640 "${dest_home}/.brakerrak/node.env"
-                log_ok "Migrated node.env -> ${dest_home}/.brakerrak/node.env"
-            else
-                log_skip "Preserved existing ${dest_home}/.brakerrak/node.env"
-            fi
-        fi
-
-        if [[ -d "${src_home}/.brakerrak/snapshots" ]]; then
-            local copied_snaps=0
-            for sfile in "${src_home}/.brakerrak/snapshots/"*; do
-                [[ -e "$sfile" ]] || continue
-                local sbase
-                sbase="$(basename "$sfile")"
-                if [[ ! -e "${dest_home}/.brakerrak/snapshots/${sbase}" ]]; then
-                    cp -a "$sfile" "${dest_home}/.brakerrak/snapshots/${sbase}"
-                    copied_snaps=$(( copied_snaps + 1 ))
-                fi
-            done
-            chown -R "${dest_user}:${dest_grp}" "${dest_home}/.brakerrak/snapshots"
-            if (( copied_snaps > 0 )); then
-                log_ok "Migrated ${copied_snaps} snapshot file(s) -> ${dest_home}/.brakerrak/snapshots/"
-            else
-                log_skip "No new snapshots to migrate from ${src_home}/.brakerrak/snapshots/"
-            fi
-        fi
-
-        if [[ -d "${src_home}/.brakerrak/engine/.git" && ! -d "${dest_home}/.brakerrak/engine/.git" ]]; then
-            cp -a "${src_home}/.brakerrak/engine" "${dest_home}/.brakerrak/engine"
-            chown -R "${dest_user}:${dest_grp}" "${dest_home}/.brakerrak/engine"
-            log_ok "Migrated BrakerRak engine -> ${dest_home}/.brakerrak/engine"
-        fi
-    fi
-
-    if [[ -L /usr/local/bin/brakerrak ]]; then
-        local brak_target
-        brak_target="$(readlink -f /usr/local/bin/brakerrak 2>/dev/null || true)"
-        if [[ "$brak_target" == "${src_home}/"* && -f "${dest_home}/.brakerrak/engine/forge.sh" ]]; then
-            ln -sf "${dest_home}/.brakerrak/engine/forge.sh" /usr/local/bin/brakerrak
-            log_ok "Re-linked /usr/local/bin/brakerrak -> ${dest_home}/.brakerrak/engine/forge.sh"
-        fi
-    fi
-
-    # 2. Migrate .rvdk (engine & cache) so /usr/local/bin/rvdk stays valid
+    # 1. Migrate .rvdk (engine, cache, config.env) so /usr/local/bin/rvdk stays valid
     if [[ -d "${src_home}/.rvdk" ]]; then
         install -d -m 0755 -o "$dest_user" -g "$dest_grp" "${dest_home}/.rvdk" "${dest_home}/.rvdk/cache"
+
+        if [[ -f "${src_home}/.rvdk/config.env" ]] && [[ ! -f "${dest_home}/.rvdk/config.env" || "$overwrite_env" == "true" ]]; then
+            cp -a "${src_home}/.rvdk/config.env" "${dest_home}/.rvdk/config.env"
+            chown "${dest_user}:${dest_grp}" "${dest_home}/.rvdk/config.env"
+            chmod 0640 "${dest_home}/.rvdk/config.env"
+            log_ok "Migrated config.env -> ${dest_home}/.rvdk/config.env"
+        fi
 
         if [[ -d "${src_home}/.rvdk/cache" ]]; then
             for cfile in "${src_home}/.rvdk/cache/"*; do
@@ -222,13 +202,81 @@ EOF
         fi
     fi
 
+    # 2. Migrate any caller-requested --extra-dotdir directories & --relink-bin symlinks
+    local ddir
+    for ddir in ${extra_dotdirs[@]+"${extra_dotdirs[@]}"}; do
+        [[ -z "$ddir" || "$ddir" == *".."* ]] && continue
+        local s_dir="${src_home}/${ddir}"
+        local d_dir="${dest_home}/${ddir}"
+        [[ -d "$s_dir" ]] || continue
+
+        install -d -m 0750 -o "$dest_user" -g "$dest_grp" "$d_dir"
+        local entry ebase
+        for entry in "${s_dir}/"*; do
+            [[ -e "$entry" ]] || continue
+            ebase="$(basename "$entry")"
+            if [[ -f "$entry" && "$ebase" == *.env ]]; then
+                if [[ ! -f "${d_dir}/${ebase}" || "$overwrite_env" == "true" ]]; then
+                    cp -a "$entry" "${d_dir}/${ebase}"
+                    sed -i "s/^ADMIN_USER=\"${target_user}\"/ADMIN_USER=\"${dest_user}\"/" "${d_dir}/${ebase}" 2>/dev/null || true
+                    chown "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
+                    chmod 0640 "${d_dir}/${ebase}"
+                    log_ok "Migrated ${ddir}/${ebase} -> ${d_dir}/${ebase}"
+                else
+                    log_skip "Preserved existing ${d_dir}/${ebase}"
+                fi
+            elif [[ -d "$entry" && -d "${entry}/.git" ]]; then
+                if [[ ! -d "${d_dir}/${ebase}/.git" ]]; then
+                    cp -a "$entry" "${d_dir}/${ebase}"
+                    chown -R "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
+                    log_ok "Migrated git tree -> ${d_dir}/${ebase}"
+                fi
+            elif [[ -d "$entry" ]]; then
+                install -d -m 0750 -o "$dest_user" -g "$dest_grp" "${d_dir}/${ebase}"
+                local subf sbase copied_cnt=0
+                for subf in "${entry}/"*; do
+                    [[ -e "$subf" ]] || continue
+                    sbase="$(basename "$subf")"
+                    if [[ ! -e "${d_dir}/${ebase}/${sbase}" ]]; then
+                        cp -a "$subf" "${d_dir}/${ebase}/${sbase}"
+                        copied_cnt=$(( copied_cnt + 1 ))
+                    fi
+                done
+                chown -R "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
+                if (( copied_cnt > 0 )); then
+                    log_ok "Migrated ${copied_cnt} item(s) -> ${d_dir}/${ebase}/"
+                fi
+            elif [[ ! -e "${d_dir}/${ebase}" ]]; then
+                cp -a "$entry" "${d_dir}/${ebase}"
+                chown -R "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
+            fi
+        done
+    done
+
+    local rspec r_bin r_rel r_cur
+    for rspec in ${relink_bins[@]+"${relink_bins[@]}"}; do
+        r_bin="${rspec%%:*}"
+        r_rel="${rspec#*:}"
+        [[ -z "$r_bin" || -z "$r_rel" || "$r_bin" == "$r_rel" ]] && continue
+        if [[ -L "$r_bin" ]]; then
+            r_cur="$(readlink -f "$r_bin" 2>/dev/null || true)"
+            if [[ "$r_cur" == "${src_home}/"* && -f "${dest_home}/${r_rel#/}" ]]; then
+                ln -sf "${dest_home}/${r_rel#/}" "$r_bin"
+                log_ok "Re-linked ${r_bin} -> ${dest_home}/${r_rel#/}"
+            fi
+        fi
+    done
+
     # Re-own fallback NFS vault directory if it was originally created under target_uid
-    local mount_pt="/mnt/nvme_pgdata"
-    if [[ -f "${dest_home}/.brakerrak/node.env" ]]; then
-        local env_mp
-        env_mp="$(awk -F= '/^MOUNT_POINT=/ {gsub(/"|\047/, "", $2); print $2}' "${dest_home}/.brakerrak/node.env" 2>/dev/null || true)"
-        [[ -n "$env_mp" ]] && mount_pt="$env_mp"
+    local mount_pt="${cli_mount_pt:-}"
+    if [[ -z "$mount_pt" ]]; then
+        local env_cand="${RVDK_ENV_FILE:-${dest_home}/.rvdk/config.env}"
+        if [[ -f "$env_cand" ]]; then
+            mount_pt="$(awk -F= '/^MOUNT_POINT=/ {gsub(/"|\047/, "", $2); print $2}' "$env_cand" 2>/dev/null || true)"
+        fi
     fi
+    mount_pt="${mount_pt:-/mnt/nvme_pgdata}"
+
     if [[ -n "$target_uid" && -d "${mount_pt}/nfs_vault" ]]; then
         if [[ "$(stat -c '%u' "${mount_pt}/nfs_vault" 2>/dev/null || echo "")" == "$target_uid" ]]; then
             chown -R "${dest_user}:${dest_grp}" "${mount_pt}/nfs_vault"

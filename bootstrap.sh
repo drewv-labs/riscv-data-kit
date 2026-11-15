@@ -68,10 +68,10 @@ if [[ $# -gt 0 ]]; then
 fi
 
 if [[ "$NEED_ROOT" == "true" && $EUID -ne 0 ]]; then
-    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
+    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
         exec sudo -E bash "$SCRIPT_SELF" "$@"
     else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
+        echo "[RVDK:FATAL] Run as root or pipe into 'sudo bash' / 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
         exit 1
     fi
 fi
@@ -163,16 +163,19 @@ if [[ $EUID -ne 0 && -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
 elif [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]] && ! [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
     if [[ $EUID -eq 0 && ! -L /usr/local/bin/rvdk ]]; then
-        install -d -m 0755 /usr/local/bin
+        mkdir -p /usr/local/bin && chmod 0755 /usr/local/bin
         ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/local/bin/rvdk
+        [[ -f /etc/openwrt_release ]] && ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/bin/rvdk
     fi
 else
     if [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" && ! -d "${ENGINE_DIR}/.git" ]]; then
-        install -d -m 0755 -o "$REAL_USER" -g "$REAL_GRP" "${REAL_HOME}/.rvdk" "${REAL_HOME}/.rvdk/cache"
+        mkdir -p "${REAL_HOME}/.rvdk" "${REAL_HOME}/.rvdk/cache"
+        chmod 0755 "${REAL_HOME}/.rvdk" "${REAL_HOME}/.rvdk/cache"
         cp -a "$CANDIDATE_ROOT" "$ENGINE_DIR"
-        chown -R "${REAL_USER}:${REAL_GRP}" "$ENGINE_DIR"
-        install -d -m 0755 /usr/local/bin
+        chown -R "${REAL_USER}:${REAL_GRP}" "${REAL_HOME}/.rvdk" 2>/dev/null || true
+        mkdir -p /usr/local/bin && chmod 0755 /usr/local/bin
         ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/local/bin/rvdk
+        [[ -f /etc/openwrt_release ]] && ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/bin/rvdk
     else
         curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
     fi
@@ -486,7 +489,7 @@ OS_ID="${RVDK_OS_ID:-unknown}"
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 
 [[ -z "$SOC_PATH" ]] && log_fatal "Unrecognized RISC-V Device Tree: '${DT_MODEL}'. Pass --soc <vendor/soc> or --board <board>."
-[[ -z "$OS_ID" || "$OS_ID" == "unknown" ]] && log_fatal "Cannot detect OS distribution. Pass --os <debian|ubuntu|bianbu>."
+[[ -z "$OS_ID" || "$OS_ID" == "unknown" ]] && log_fatal "Cannot detect OS distribution. Pass --os <debian|ubuntu|bianbu|openwrt>."
 
 DEEPTUNE_STATE_FILE="/etc/rvdk/deeptune.env"
 LEGACY_DEEPTUNE_STATE="/var/lib/rvdk/deeptune.conf"
@@ -552,14 +555,16 @@ fi
 rvdk_prog_init "${MODULE} (${BOARD_PATH:-$SOC_PATH})"
 log_rvdk "Kit: board=${BOARD_PATH:-generic} | soc=${SOC_PATH} | os=${OS_ID} (${RVDK_KIT_SOURCE:-probed}) | Module: ${MODULE}"
 
-# Strictly match OS-specific scripts (excludes bootstrap.sh symlink to prevent recursion)
+# Match OS-specific scripts first, falling back to a unified non-symlink forge.sh
+# (excludes bootstrap.sh symlinks to prevent recursion)
 resolve_os_script() {
     local base_dir="$1"
     for candidate in \
         "${base_dir}/bootstrap-${OS_ID}.sh" \
         "${base_dir}/forge-${OS_ID}.sh" \
-        "${base_dir}/forge_${OS_ID}.sh"; do
-        if [[ -f "$candidate" && ! -L "$candidate" ]]; then
+        "${base_dir}/forge_${OS_ID}.sh" \
+        "${base_dir}/forge.sh"; do
+        if [[ -f "$candidate" && ! -L "$candidate" && -s "$candidate" ]]; then
             echo "$candidate"
             return 0
         fi
@@ -623,7 +628,7 @@ run_kit_deeptune() {
         idx=$((idx + 1))
     done
 
-    install -d -m 0755 /etc/rvdk
+    mkdir -p /etc/rvdk && chmod 0755 /etc/rvdk
     local layers_joined
     layers_joined="$(IFS=','; echo "${rel_layers[*]}")"
     cat <<EOF > "$DEEPTUNE_STATE_FILE"

@@ -4,7 +4,7 @@
 # Path: riscv-data-kit/mods/nvme-4kn/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/nvme-4kn [--device /dev/nvme0n1] [--mount /mnt/nvme_pgdata] [--force-wipe] [--no-apt-update] [--noprogbar]
+#   sudo rvdk mods/nvme-4kn [--device /dev/nvme0n1] [--mount /mnt/nvme_pgdata] [--vg vg_rvdk] [--lv lv_pgdata] [--force-wipe] [--no-apt-update] [--noprogbar]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/nvme-4kn/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
@@ -19,15 +19,16 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
-NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
+[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+ENV_FILE="${RVDK_ENV_FILE:-${REAL_HOME}/.rvdk/config.env}"
 # shellcheck disable=SC1090
-[[ -f "$NODE_ENV" ]] && source "$NODE_ENV"
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
 NVME_DEV="${NVME_DEV:-/dev/nvme0n1}"
 MOUNT_POINT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
 FS_LABEL="${FS_LABEL:-PGDATA_NVME}"
-VG_NAME="${VG_NAME:-vg_braker}"
+VG_NAME="${VG_NAME:-vg_rvdk}"
 LV_NAME="${LV_NAME:-lv_pgdata}"
 LV_PCT="${LV_PCT:-85%VG}"
 USE_LVM="${USE_LVM:-true}"
@@ -38,6 +39,8 @@ while [[ $# -gt 0 ]]; do
         --device)                        NVME_DEV="${2:-}"; shift 2 ;;
         --mount)                         MOUNT_POINT="${2:-}"; shift 2 ;;
         --label)                         FS_LABEL="${2:-}"; shift 2 ;;
+        --vg|--vg-name)                  VG_NAME="${2:-vg_rvdk}"; shift 2 ;;
+        --lv|--lv-name)                  LV_NAME="${2:-lv_pgdata}"; shift 2 ;;
         --no-lvm)                        USE_LVM="false"; shift ;;
         --force-wipe|--force-wipe-nvme)  FORCE_WIPE="true"; shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
@@ -138,7 +141,7 @@ else
     fi
 fi
 
-# 3. Provision LVM (vg_braker/lv_pgdata with 15% snapshot reserve) & Format XFS/ext4
+# 3. Provision LVM (${VG_NAME}/${LV_NAME} with 15% snapshot reserve) & Format XFS/ext4
 rvdk_prog 60 "NVMe 4Kn: converging LVM (${VG_NAME}/${LV_NAME}) & ${NVME_FSTYPE^^}..."
 if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
     TARGET_BLOCK_DEV="$EXISTING_FS_DEV"

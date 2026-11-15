@@ -1,0 +1,9 @@
+{
+  "board": "milkv/mars",
+  "tag": "mars",
+  "name": "Milk-V Mars (JH7110)",
+  "soc": "starfive/jh7110",
+  "default_os": "debian-12",
+  "media": {},
+  "quirks": []
+}

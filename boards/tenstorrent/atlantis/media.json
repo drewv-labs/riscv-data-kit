@@ -1,0 +1,9 @@
+{
+  "board": "tenstorrent/atlantis",
+  "tag": "atlantis",
+  "name": "Tenstorrent Atlantis (8x Ascalon-X)",
+  "soc": "tenstorrent/atlantis",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

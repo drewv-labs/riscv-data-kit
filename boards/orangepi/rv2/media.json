@@ -1,0 +1,9 @@
+{
+  "board": "orangepi/rv2",
+  "tag": "rv2",
+  "name": "Orange Pi RV2 (Ky X1 / K1)",
+  "soc": "spacemit/k1",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

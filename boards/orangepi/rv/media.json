@@ -1,0 +1,9 @@
+{
+  "board": "orangepi/rv",
+  "tag": "opirv",
+  "name": "Orange Pi RV (JH7110)",
+  "soc": "starfive/jh7110",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

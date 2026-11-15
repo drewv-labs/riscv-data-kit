@@ -5,7 +5,7 @@
 #
 # Description:
 #   Silicon- and board-agnostic headless Linux OS deep-tuning across Debian,
-#   Ubuntu, and Bianbu RISC-V nodes:
+#   Ubuntu, Bianbu, and OpenWrt RISC-V nodes:
 #     • Silences periodic background polling (`smartd` & `sysstat` timers) while
 #       preserving on-demand diagnostic CLIs (`smartctl`, `iostat`, `mpstat`, `pidstat`)
 #     • Masks OS/desktop/filesystem background jitter timers (`fwupd-refresh`,
@@ -32,7 +32,12 @@ log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 
 if [[ $EUID -ne 0 ]]; then
-    exec sudo -E bash "$0" "$@"
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo -E bash "$0" "$@"
+    else
+        echo "[RVDK:FATAL] Run as root." >&2
+        exit 1
+    fi
 fi
 
 TUNE_REQUEST="${RVDK_TUNE:-data}"
@@ -79,6 +84,58 @@ fi
 
 rvdk_prog_init "OS DeepTune (--tune ${TUNE_LABEL}): inspecting services & timers..."
 log_info "Converging headless OS DeepTune (--tune ${TUNE_LABEL} | NIC=${RVDK_PRIMARY_NIC:-auto})..."
+
+# Guard against severing SSH when primary default-route NIC is wireless (e.g. wlan0 on bench/field SBC)
+PRIMARY_NIC="${RVDK_PRIMARY_NIC:-}"
+PRIMARY_IS_WIFI="false"
+if [[ -n "$PRIMARY_NIC" ]] && [[ "$PRIMARY_NIC" == wl* || -d "/sys/class/net/${PRIMARY_NIC}/wireless" ]]; then
+    PRIMARY_IS_WIFI="true"
+    log_warn "Primary NIC '${PRIMARY_NIC}' is wireless; preserving wpa_supplicant & cfg80211 to protect active SSH link"
+fi
+
+# OpenWrt / non-systemd fast-path: apply THP + BusyBox-compatible sysctls without systemd/APT calls
+if [[ "${RVDK_OS_ID:-}" == "openwrt" || -f /etc/openwrt_release ]] || ! command -v systemctl >/dev/null 2>&1; then
+    log_skip "Non-systemd/APT rootfs (${RVDK_OS_ID:-procd}); skipping systemd timer & Debian/Ubuntu desktop package purges"
+
+    if [[ "$TUNE_MODE" == "data" ]]; then
+        THP_MODE="never"
+    else
+        THP_MODE="madvise"
+    fi
+    if [[ -d /sys/kernel/mm/transparent_hugepage ]]; then
+        for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do
+            [[ -w "$f" ]] && echo "$THP_MODE" > "$f" 2>/dev/null || true
+        done
+        if [[ -f /etc/rc.common ]]; then
+            PROCD_THP="/etc/init.d/rvdk-thp-tune"
+            cat <<EOF > "$PROCD_THP"
+#!/bin/sh /etc/rc.common
+START=96
+start() {
+    for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do
+        [ -w "\$f" ] && echo ${THP_MODE} > "\$f" 2>/dev/null || true
+    done
+}
+EOF
+            chmod +x "$PROCD_THP"
+            "$PROCD_THP" enable 2>/dev/null || true
+        fi
+        log_ok "Set Transparent HugePages -> '${THP_MODE}' (--tune ${TUNE_LABEL})"
+    fi
+
+    mkdir -p /etc/sysctl.d
+    DEEPTUNE_SYSCTL="/etc/sysctl.d/95-rvdk-deeptune.conf"
+    OWRT_SYSCTLS=("# Managed by RVDK (os/deeptune.sh | tune=${TUNE_LABEL})")
+    [[ -e /proc/sys/kernel/sched_autogroup_enabled ]] && OWRT_SYSCTLS+=("kernel.sched_autogroup_enabled = 0")
+    [[ -e /proc/sys/vm/swappiness ]]                  && OWRT_SYSCTLS+=("vm.swappiness = 1")
+    [[ -e /proc/sys/kernel/printk ]]                  && OWRT_SYSCTLS+=("kernel.printk = 3 4 1 3")
+    [[ -e /proc/sys/kernel/nmi_watchdog ]]            && OWRT_SYSCTLS+=("kernel.nmi_watchdog = 0")
+    printf "%s\n" "${OWRT_SYSCTLS[@]}" > "$DEEPTUNE_SYSCTL"
+    sysctl -p "$DEEPTUNE_SYSCTL" >/dev/null 2>&1 || true
+    log_ok "Applied router/non-systemd scheduler & VM sysctls (${DEEPTUNE_SYSCTL})"
+    rvdk_prog 100 "OS DeepTune (--tune ${TUNE_LABEL}) complete"
+    exit 0
+fi
 
 mask_units_quiet() {
     local units=("$@")
@@ -167,21 +224,21 @@ BLOAT_DAEMONS=(
     upower.service
     power-profiles-daemon.service
     rtkit-daemon.service
-    wpa_supplicant.service
     rsyslog.service
     syslog.socket
     nfs-blkmap.service
 )
+[[ "$PRIMARY_IS_WIFI" == "false" ]] && BLOAT_DAEMONS+=(wpa_supplicant.service)
+
 if mask_units_quiet "${BLOAT_DAEMONS[@]}"; then
-    log_ok "Stopped & masked non-essential system daemons (fwupd, multipathd, cups, avahi, udisks2, upower, wpa_supplicant, rsyslog)"
+    log_ok "Stopped & masked non-essential system daemons (fwupd, multipathd, cups, avahi, udisks2, upower, rsyslog)"
 else
     log_skip "Non-essential system daemons already masked"
 fi
 
 # Dynamic Primary NIC SSH-safe NetworkManager removal guard
-PRIMARY_NIC="${RVDK_PRIMARY_NIC:-}"
 NM_SAFE_TO_PURGE="false"
-if [[ -n "$PRIMARY_NIC" ]] && systemctl is-active --quiet systemd-networkd.service 2>/dev/null; then
+if [[ -n "$PRIMARY_NIC" && "$PRIMARY_IS_WIFI" == "false" ]] && systemctl is-active --quiet systemd-networkd.service 2>/dev/null; then
     if command -v networkctl >/dev/null 2>&1 && networkctl list 2>/dev/null | awk -v nic="$PRIMARY_NIC" '$2 == nic && $4 == "configured" {found=1} END {exit !found}'; then
         NM_SAFE_TO_PURGE="true"
     fi
@@ -199,7 +256,7 @@ fi
 # 2. LOCK DOWN PER-SSH `systemd --user` AUDIO & KEYRING SPAWNERS
 # ==============================================================================
 rvdk_prog 35 "OS DeepTune: masking user-session PipeWire & GNOME Keyring units..."
-install -d -m 0755 /etc/systemd/user
+mkdir -p /etc/systemd/user && chmod 0755 /etc/systemd/user
 USER_MASK_UNITS=(
     pipewire.service
     pipewire.socket
@@ -254,7 +311,6 @@ CANDIDATE_PURGE_PKGS=(
     upower
     power-profiles-daemon
     avahi-daemon
-    wpasupplicant
     rtkit
     ubuntu-advantage-tools
     update-notifier-common
@@ -273,6 +329,7 @@ CANDIDATE_PURGE_PKGS=(
     pipewire-audio
     wireplumber
 )
+[[ "$PRIMARY_IS_WIFI" == "false" ]] && CANDIDATE_PURGE_PKGS+=(wpasupplicant)
 
 if [[ "$NM_SAFE_TO_PURGE" == "true" ]]; then
     CANDIDATE_PURGE_PKGS+=(
@@ -307,16 +364,18 @@ fi
 # ==============================================================================
 rvdk_prog 75 "OS DeepTune: blacklisting universal non-server kernel modules..."
 OS_BLACKLIST_MODS=(
-    cfg80211
     joydev
     input_leds
     apple_mfi_fastcharge
     dm_multipath
     nvme_fabrics
 )
+[[ "$PRIMARY_IS_WIFI" == "false" ]] && OS_BLACKLIST_MODS=(cfg80211 "${OS_BLACKLIST_MODS[@]}")
+
+mkdir -p /etc/modprobe.d
 MODPROBE_OS="/etc/modprobe.d/85-rvdk-os-deeptune.conf"
 WANT_OS_MODPROBE="# Managed by RVDK (os/deeptune.sh)
-# Suppresses Wi-Fi, gamepad, USB phone fast-charge, and SAN multipath modules on headless nodes."
+# Suppresses non-server modules on headless nodes."
 for m in "${OS_BLACKLIST_MODS[@]}"; do
     WANT_OS_MODPROBE+=$'\n'"blacklist ${m}"
 done
@@ -384,7 +443,7 @@ if [[ -d /sys/kernel/mm/transparent_hugepage ]]; then
     fi
 fi
 
-install -d -m 0755 /etc/systemd/journald.conf.d
+mkdir -p /etc/systemd/journald.conf.d && chmod 0755 /etc/systemd/journald.conf.d
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-rvdk-deeptune.conf"
 WANT_JOURNALD="[Journal]
 SystemMaxUse=256M

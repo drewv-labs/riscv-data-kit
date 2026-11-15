@@ -3,19 +3,20 @@
 # DREW-V Labs // Day-0 Debian Node Bootstrap Script
 # Path: riscv-data-kit/os/bootstrap-debian.sh
 # Description: Idempotent user creation, group assignment, passwordless sudo,
-#              UTF-8 locale, and hostname configuration for Debian nodes.
+#              headless target, UTF-8 locale, and hostname configuration for Debian nodes.
 #
 # Usage:
-#   ./bootstrap-debian.sh --user drew --hostname brakerbox-titan --nopasswd [--no-apt-update] [--noprogbar]
+#   ./bootstrap-debian.sh [--user drew] [--hostname rv-titan] [--nopasswd] [--no-apt-update] [--noprogbar]
 # ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # --- Default State ---
 TARGET_USER=""
 TARGET_HOSTNAME=""
 NOPASSWD_SUDO="false"
 FIX_LOCALE="true"
+KEEP_GUI="false"
 DEFAULT_GROUPS=("sudo" "adm" "dialout" "plugdev" "render" "video")
 ORIG_ARGS=("$@")
 
@@ -34,23 +35,19 @@ Options:
   -H, --hostname <hostname>   New system hostname to configure
   -n, --nopasswd              Enable passwordless sudo (NOPASSWD) for --user
       --skip-locale           Skip en_US.UTF-8 locale verification
+      --keep-gui              Keep graphical.target if active
       --no-apt-update         Skip redundant apt-get update calls
       --noprogbar             Suppress persistent bottom progress bar
   -h, --help                  Show this help message and exit
 
 Example:
-  $0 --user drew --hostname brakerbox-titan --nopasswd
+  $0 --user drew --hostname rv-titan --nopasswd
 EOF
 }
 
 # ==============================================================================
 # ARGUMENT PARSER
 # ==============================================================================
-if [[ $# -eq 0 ]]; then
-    usage
-    exit 1
-fi
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -u|--user)
@@ -75,6 +72,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-locale)
             FIX_LOCALE="false"
+            shift
+            ;;
+        --debloat-only)
+            KEEP_GUI="false"
+            shift
+            ;;
+        --keep-gui)
+            KEEP_GUI="true"
             shift
             ;;
         --no-apt-update|--skip-apt-update)
@@ -107,7 +112,7 @@ fi
 if [[ $EUID -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
         log_info "Escalating privileges via sudo..."
-        exec sudo -E bash "$0" "${ORIG_ARGS[@]}"
+        exec sudo -E bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
         log_err "This script must be run as root (and 'sudo' is not installed)."
         exit 1
@@ -185,6 +190,13 @@ if [[ "$FIX_LOCALE" == "true" ]]; then
         update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
         export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
         log_ok "Configured en_US.UTF-8 locale"
+    fi
+fi
+
+if [[ "$KEEP_GUI" == "false" ]] && command -v systemctl >/dev/null 2>&1; then
+    if [[ "$(systemctl get-default 2>/dev/null || true)" != "multi-user.target" ]]; then
+        systemctl set-default multi-user.target
+        log_ok "Boot target set to headless multi-user.target"
     fi
 fi
 
@@ -346,4 +358,4 @@ fi
 
 # ----------------------------------------------------------------------------------
 rvdk_prog 100 "Debian Day-0 OS normalization complete"
-log_info "Day-0 Debian bootstrap complete. Node is pregamed and ready for forge.sh."
+log_info "Day-0 Debian bootstrap complete."

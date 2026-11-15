@@ -1,0 +1,9 @@
+{
+  "board": "starfive/vf2-lite",
+  "tag": "vf2lite",
+  "name": "StarFive VisionFive 2 Lite (JH7110S)",
+  "soc": "starfive/jh7110",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

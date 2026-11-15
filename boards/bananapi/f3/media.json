@@ -1,0 +1,9 @@
+{
+  "board": "bananapi/f3",
+  "tag": "bpif3",
+  "name": "Banana Pi BPI-F3 (SpacemiT K1)",
+  "soc": "spacemit/k1",
+  "default_os": "bianbu",
+  "media": {},
+  "quirks": []
+}

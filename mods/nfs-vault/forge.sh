@@ -24,12 +24,12 @@ REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
 [[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
 
-# Inherit storage/subnet layout from BrakerRak node.env if present, while keeping
-# standalone RVDK's own backend default as 'auto' unless explicitly passed.
+# Inherit storage/subnet layout from RVDK_ENV_FILE (~/.rvdk/config.env) if present,
+# while keeping standalone RVDK's own backend default as 'auto' unless passed.
 PRESET_BACKEND="${NFS_BACKEND:-}"
-NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
+ENV_FILE="${RVDK_ENV_FILE:-${REAL_HOME}/.rvdk/config.env}"
 # shellcheck disable=SC1090
-[[ -f "$NODE_ENV" ]] && source "$NODE_ENV"
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
 LAB_SUBNET="${LAB_SUBNET:-10.0.10.0/24}"
 DATA_MOUNT="${MOUNT_POINT:-/mnt/nvme_pgdata}"

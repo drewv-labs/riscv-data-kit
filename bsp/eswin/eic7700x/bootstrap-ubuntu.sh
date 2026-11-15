@@ -10,7 +10,7 @@
 #   sudo ./bsp/eswin/eic7700x/bootstrap-ubuntu.sh
 # ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -22,8 +22,13 @@ log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Escalating privileges via sudo..."
-    exec sudo -E bash "$0" "$@"
+    if command -v sudo >/dev/null 2>&1; then
+        echo "Escalating privileges via sudo..."
+        exec sudo -E bash "$0" "$@"
+    else
+        echo "[ERR!] This script must be run as root." >&2
+        exit 1
+    fi
 fi
 
 while [[ $# -gt 0 ]]; do
@@ -95,7 +100,7 @@ else
 fi
 
 # Back up factory extlinux.conf if present and not yet backed up
-for ext_path in /boot/extlinux/extlinux.conf /boot/efi/extlinux/extlinux.conf; do
+for ext_path in /boot/extlinux/extlinux.conf /boot/efi/extlinux.conf; do
     if [[ -f "$ext_path" && ! -f "${ext_path}.factory.bak" ]]; then
         cp -a "$ext_path" "${ext_path}.factory.bak"
         log_ok "Backed up factory bootloader config to ${ext_path}.factory.bak"
@@ -212,7 +217,7 @@ if apt-cache show fancontrol-config-p550-premier >/dev/null 2>&1; then
 fi
 
 PMU_SYSCTL="/etc/sysctl.d/90-sifive-p550-pmu.conf"
-PMU_CONTENT="# Unlock SiFive P550 L1/PL2/L3 hardware performance counters for CarrierPigeons / perf
+PMU_CONTENT="# Unlock SiFive P550 L1/PL2/L3 hardware performance counters for Linux perf & PMU telemetry
 kernel.perf_event_paranoid = -1
 kernel.kptr_restrict = 0"
 

@@ -4,7 +4,7 @@
 # Path: riscv-data-kit/mods/btrfs-raid/forge.sh
 #
 # Usage:
-#   sudo rvdk mods/btrfs-raid [--force-wipe-raid] [--no-apt-update] [--noprogbar]
+#   sudo rvdk mods/btrfs-raid [--json '<arrays_json>'] [--force-wipe-raid] [--no-apt-update] [--noprogbar]
 #   curl -fsSL https://rvdk.drewv-labs.dev/mods/btrfs-raid/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
@@ -19,10 +19,11 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
-NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
+[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+ENV_FILE="${RVDK_ENV_FILE:-${REAL_HOME}/.rvdk/config.env}"
 # shellcheck disable=SC1090
-[[ -f "$NODE_ENV" ]] && source "$NODE_ENV"
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
 FORCE_WIPE_RAID="${FORCE_WIPE_RAID:-false}"
 while [[ $# -gt 0 ]]; do

@@ -1,0 +1,9 @@
+{
+  "board": "sifive/unmatched",
+  "tag": "unmatched",
+  "name": "SiFive HiFive Unmatched Rev B (FU740)",
+  "soc": "sifive/fu740",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

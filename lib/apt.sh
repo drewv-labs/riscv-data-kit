@@ -7,8 +7,8 @@
 #   RVDK_NO_APT_UPDATE=1|true   Skip redundant `apt-get update` when index lists
 #                               already exist in /var/lib/apt/lists/.
 #   RVDK_APT_STAMP_FILE=<path>  Touched whenever `apt-get update` actually runs
-#                               so parent pipelines (rvdk day0 / brakerrak) can
-#                               set APT_UPDATED=true for subsequent modules.
+#                               so parent pipelines (rvdk day0 or external callers)
+#                               can skip redundant updates on subsequent modules.
 # ==============================================================================
 
 rvdk_apt_has_lists() {

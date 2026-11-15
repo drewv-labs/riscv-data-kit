@@ -25,28 +25,40 @@ _rvdk_infer_from_dt_model() {
             echo "eswin/eic7700x|pine64/starpro64|starpro64|" ;;
         *"EIC7700"*)
             echo "eswin/eic7700x|eswin/eic7700x-evb|eic7700x|" ;;
+        *"Unmatched"*|*"FU740"*)
+            echo "sifive/fu740|sifive/unmatched|unmatched|" ;;
+        *"VisionFive 2 Lite"*|*"VF2 Lite"*|*"JH7110S"*|*"JH-7110S"*)
+            echo "starfive/jh7110|starfive/vf2-lite|vf2lite|user" ;;
         *"VisionFive 2"*|*"VF2"*)
             echo "starfive/jh7110|starfive/vf2|vf2|user" ;;
         *"Mars"*)
             echo "starfive/jh7110|milkv/mars|mars|user" ;;
         *"Star64"*)
             echo "starfive/jh7110|pine64/star64|star64|user" ;;
-        *"OrangePi RV2"*)
+        *"OrangePi RV2"*|*"Orange Pi RV2"*)
             echo "spacemit/k1|orangepi/rv2|rv2|" ;;
-        *"OrangePi R2S"*)
+        *"OrangePi R2S"*|*"Orange Pi R2S"*)
             echo "spacemit/k1|orangepi/r2s|r2s|" ;;
-        *"OrangePi RV"*)
+        *"OrangePi RV"*|*"Orange Pi RV"*)
             echo "starfive/jh7110|orangepi/rv|opirv|user" ;;
         *"JH7110"*)
             echo "starfive/jh7110|starfive/vf2|vf2|user" ;;
+        *"AIBOX-K3"*|*"Firefly"*K3*)
+            echo "spacemit/k3|firefly/aibox-k3|aiboxk3|" ;;
         *"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
             echo "spacemit/k3|milkv/jupiter2|jptr2|" ;;
-        *"BPI-F3"*)
+        *"BPI-F3"*|*"Banana Pi BPI-F3"*)
             echo "spacemit/k1|bananapi/f3|bpif3|" ;;
+        *"BPI-CM6"*|*"Banana Pi BPI-CM6"*)
+            echo "spacemit/k1|bananapi/cm6|bpicm6|" ;;
         *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*)
             echo "spacemit/k1|milkv/jupiter|jptr1|" ;;
         *"Titan"*|*"DP1000"*)
-            echo "ultrarisc/dp1000|ultrarisc/titan|titan|" ;;
+            echo "ultrarisc/dp1000|milkv/titan|titan|" ;;
+        *"Atlantis"*|*"Ascalon"*)
+            echo "tenstorrent/atlantis|tenstorrent/atlantis|atlantis|" ;;
+        *"Blackhole"*)
+            echo "tenstorrent/blackhole|tenstorrent/blackhole|blackhole|" ;;
         *)
             echo "|||" ;;
     esac
@@ -59,20 +71,40 @@ rvdk_normalize_board_id() {
     case "$q" in
         p550|premier-p550|hifive-premier-p550|sifive-p550|sifive/p550|sifive/hifive-premier-p550)
             echo "sifive/p550" ;;
+        unmatched|unmatchedb|unmatched-b|fu740|hifive-unmatched|sifive-unmatched|sifive/unmatched)
+            echo "sifive/unmatched" ;;
         megrez|milkv-megrez|milkv/megrez|milk-v/megrez)
             echo "milkv/megrez" ;;
         starpro64|pine64/starpro64)
             echo "pine64/starpro64" ;;
+        vf2-lite|vf2lite|visionfive2-lite|visionfive-2-lite|starfive-vf2-lite|starfive/vf2-lite)
+            echo "starfive/vf2-lite" ;;
         vf2|visionfive2|visionfive-2|starfive-vf2|starfive/vf2|starfive/visionfive2)
             echo "starfive/vf2" ;;
         mars|milkv-mars|milkv/mars|milk-v/mars)
             echo "milkv/mars" ;;
+        rv|opirv|orangepi-rv|orangepi/rv)
+            echo "orangepi/rv" ;;
+        rv2|opirv2|orangepi-rv2|orangepi/rv2)
+            echo "orangepi/rv2" ;;
+        r2s|opir2s|orangepi-r2s|orangepi/r2s)
+            echo "orangepi/r2s" ;;
+        f3|bpif3|bpi-f3|bananapi-f3|bananapi/f3|bananapi/bpi-f3|banana-pi/f3)
+            echo "bananapi/f3" ;;
+        cm6|bpicm6|bpi-cm6|bananapi-cm6|bananapi/cm6|bananapi/bpi-cm6|banana-pi/cm6)
+            echo "bananapi/cm6" ;;
         jupiter|jptr1|jupiter1|milkv-jupiter|milkv/jupiter|milk-v/jupiter)
             echo "milkv/jupiter" ;;
         jupiter2|jptr2|milkv-jupiter2|milkv/jupiter2|milk-v/jupiter2)
             echo "milkv/jupiter2" ;;
-        titan|dp1000|ultrarisc-titan|ultrarisc/titan|milkv/titan|milk-v/titan)
-            echo "ultrarisc/titan" ;;
+        aibox-k3|aiboxk3|firefly-k3|firefly-aibox-k3|firefly/aibox-k3)
+            echo "firefly/aibox-k3" ;;
+        titan|dp1000|milkv-titan|milkv/titan|milk-v/titan|ultrarisc-titan|ultrarisc/titan)
+            echo "milkv/titan" ;;
+        atlantis|tt-atlantis|ascalon|tenstorrent-atlantis|tenstorrent/atlantis)
+            echo "tenstorrent/atlantis" ;;
+        blackhole|tt-blackhole|tenstorrent-blackhole|tenstorrent/blackhole)
+            echo "tenstorrent/blackhole" ;;
         */*)
             echo "$q" ;;
         *)
@@ -162,40 +194,79 @@ rvdk_kit_resolve() {
 
     if [[ -n "$cli_board" ]]; then
         board="$(rvdk_normalize_board_id "$cli_board")"
-        tag="${board##*/}"
+        case "$board" in
+            starfive/vf2-lite) tag="vf2lite"; factory_user="${factory_user:-user}" ;;
+            starfive/vf2|milkv/mars|pine64/star64) tag="${board##*/}"; factory_user="${factory_user:-user}" ;;
+            orangepi/rv)       tag="opirv"; factory_user="${factory_user:-user}" ;;
+            milkv/jupiter)     tag="jptr1" ;;
+            milkv/jupiter2)    tag="jptr2" ;;
+            firefly/aibox-k3)  tag="aiboxk3" ;;
+            bananapi/f3)       tag="bpif3" ;;
+            bananapi/cm6)      tag="bpicm6" ;;
+            *)                 tag="${board##*/}" ;;
+        esac
     fi
     if [[ -n "$cli_soc" ]]; then
         soc="$cli_soc"
     elif [[ -z "$soc" && -n "$board" ]]; then
         case "$board" in
             sifive/p550|milkv/megrez|pine64/starpro64) soc="eswin/eic7700x" ;;
-            starfive/vf2|milkv/mars|pine64/star64|orangepi/rv) soc="starfive/jh7110" ;;
-            milkv/jupiter|orangepi/rv2|orangepi/r2s|bananapi/f3) soc="spacemit/k1" ;;
-            milkv/jupiter2) soc="spacemit/k3" ;;
-            ultrarisc/titan) soc="ultrarisc/dp1000" ;;
+            sifive/unmatched) soc="sifive/fu740" ;;
+            starfive/vf2|starfive/vf2-lite|milkv/mars|pine64/star64|orangepi/rv) soc="starfive/jh7110" ;;
+            milkv/jupiter|orangepi/rv2|orangepi/r2s|bananapi/f3|bananapi/cm6) soc="spacemit/k1" ;;
+            milkv/jupiter2|firefly/aibox-k3) soc="spacemit/k3" ;;
+            milkv/titan) soc="ultrarisc/dp1000" ;;
+            tenstorrent/atlantis) soc="tenstorrent/atlantis" ;;
+            tenstorrent/blackhole) soc="tenstorrent/blackhole" ;;
         esac
     fi
 
     if [[ -z "$board" && -n "$soc" ]]; then
         case "$soc" in
-            eswin/eic7700x)   board="sifive/p550";     tag="p550" ;;
-            starfive/jh7110)  board="starfive/vf2";    tag="vf2"; factory_user="user" ;;
-            spacemit/k1)      board="milkv/jupiter";   tag="jptr1" ;;
-            spacemit/k3)      board="milkv/jupiter2";  tag="jptr2" ;;
-            ultrarisc/dp1000) board="ultrarisc/titan"; tag="titan" ;;
+            eswin/eic7700x)        board="sifive/p550";          tag="p550" ;;
+            sifive/fu740)          board="sifive/unmatched";     tag="unmatched" ;;
+            starfive/jh7110)       board="starfive/vf2";         tag="vf2"; factory_user="user" ;;
+            spacemit/k1)           board="milkv/jupiter";        tag="jptr1" ;;
+            spacemit/k3)           board="milkv/jupiter2";       tag="jptr2" ;;
+            ultrarisc/dp1000)      board="milkv/titan";          tag="titan" ;;
+            tenstorrent/atlantis)  board="tenstorrent/atlantis"; tag="atlantis" ;;
+            tenstorrent/blackhole) board="tenstorrent/blackhole"; tag="blackhole" ;;
         esac
     fi
 
     local os_id="${cli_os:-}"
     local os_ver=""
+    local os_like=""
     if [[ -z "$os_id" && -f /etc/os-release ]]; then
         os_id="$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}")"
         os_ver="$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}")"
+        os_like="$(. /etc/os-release 2>/dev/null && echo "${ID_LIKE:-}")"
+    elif [[ -z "$os_id" && -f /etc/openwrt_release ]]; then
+        os_id="openwrt"
+        os_ver="$(. /etc/openwrt_release 2>/dev/null && echo "${DISTRIB_RELEASE:-}")"
     elif [[ -z "$os_id" && "$(uname -s)" == "Darwin" ]]; then
         os_id="macos"
         os_ver="$(sw_vers -productVersion 2>/dev/null || true)"
     fi
     os_id="$(tr '[:upper:]' '[:lower:]' <<< "${os_id:-unknown}")"
+    os_like="$(tr '[:upper:]' '[:lower:]' <<< "${os_like:-}")"
+
+    # Normalize derivative RISC-V BSP distros & versioned media.json tags (ubuntu-24.04, debian-12, RockOS, RevyOS, Ky OpenWrt)
+    case "$os_id" in
+        debian|ubuntu|bianbu|openwrt|macos) ;;
+        debian-*|rockos*|revyos*) os_id="debian" ;;
+        ubuntu-*)                 os_id="ubuntu" ;;
+        bianbu-*)                 os_id="bianbu" ;;
+        *openwrt*)                os_id="openwrt" ;;
+        *)
+            case " $os_like " in
+                *" openwrt "*) os_id="openwrt" ;;
+                *" bianbu "*)  os_id="bianbu" ;;
+                *" ubuntu "*)  os_id="ubuntu" ;;
+                *" debian "*)  os_id="debian" ;;
+            esac
+            ;;
+    esac
 
     local soc_slug="${soc//\//-}"
     local primary_nic
@@ -222,7 +293,8 @@ rvdk_kit_resolve() {
     if [[ "$(uname -s)" == "Linux" && $EUID -eq 0 && -n "$RVDK_SOC" ]] && [[ "$has_override" == "false" || "$force_refresh" == "true" ]]; then
         local cache_dir
         cache_dir="$(dirname "$RVDK_KIT_CACHE_FILE")"
-        install -d -m 0755 "$cache_dir"
+        mkdir -p "$cache_dir"
+        chmod 0755 "$cache_dir"
         local tmp_kit="${RVDK_KIT_CACHE_FILE}.tmp.$$"
         cat <<EOF > "$tmp_kit"
 # ==============================================================================
@@ -248,7 +320,7 @@ EOF
 
 # Collect all applicable deeptune.sh layers for the resolved Kit in execution order:
 #   1. os/deeptune.sh
-#   2. os/deeptune-<os_id>.sh (if present)
+#   2. os/deeptune-${RVDK_OS_ID:-unknown}.sh (if present)
 #   3. bsp/<vendor>/<soc>/deeptune.sh (if present)
 #   4. boards/<vendor>/<board>/deeptune.sh (if present)
 rvdk_collect_deeptune_scripts() {

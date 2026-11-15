@@ -6,11 +6,11 @@
 #              eradication for Ubuntu 24.04+ RISC-V nodes.
 #
 # Usage:
-#   ./bootstrap-ubuntu.sh --user drew --hostname brakerbox-p550 --nopasswd [--no-apt-update] [--noprogbar]
+#   ./bootstrap-ubuntu.sh [--user drew] [--hostname rv-p550] [--nopasswd] [--no-apt-update] [--noprogbar]
 #   ./bootstrap-ubuntu.sh --debloat-only
 # ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # --- Default State ---
 TARGET_USER=""
@@ -44,18 +44,13 @@ Options:
   -h, --help                  Show this help message and exit
 
 Example:
-  $0 --user drew --hostname brakerbox-p550 --nopasswd
+  $0 --user drew --hostname rv-p550 --nopasswd
 EOF
 }
 
 # ==============================================================================
 # ARGUMENT PARSER
 # ==============================================================================
-if [[ $# -eq 0 ]]; then
-    usage
-    exit 1
-fi
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -u|--user)
@@ -114,7 +109,7 @@ fi
 if [[ $EUID -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
         log_info "Escalating privileges via sudo..."
-        exec sudo -E bash "$0" "${ORIG_ARGS[@]}"
+        exec sudo -E bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
         log_err "This script must be run as root."
         exit 1
@@ -378,4 +373,4 @@ fi
 
 # ----------------------------------------------------------------------------------
 rvdk_prog 100 "Ubuntu Day-0 OS normalization complete"
-log_info "Day-0 Ubuntu bootstrap complete. Node is pregamed and ready for forge.sh."
+log_info "Day-0 Ubuntu bootstrap complete."

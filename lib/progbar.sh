@@ -8,10 +8,16 @@
 #      Reserves 1 row at the bottom of the terminal (row = ROWS), confines
 #      scrolling logs to [1 .. ROWS-1] via DECSTBM (\033[1;<end>r), and restores
 #      the full terminal scroll region on EXIT/INT/TERM.
-#   2. Stacked Sub-Process Mode (BRAKERRAK_PROGBAR_ACTIVE=1):
-#      Draws RVDK sub-module progress on row (ROWS - 1) directly above the
-#      BrakerRak master progress bar on row (ROWS), keeping scroll margins at
-#      [1 .. ROWS-2] without tearing down BrakerRak's dock on sub-process exit.
+#   2. Stacked Sub-Process Mode (RVDK_PARENT_PROGBAR=1):
+#      Draws RVDK sub-module progress on row (ROWS - 1) directly above a parent
+#      orchestrator's master progress bar on row (ROWS), keeping scroll margins
+#      at [1 .. ROWS-2] without tearing down the parent dock on sub-process exit.
+#      Optional parent env hooks:
+#        RVDK_PARENT_LABEL       Badge label on row ROWS (default: "Pipeline")
+#        RVDK_PARENT_BADGE_SGR   ANSI SGR sequence for parent badge
+#        RVDK_PARENT_BAR_SGR     ANSI SGR sequence for parent gauge fill
+#        RVDK_PARENT_STATE       Path to parent `<pct>|<msg>` state file
+#        RVDK_SUB_STATE          Path where RVDK writes its `<pct>|<msg>` state
 #   3. Suppressed Mode (--noprogbar | RVDK_NO_PROGBAR=1 | non-TTY | dumb term):
 #      All functions become zero-overhead no-ops.
 # ==============================================================================
@@ -26,19 +32,18 @@ _RVDK_PROGBAR_SOURCED="1"
 # bash parses `\0` + 3 octal digits (`\0337` -> 0xDF) instead of ESC + '7'!
 _RVDK_ESC=$'\033'
 
-# Brand palette:
-#   RVDK Blue       : #1c49f2 -> RGB(28, 73, 242)
-#   BrakerRak Purple: #5a26e5 -> RGB(90, 38, 229)
+# Palette:
+#   RVDK Blue: #1c49f2 -> RGB(28, 73, 242)
 if [[ "${TERM:-}" == "linux" ]]; then
     _RVDK_BADGE_SGR="${_RVDK_ESC}[44;97;1m"
     _RVDK_BAR_SGR="${_RVDK_ESC}[1;34m"
-    _RVDK_BRAK_BADGE_SGR="${_RVDK_ESC}[45;97;1m"
-    _RVDK_BRAK_BAR_SGR="${_RVDK_ESC}[1;35m"
+    _RVDK_DEFAULT_PARENT_BADGE_SGR="${_RVDK_ESC}[46;97;1m"
+    _RVDK_DEFAULT_PARENT_BAR_SGR="${_RVDK_ESC}[1;36m"
 else
     _RVDK_BADGE_SGR="${_RVDK_ESC}[48;2;28;73;242;38;2;255;255;255;1m"
     _RVDK_BAR_SGR="${_RVDK_ESC}[38;2;28;73;242;1m"
-    _RVDK_BRAK_BADGE_SGR="${_RVDK_ESC}[48;2;90;38;229;38;2;255;255;255;1m"
-    _RVDK_BRAK_BAR_SGR="${_RVDK_ESC}[38;2;90;38;229;1m"
+    _RVDK_DEFAULT_PARENT_BADGE_SGR="${_RVDK_ESC}[48;2;51;65;85;38;2;255;255;255;1m"
+    _RVDK_DEFAULT_PARENT_BAR_SGR="${_RVDK_ESC}[38;2;100;116;139;1m"
 fi
 
 _RVDK_PROG_ACTIVE="0"
@@ -99,7 +104,7 @@ _rvdk_prog_format_line() {
         return 0
     fi
 
-    # Fixed 18-char badge (" %-9s [%3d%%] ") so RVDK & BrakerRak align vertically
+    # Fixed 18-char badge (" %-9s [%3d%%] ") so stacked parent & child bars align vertically
     local badge_txt
     badge_txt="$(printf " %-9s [%3d%%] " "$label" "$pct")"
 
@@ -171,15 +176,18 @@ _rvdk_prog_render() {
 
         seq+="${esc}[${sub_row};1H${rvdk_line}${esc}[0K"
 
-        # Self-heal BrakerRak master bar on row=ROWS if state file is present
-        if [[ -n "${BRAKERRAK_MASTER_STATE:-}" && -r "${BRAKERRAK_MASTER_STATE}" ]]; then
+        # Self-heal parent orchestrator bar on row=ROWS if state file is present
+        if [[ -n "${RVDK_PARENT_STATE:-}" && -r "${RVDK_PARENT_STATE}" ]]; then
             local m_raw="" m_pct="0" m_msg="" m_line=""
-            IFS= read -r m_raw < "${BRAKERRAK_MASTER_STATE}" 2>/dev/null || true
+            local p_label="${RVDK_PARENT_LABEL:-Pipeline}"
+            local p_badge="${RVDK_PARENT_BADGE_SGR:-$_RVDK_DEFAULT_PARENT_BADGE_SGR}"
+            local p_bar="${RVDK_PARENT_BAR_SGR:-$_RVDK_DEFAULT_PARENT_BAR_SGR}"
+            IFS= read -r m_raw < "${RVDK_PARENT_STATE}" 2>/dev/null || true
             if [[ -n "$m_raw" ]]; then
                 m_pct="${m_raw%%|*}"
                 m_msg="${m_raw#*|}"
                 [[ "$m_pct" =~ ^[0-9]+$ ]] || m_pct=0
-                m_line="$(_rvdk_prog_format_line "BrakerRak" "$_RVDK_BRAK_BADGE_SGR" "$_RVDK_BRAK_BAR_SGR" "$m_pct" "$m_msg" "$cols")"
+                m_line="$(_rvdk_prog_format_line "$p_label" "$p_badge" "$p_bar" "$m_pct" "$m_msg" "$cols")"
                 seq+="${esc}[${master_row};1H${m_line}${esc}[0K"
             fi
         fi
@@ -225,13 +233,13 @@ rvdk_prog_init() {
     _RVDK_PROG_PCT="${RVDK_PROG_BASE:-0}"
     _RVDK_PROG_MSG="$init_label"
 
-    if [[ "${BRAKERRAK_PROGBAR_ACTIVE:-0}" == "1" ]]; then
-        # Stacked above BrakerRak master bar: BrakerRak already reserved 2 rows
+    if [[ "${RVDK_PARENT_PROGBAR:-0}" == "1" ]]; then
+        # Stacked above parent orchestrator bar (parent already reserved 2 rows)
         _RVDK_PROG_MODE="stacked"
         _RVDK_PROG_OWNER="0"
         trap '_rvdk_prog_render' WINCH
-        if [[ -n "${BRAKERRAK_SUB_STATE:-}" ]]; then
-            printf '%s|%s\n' "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" > "${BRAKERRAK_SUB_STATE}" 2>/dev/null || true
+        if [[ -n "${RVDK_SUB_STATE:-}" ]]; then
+            printf '%s|%s\n' "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" > "${RVDK_SUB_STATE}" 2>/dev/null || true
         fi
         _rvdk_prog_render
     elif [[ "${RVDK_PROGBAR_SESSION:-0}" == "1" ]]; then
@@ -280,8 +288,8 @@ rvdk_prog() {
     _RVDK_PROG_PCT="$scaled"
     [[ -n "$msg" ]] && _RVDK_PROG_MSG="$msg"
 
-    if [[ "$_RVDK_PROG_MODE" == "stacked" && -n "${BRAKERRAK_SUB_STATE:-}" ]]; then
-        printf '%s|%s\n' "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" > "${BRAKERRAK_SUB_STATE}" 2>/dev/null || true
+    if [[ "$_RVDK_PROG_MODE" == "stacked" && -n "${RVDK_SUB_STATE:-}" ]]; then
+        printf '%s|%s\n' "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" > "${RVDK_SUB_STATE}" 2>/dev/null || true
     fi
 
     _rvdk_prog_render

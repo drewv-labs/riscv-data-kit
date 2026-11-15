@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // StarFive JH7110 (SiFive U74) Debian BSP Forge
+# DREW-V Labs // StarFive JH7110 / JH7110S (SiFive U74) Debian BSP Bootstrapper
 # Path: riscv-data-kit/bsp/starfive/jh7110/bootstrap-debian.sh
-# Description: Idempotent Layer 2 BSP hardening for StarFive JH7110 on Debian:
-#              - Protects vendor U-Boot hooks (/etc/kernel/postinst.d/zz-u-boot-menu)
-#              - Migrates dead 2023 debian-ports snapshot to official Debian sid
+# Description: Idempotent Layer 2 BSP hardening for StarFive JH7110 / JH7110S
+#              (VisionFive 2, VisionFive 2 Lite, Milk-V Mars, Orange Pi RV) on Debian:
+#              - Protects vendor U-Boot & DTB hooks (/etc/kernel/postinst.d/zz-u-boot-menu)
+#              - Migrates dead 2023/VF2-Lite snapshot repos to official Debian sid
 #              - Purges Wayland/Weston/X11/GTK & unblocks t64 prior to full-upgrade
-#              - Persists eth0 DHCP, masks sleep targets, locks 1500 MHz governor,
+#              - Persists primary wired NIC (eth0/end0) DHCP, masks sleep targets,
+#                locks U74 max OPP governor (1.50 GHz JH7110 / 1.25 GHz JH7110S),
 #                and unlocks SiFive U74 PMU counters.
 #
 # Usage:
 #   sudo rvdk bsp [--skip-upgrade] [--no-apt-update] [--noprogbar]
-#   curl -fsSL https://rvdk.drewv-labs.dev/bsp/starfive/jh7110/forge-debian.sh | sudo bash
+#   curl -fsSL https://rvdk.drewv-labs.dev/bsp/starfive/jh7110/bootstrap-debian.sh | sudo bash
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -102,7 +104,7 @@ log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_warn() { printf "\033[1;31m[WARN]\033[0m %s\n" "$1"; }
 
 # ==============================================================================
-# 1. VERIFY STARFIVE JH7110 DEVICE TREE
+# 1. VERIFY STARFIVE JH7110 / JH7110S DEVICE TREE
 # ==============================================================================
 DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
 log_info "Detected Device-Tree Model: ${DT_MODEL}"
@@ -110,7 +112,7 @@ log_info "Detected Device-Tree Model: ${DT_MODEL}"
 # ==============================================================================
 # 2. BOOTLOADER, FIT & VENDOR U-BOOT HOOK PROTECTION (zz-u-boot-menu)
 # ==============================================================================
-rvdk_prog 10 "JH7110 BSP: protecting U-Boot & FIT hooks..."
+rvdk_prog 10 "JH7110 BSP: protecting U-Boot & FIT/DTB hooks..."
 APT_BSP_CONF="/etc/apt/apt.conf.d/90-starfive-bsp-protect"
 APT_BSP_CONTENT='Dpkg::Options {
    "--force-overwrite";
@@ -125,7 +127,7 @@ else
     log_skip "StarFive U-Boot/DTB dpkg protection already active"
 fi
 
-for boot_cfg in /boot/extlinux/extlinux.conf /boot/boot/extlinux/extlinux.conf /etc/default/u-boot /etc/kernel/postinst.d/zz-u-boot-menu; do
+for boot_cfg in /boot/extlinux/extlinux.conf /boot/boot/extlinux/extlinux.conf /boot/efi/extlinux.conf /etc/default/u-boot /etc/kernel/postinst.d/zz-u-boot-menu; do
     if [[ -f "$boot_cfg" && ! -f "${boot_cfg}.factory.bak" ]]; then
         cp -a "$boot_cfg" "${boot_cfg}.factory.bak"
         log_ok "Backed up factory boot artifact to ${boot_cfg}.factory.bak"
@@ -133,7 +135,7 @@ for boot_cfg in /boot/extlinux/extlinux.conf /boot/boot/extlinux/extlinux.conf /
 done
 
 # ==============================================================================
-# 3. MIGRATE 2023 SNAPSHOT REPOS, PURGE GUI & UNBLOCK T64 UPGRADE
+# 3. MIGRATE SNAPSHOT REPOS, PURGE GUI & UNBLOCK T64 UPGRADE
 # ==============================================================================
 rvdk_prog 25 "JH7110 BSP: checking APT sources & keyring..."
 DESIRED_SOURCES="deb http://deb.debian.org/debian unstable main
@@ -218,25 +220,31 @@ else
 fi
 
 # ==============================================================================
-# 4. PERSISTENT PRIMARY NIC (eth0) CONFIGURATION
+# 4. PERSISTENT PRIMARY WIRED NIC (eth0 / end0) CONFIGURATION
 # ==============================================================================
-rvdk_prog 82 "JH7110 BSP: persisting eth0 & masking sleep targets..."
-if ip link show eth0 >/dev/null 2>&1; then
-    if [[ -d /etc/network/interfaces.d ]]; then
-        if grep -rqE "iface (eth0|end0)" /etc/network/ 2>/dev/null; then
-            log_skip "Interface 'eth0' is already persisted in /etc/network/"
-        else
-            cat << 'EOF' > /etc/network/interfaces.d/eth0
-allow-hotplug eth0
-iface eth0 inet dhcp
+rvdk_prog 82 "JH7110 BSP: persisting primary wired NIC & masking sleep..."
+PRIMARY_WIRED_NIC=""
+for cand_nic in eth0 end0; do
+    if ip link show "$cand_nic" >/dev/null 2>&1; then
+        PRIMARY_WIRED_NIC="$cand_nic"
+        break
+    fi
+done
+
+if [[ -n "$PRIMARY_WIRED_NIC" && -d /etc/network/interfaces.d ]]; then
+    if grep -rqE "iface ${PRIMARY_WIRED_NIC}\\b" /etc/network/ 2>/dev/null; then
+        log_skip "Interface '${PRIMARY_WIRED_NIC}' is already persisted in /etc/network/"
+    else
+        cat <<EOF > "/etc/network/interfaces.d/${PRIMARY_WIRED_NIC}"
+allow-hotplug ${PRIMARY_WIRED_NIC}
+iface ${PRIMARY_WIRED_NIC} inet dhcp
 EOF
-            log_ok "Persisted eth0 DHCP configuration in /etc/network/interfaces.d/eth0"
-        fi
+        log_ok "Persisted ${PRIMARY_WIRED_NIC} DHCP configuration in /etc/network/interfaces.d/${PRIMARY_WIRED_NIC}"
     fi
 fi
 
 # ==============================================================================
-# 5. JH7110 SLEEP TARGET LOCKOUT & BACKGROUND APT TIMER MASK
+# 5. JH7110 / JH7110S SLEEP TARGET LOCKOUT & BACKGROUND APT TIMER MASK
 # ==============================================================================
 MASK_UNITS=(
     sleep.target suspend.target hibernate.target hybrid-sleep.target
@@ -259,12 +267,20 @@ else
 fi
 
 # ==============================================================================
-# 6. LOCK 1500 MHz CPUFREQ PERFORMANCE GOVERNOR & UNLOCK U74 PMU COUNTERS
+# 6. LOCK MAX OPP CPUFREQ PERFORMANCE GOVERNOR & UNLOCK U74 PMU COUNTERS
+#    (1500 MHz on JH7110 VF2/Mars/OPi-RV; 1250 MHz on JH7110S VF2 Lite)
 # ==============================================================================
-rvdk_prog 92 "JH7110 BSP: locking 1500 MHz governor & U74 PMU..."
+MAX_KHZ="$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo "")"
+if [[ "$MAX_KHZ" =~ ^[0-9]+$ ]] && (( MAX_KHZ > 0 )); then
+    MAX_MHZ_LABEL="$(( MAX_KHZ / 1000 )) MHz"
+else
+    MAX_MHZ_LABEL="max OPP"
+fi
+
+rvdk_prog 92 "JH7110 BSP: locking ${MAX_MHZ_LABEL} governor & U74 PMU..."
 GOV_UNIT="/etc/systemd/system/jh7110-cpufreq-performance.service"
 GOV_UNIT_CONTENT='[Unit]
-Description=Lock StarFive JH7110 SiFive U74 Harts to 1500 MHz Performance Governor
+Description=Lock StarFive JH7110/JH7110S SiFive U74 Harts to Performance Governor
 After=multi-user.target
 
 [Service]
@@ -279,14 +295,14 @@ if [[ ! -f "$GOV_UNIT" ]] || [[ "$(cat "$GOV_UNIT")" != "$GOV_UNIT_CONTENT" ]]; 
     echo "$GOV_UNIT_CONTENT" > "$GOV_UNIT"
     systemctl daemon-reload
     systemctl enable --now jh7110-cpufreq-performance.service >/dev/null
-    log_ok "Enabled persistent 1500 MHz performance governor service ($GOV_UNIT)"
+    log_ok "Enabled persistent ${MAX_MHZ_LABEL} performance governor service ($GOV_UNIT)"
 else
     systemctl start jh7110-cpufreq-performance.service 2>/dev/null || true
-    log_skip "1500 MHz performance governor service already active"
+    log_skip "U74 performance governor service (${MAX_MHZ_LABEL}) already active"
 fi
 
 PMU_SYSCTL="/etc/sysctl.d/90-starfive-u74-pmu.conf"
-PMU_CONTENT="# Unlock SiFive U74 hardware performance counters for CarrierPigeons / perf
+PMU_CONTENT="# Unlock SiFive U74 hardware performance counters for Linux perf & PMU telemetry
 kernel.perf_event_paranoid = -1
 kernel.kptr_restrict = 0"
 
@@ -298,5 +314,5 @@ else
     log_skip "SiFive U74 PMU sysctls already configured"
 fi
 
-rvdk_prog 100 "StarFive JH7110 BSP hardening complete"
-log_info "StarFive JH7110 (Debian) BSP forge complete."
+rvdk_prog 100 "StarFive JH7110/JH7110S BSP hardening complete"
+log_info "StarFive JH7110/JH7110S (Debian) BSP bootstrap complete."

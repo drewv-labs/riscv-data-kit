@@ -1,0 +1,9 @@
+{
+  "board": "milkv/megrez",
+  "tag": "megrez",
+  "name": "Milk-V Megrez (ESWIN EIC7700X)",
+  "soc": "eswin/eic7700x",
+  "default_os": "ubuntu-24.04",
+  "media": {},
+  "quirks": []
+}

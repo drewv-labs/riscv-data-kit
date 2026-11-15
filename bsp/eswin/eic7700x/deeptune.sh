@@ -86,7 +86,7 @@ EOF
 done
 
 if [[ "$ACTION" != "status" && $EUID -ne 0 ]]; then
-    exec sudo -E bash "$0" "${ORIG_ARGS[@]}"
+    exec sudo -E bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
 fi
 
 _SCRIPT_DIR=""
@@ -239,7 +239,7 @@ WANT_IRQ_SCRIPT="#!/usr/bin/env bash
 #   • xhci-hcd:usb3 -> CPU1
 #   • ${PRIMARY_NIC} (GbE)    -> CPU2
 #   • xhci-hcd:usb1 -> CPU3
-set -euo pipefail
+set -Eeuo pipefail
 pin_irq() {
     local pattern=\"\$1\"
     local cpu_list=\"\$2\"

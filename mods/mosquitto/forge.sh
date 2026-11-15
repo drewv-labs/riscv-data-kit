@@ -22,9 +22,9 @@ REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
 [[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
 
-NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
+ENV_FILE="${RVDK_ENV_FILE:-${REAL_HOME}/.rvdk/config.env}"
 # shellcheck disable=SC1090
-[[ -f "$NODE_ENV" ]] && source "$NODE_ENV"
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
 MQTT_PORT="${MQTT_PORT:-1883}"
 DATA_MOUNT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
@@ -108,7 +108,7 @@ WANT_MOSQ_CONF="# DREW-V Labs // RVDK Mosquitto Telemetry Broker
 listener ${MQTT_PORT} 0.0.0.0
 socket_domain ipv4
 
-# Local Unix Domain Socket for zero-TCP-overhead local Pigeoneer/PigeonCoop pub/sub
+# Local Unix Domain Socket for zero-TCP-overhead local IPC pub/sub
 listener 0 /run/mosquitto/mosquitto.sock
 
 allow_anonymous true
