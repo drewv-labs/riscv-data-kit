@@ -174,6 +174,7 @@ rvdk flash p550 usb --device /dev/sdX --image /path/to/custom.img.zst
 #### Orgs & Special Projects
 - [RISC-V International](https://riscv.org/)
 - [RISE Project (RISC-V Software Ecosystem)](https://riseproject.dev/)
+- [Linux Foundation](https://www.linuxfoundation.org/)
 
 #### Industry
 - [SiFive](https://www.sifive.com/)
