@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // RVDK Module: NVMe 4Kn + LVM + XFS/ext4 Storage Provisioner
+# DREW-V Labs // RVDK Module: NVMe 4Kn + LVM (Single or Dual PG/NFS) Provisioner
 # Path: riscv-data-kit/mods/nvme-4kn/forge.sh
 #
+# Layouts:
+#   • Default (Single-LV):
+#       lv_pgdata   (85%VG) -> 4Kn XFS/ext4 at /mnt/nvme_pgdata
+#       Free Pool   (15%VG) -> CoW snapshot & growth reserve
+#   • Dual-LV (--with-nfs-lv | WITH_NFS_LV=true):
+#       lv_pgdata   (45%VG) -> 4Kn XFS/ext4 at /mnt/nvme_pgdata (ENOSPC-isolated PG18)
+#       lv_nfsvault (30%VG) -> Btrfs zstd:3 at /mnt/nfs_vault   (grow+shrink elastic NFS)
+#       Free Pool   (25%VG) -> Shared elastic VG reserve + CoW snapshots
+#
 # Usage:
-#   sudo rvdk mods/nvme-4kn [--device /dev/nvme0n1] [--mount /mnt/nvme_pgdata] [--vg vg_rvdk] [--lv lv_pgdata] [--force-wipe] [--no-apt-update] [--noprogbar]
-#   curl -fsSL https://rvdk.drewv-labs.dev/mods/nvme-4kn/forge.sh | sudo bash
+#   sudo rvdk mods/nvme-4kn [--device /dev/nvme0n1] [--mount /mnt/nvme_pgdata] [--vg vg_rvdk] [--lv lv_pgdata] [--with-nfs-lv] [--nfs-mount /mnt/nfs_vault] [--force-wipe] [--no-apt-update] [--noprogbar]
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -19,6 +27,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
+REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
 [[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
 ENV_FILE="${RVDK_ENV_FILE:-${REAL_HOME}/.rvdk/config.env}"
@@ -31,6 +40,14 @@ FS_LABEL="${FS_LABEL:-PGDATA_NVME}"
 VG_NAME="${VG_NAME:-vg_rvdk}"
 LV_NAME="${LV_NAME:-lv_pgdata}"
 LV_PCT="${LV_PCT:-85%VG}"
+
+WITH_NFS_LV="${WITH_NFS_LV:-false}"
+NFS_LV_NAME="${NFS_LV_NAME:-lv_nfsvault}"
+NFS_FS_LABEL="${NFS_FS_LABEL:-NFS_VAULT}"
+NFS_MOUNT_POINT="${NFS_MOUNT_POINT:-/mnt/nfs_vault}"
+DUAL_PG_PCT="${DUAL_PG_PCT:-45%VG}"
+DUAL_NFS_PCT="${DUAL_NFS_PCT:-30%VG}"
+
 USE_LVM="${USE_LVM:-true}"
 FORCE_WIPE="${FORCE_WIPE_NVME:-false}"
 
@@ -41,6 +58,13 @@ while [[ $# -gt 0 ]]; do
         --label)                         FS_LABEL="${2:-}"; shift 2 ;;
         --vg|--vg-name)                  VG_NAME="${2:-vg_rvdk}"; shift 2 ;;
         --lv|--lv-name)                  LV_NAME="${2:-lv_pgdata}"; shift 2 ;;
+        --with-nfs-lv|--dual-lvm)        WITH_NFS_LV="true"; shift ;;
+        --no-nfs-lv)                     WITH_NFS_LV="false"; shift ;;
+        --nfs-mount)                     NFS_MOUNT_POINT="${2:-/mnt/nfs_vault}"; shift 2 ;;
+        --nfs-lv)                        NFS_LV_NAME="${2:-lv_nfsvault}"; shift 2 ;;
+        --nfs-label)                     NFS_FS_LABEL="${2:-NFS_VAULT}"; shift 2 ;;
+        --pg-pct)                        DUAL_PG_PCT="${2:-45%VG}"; shift 2 ;;
+        --nfs-pct)                       DUAL_NFS_PCT="${2:-30%VG}"; shift 2 ;;
         --no-lvm)                        USE_LVM="false"; shift ;;
         --force-wipe|--force-wipe-nvme)  FORCE_WIPE="true"; shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
@@ -101,14 +125,26 @@ if lsblk -no MOUNTPOINT "$NVME_DEV" 2>/dev/null | grep -qE "^(/|/boot|/boot/efi)
     log_fatal "Safety Interlock: ${NVME_DEV} backs the root/boot OS filesystem! Aborting."
 fi
 
-rvdk_prog 15 "NVMe 4Kn: verifying nvme-cli, lvm2 & xfsprogs..."
-rvdk_apt_ensure nvme-cli lvm2 xfsprogs e2fsprogs parted util-linux
+REQ_PKGS=(nvme-cli lvm2 xfsprogs e2fsprogs parted util-linux)
+if [[ "$WITH_NFS_LV" == "true" && "$USE_LVM" == "true" ]]; then
+    REQ_PKGS+=(btrfs-progs)
+fi
+rvdk_prog 15 "NVMe 4Kn: verifying storage prerequisites..."
+rvdk_apt_ensure "${REQ_PKGS[@]}"
 
-# 1. Detect Kernel Filesystem Support (XFS preferred; automatic 4K ext4 fallback on stripped vendor kernels)
+# 1. Detect Kernel Filesystem Support
+#    • PostgreSQL volume (`lv_pgdata`)  : XFS preferred (4Kn, logbsize=256k); ext4 fallback
+#    • Dedicated NFS LV (`lv_nfsvault`) : Btrfs preferred (zstd:3, online grow+shrink); XFS/ext4 fallback
 if modprobe xfs 2>/dev/null || grep -qw xfs /proc/filesystems; then
     NVME_FSTYPE="xfs"
 else
     NVME_FSTYPE="ext4"
+fi
+
+if modprobe btrfs 2>/dev/null || grep -qw btrfs /proc/filesystems; then
+    NFS_FSTYPE="btrfs"
+else
+    NFS_FSTYPE="$NVME_FSTYPE"
 fi
 
 NVME_SHORT="$(basename "$NVME_DEV")"
@@ -124,6 +160,7 @@ if [[ -n "$EXISTING_FS_DEV" && "$CUR_LBA" == "4096" && "$FORCE_WIPE" == "false" 
 else
     if [[ "$CUR_LBA" != "4096" || "$FORCE_WIPE" == "true" ]]; then
         umount -f "$MOUNT_POINT" 2>/dev/null || true
+        umount -f "$NFS_MOUNT_POINT" 2>/dev/null || true
         vgchange -an "$VG_NAME" 2>/dev/null || true
 
         LBA_4K_IDX="$(nvme id-ns "$NVME_DEV" 2>/dev/null | awk '/lbads:12/ {print $2}' | tr -dc '0-9' | head -n1 || true)"
@@ -141,8 +178,13 @@ else
     fi
 fi
 
-# 3. Provision LVM (${VG_NAME}/${LV_NAME} with 15% snapshot reserve) & Format XFS/ext4
-rvdk_prog 60 "NVMe 4Kn: converging LVM (${VG_NAME}/${LV_NAME}) & ${NVME_FSTYPE^^}..."
+# 3. Provision Primary PostgreSQL Volume (${VG_NAME}/${LV_NAME}) & Format XFS/ext4
+EFFECTIVE_PG_PCT="$LV_PCT"
+if [[ "$WITH_NFS_LV" == "true" && "$USE_LVM" == "true" ]]; then
+    EFFECTIVE_PG_PCT="$DUAL_PG_PCT"
+fi
+
+rvdk_prog 55 "NVMe 4Kn: converging primary volume (${VG_NAME}/${LV_NAME}) & ${NVME_FSTYPE^^}..."
 if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
     TARGET_BLOCK_DEV="$EXISTING_FS_DEV"
     log_skip "${NVME_FSTYPE^^} volume '${FS_LABEL}' already converged at ${TARGET_BLOCK_DEV}"
@@ -154,7 +196,8 @@ else
         log_warn "Reformatting existing LVM volume ${TARGET_BLOCK_DEV} to ${NVME_FSTYPE}..."
         wipefs -af "$TARGET_BLOCK_DEV" >/dev/null 2>&1 || true
     elif [[ "$USE_LVM" == "true" ]]; then
-        log_info "Building LVM Volume Group (${VG_NAME}/${LV_NAME} @ ${LV_PCT}) on ${NVME_DEV}..."
+        umount -f "$NFS_MOUNT_POINT" 2>/dev/null || true
+        log_info "Building LVM Volume Group (${VG_NAME}/${LV_NAME} @ ${EFFECTIVE_PG_PCT}) on ${NVME_DEV}..."
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
         pvremove -ff -y "$NVME_DEV" 2>/dev/null || true
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
@@ -163,9 +206,9 @@ else
 
         pvcreate --dataalignment 4m -f -y "$NVME_DEV"
         vgcreate -s 4m "$VG_NAME" "$NVME_DEV"
-        lvcreate -l "$LV_PCT" -n "$LV_NAME" -y "$VG_NAME"
+        lvcreate -l "$EFFECTIVE_PG_PCT" -n "$LV_NAME" -y "$VG_NAME"
         TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
-        log_ok "Created LVM Logical Volume ${TARGET_BLOCK_DEV} (15% VG reserved for CoW snapshots)"
+        log_ok "Created LVM Logical Volume ${TARGET_BLOCK_DEV} (${EFFECTIVE_PG_PCT})"
     else
         log_info "Creating GPT partition layout on ${NVME_DEV}..."
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
@@ -177,7 +220,7 @@ else
         TARGET_BLOCK_DEV="${NVME_DEV}p1"
     fi
 
-    rvdk_prog 78 "NVMe 4Kn: mkfs.${NVME_FSTYPE} (${FS_LABEL})..."
+    rvdk_prog 70 "NVMe 4Kn: mkfs.${NVME_FSTYPE} (${FS_LABEL})..."
     SECTOR_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
     if [[ "$NVME_FSTYPE" == "xfs" ]]; then
         mkfs.xfs -f -s "size=${SECTOR_SZ}" -b size=4096 -L "$FS_LABEL" "$TARGET_BLOCK_DEV"
@@ -188,8 +231,8 @@ else
     log_ok "Formatted ${TARGET_BLOCK_DEV} as ${NVME_FSTYPE^^} (label: ${FS_LABEL}, sector: ${SECTOR_SZ}B)"
 fi
 
-# 4. Persist in /etc/fstab (No inline discard; nofail protection) & Mount
-rvdk_prog 90 "NVMe 4Kn: persisting /etc/fstab & mounting ${MOUNT_POINT}..."
+# 4. Persist Primary Volume in /etc/fstab & Mount
+rvdk_prog 80 "NVMe 4Kn: persisting /etc/fstab & mounting ${MOUNT_POINT}..."
 mkdir -p "$MOUNT_POINT"
 if [[ "$NVME_FSTYPE" == "xfs" ]]; then
     FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
@@ -212,6 +255,104 @@ if ! mountpoint -q "$MOUNT_POINT"; then
     log_ok "Mounted ${MOUNT_POINT} (${NVME_FSTYPE})"
 else
     log_skip "${MOUNT_POINT} is already mounted"
+fi
+
+# 5. Optional Dual-LVM Dedicated NFS Vault (${VG_NAME}/${NFS_LV_NAME} -> Btrfs zstd:3)
+if [[ "$WITH_NFS_LV" == "true" && "$USE_LVM" == "true" ]]; then
+    rvdk_prog 90 "NVMe 4Kn: converging Dual-LVM NFS vault (${VG_NAME}/${NFS_LV_NAME} -> ${NFS_FSTYPE^^})..."
+    EXISTING_NFS_DEV="$(blkid -L "$NFS_FS_LABEL" || true)"
+    EXISTING_NFS_TYPE=""
+    [[ -n "$EXISTING_NFS_DEV" ]] && EXISTING_NFS_TYPE="$(blkid -s TYPE -o value "$EXISTING_NFS_DEV" 2>/dev/null || true)"
+
+    NFS_BLOCK_DEV=""
+    if [[ -n "$EXISTING_NFS_DEV" && "$EXISTING_NFS_TYPE" == "$NFS_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
+        NFS_BLOCK_DEV="$EXISTING_NFS_DEV"
+        log_skip "Dual-LVM ${NFS_FSTYPE^^} vault '${NFS_FS_LABEL}' already converged at ${NFS_BLOCK_DEV}"
+    elif [[ -b "/dev/${VG_NAME}/${NFS_LV_NAME}" ]]; then
+        umount -f "$NFS_MOUNT_POINT" 2>/dev/null || true
+        NFS_BLOCK_DEV="/dev/${VG_NAME}/${NFS_LV_NAME}"
+        wipefs -af "$NFS_BLOCK_DEV" >/dev/null 2>&1 || true
+        if [[ "$NFS_FSTYPE" == "btrfs" ]]; then
+            mkfs.btrfs -f -L "$NFS_FS_LABEL" "$NFS_BLOCK_DEV"
+            btrfs device scan >/dev/null 2>&1 || true
+        elif [[ "$NFS_FSTYPE" == "xfs" ]]; then
+            SECTOR_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
+            mkfs.xfs -f -s "size=${SECTOR_SZ}" -b size=4096 -L "$NFS_FS_LABEL" "$NFS_BLOCK_DEV"
+        else
+            mkfs.ext4 -F -b 4096 -L "$NFS_FS_LABEL" "$NFS_BLOCK_DEV"
+        fi
+        udevadm settle
+        log_ok "Formatted existing LV ${NFS_BLOCK_DEV} as ${NFS_FSTYPE^^} (${NFS_FS_LABEL})"
+    elif vgs "$VG_NAME" >/dev/null 2>&1; then
+        VG_TOTAL_EXT="$(vgs --noheadings --nosuffix -o vg_extent_count "$VG_NAME" 2>/dev/null | tr -dc '0-9' || echo 0)"
+        VG_FREE_EXT="$(vgs --noheadings --nosuffix -o vg_free_count "$VG_NAME" 2>/dev/null | tr -dc '0-9' || echo 0)"
+        WANT_PCT_NUM="${DUAL_NFS_PCT%%%*}"
+        [[ "$WANT_PCT_NUM" =~ ^[0-9]+$ ]] || WANT_PCT_NUM=30
+        WANT_EXT=$(( (VG_TOTAL_EXT * WANT_PCT_NUM) / 100 ))
+
+        if (( VG_FREE_EXT >= WANT_EXT && WANT_EXT > 0 )); then
+            lvcreate -l "$DUAL_NFS_PCT" -n "$NFS_LV_NAME" -y "$VG_NAME"
+            NFS_BLOCK_DEV="/dev/${VG_NAME}/${NFS_LV_NAME}"
+            log_ok "Created Dual-LVM NFS Logical Volume ${NFS_BLOCK_DEV} (${DUAL_NFS_PCT}; elastic reserve retained in ${VG_NAME})"
+        elif (( VG_FREE_EXT >= 64 )); then
+            # Live persona flip from an earlier 85%VG single-LV build: carve 80% of remaining free VG
+            # without touching lv_pgdata, still keeping 20% of free space for CoW snapshots.
+            lvcreate -l "80%FREE" -n "$NFS_LV_NAME" -y "$VG_NAME"
+            NFS_BLOCK_DEV="/dev/${VG_NAME}/${NFS_LV_NAME}"
+            log_ok "Carved live Dual-LVM NFS volume ${NFS_BLOCK_DEV} from free ${VG_NAME} extents (80%FREE; zero PG downtime)"
+        else
+            log_warn "Volume Group ${VG_NAME} has insufficient free extents (${VG_FREE_EXT}) for ${NFS_LV_NAME}; NFS will fall back to ${MOUNT_POINT}/nfs_vault unless --force-wipe is used."
+        fi
+
+        if [[ -n "$NFS_BLOCK_DEV" ]]; then
+            if [[ "$NFS_FSTYPE" == "btrfs" ]]; then
+                mkfs.btrfs -f -L "$NFS_FS_LABEL" "$NFS_BLOCK_DEV"
+                btrfs device scan >/dev/null 2>&1 || true
+            elif [[ "$NFS_FSTYPE" == "xfs" ]]; then
+                SECTOR_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
+                mkfs.xfs -f -s "size=${SECTOR_SZ}" -b size=4096 -L "$NFS_FS_LABEL" "$NFS_BLOCK_DEV"
+            else
+                mkfs.ext4 -F -b 4096 -L "$NFS_FS_LABEL" "$NFS_BLOCK_DEV"
+            fi
+            udevadm settle
+            log_ok "Formatted ${NFS_BLOCK_DEV} as ${NFS_FSTYPE^^} (label: ${NFS_FS_LABEL})"
+        fi
+    fi
+
+    if [[ -n "$NFS_BLOCK_DEV" ]]; then
+        mkdir -p "$NFS_MOUNT_POINT"
+        if [[ "$NFS_FSTYPE" == "btrfs" ]]; then
+            FSTAB_NFS="LABEL=${NFS_FS_LABEL}  ${NFS_MOUNT_POINT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=15s  0  2"
+        elif [[ "$NFS_FSTYPE" == "xfs" ]]; then
+            FSTAB_NFS="LABEL=${NFS_FS_LABEL}  ${NFS_MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
+        else
+            FSTAB_NFS="LABEL=${NFS_FS_LABEL}  ${NFS_MOUNT_POINT}  ext4  rw,noatime,nodiratime,data=ordered,nofail,x-systemd.device-timeout=15s  0  2"
+        fi
+
+        if ! grep -qE "^LABEL=${NFS_FS_LABEL}[[:space:]]+${NFS_MOUNT_POINT}[[:space:]]+${NFS_FSTYPE}[[:space:]]" /etc/fstab; then
+            sed -i "\|LABEL=${NFS_FS_LABEL}|d" /etc/fstab 2>/dev/null || true
+            sed -i "\|[[:space:]]${NFS_MOUNT_POINT}[[:space:]]|d" /etc/fstab 2>/dev/null || true
+            echo "$FSTAB_NFS" >> /etc/fstab
+            systemctl daemon-reload
+            log_ok "Persisted ${NFS_FS_LABEL} -> ${NFS_MOUNT_POINT} (${NFS_FSTYPE}) in /etc/fstab"
+        else
+            log_skip "${NFS_MOUNT_POINT} (${NFS_FSTYPE}) already in /etc/fstab"
+        fi
+
+        if ! mountpoint -q "$NFS_MOUNT_POINT"; then
+            mount "$NFS_MOUNT_POINT"
+            chown "${REAL_USER}:${REAL_GRP}" "$NFS_MOUNT_POINT"
+            chmod 0775 "$NFS_MOUNT_POINT"
+            log_ok "Mounted Dual-LVM NFS vault at ${NFS_MOUNT_POINT} (${NFS_FSTYPE})"
+        else
+            log_skip "${NFS_MOUNT_POINT} is already mounted"
+        fi
+    fi
+fi
+
+if vgs "$VG_NAME" >/dev/null 2>&1; then
+    VG_SUMMARY="$(vgs --noheadings -o vg_free,vg_size "$VG_NAME" 2>/dev/null | awk '{print $1 " free of " $2}' || true)"
+    [[ -n "$VG_SUMMARY" ]] && log_info "LVM Elastic Pool (${VG_NAME}): ${VG_SUMMARY}"
 fi
 
 rvdk_prog 100 "NVMe 4Kn storage converged (${MOUNT_POINT})"

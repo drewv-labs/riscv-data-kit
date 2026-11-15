@@ -356,8 +356,8 @@ else
     TARGET_PGDATA="/var/lib/postgresql/${PG_VERSION}/main"
 fi
 
-# 4. Write Drop-In Tuning Config & Restart
-rvdk_prog 90 "PG 18.6: applying io_uring tuning & restarting cluster..."
+# 4. Write Drop-In Tuning Config, VIP CPU/IO QoS Policy & Restart
+rvdk_prog 90 "PG 18.6: applying io_uring tuning, cgroup v2 VIP QoS & restarting cluster..."
 CONF_DIR="/etc/postgresql/${PG_VERSION}/main/conf.d"
 install -d -o postgres -g postgres "$CONF_DIR"
 cat <<EOF > "${CONF_DIR}/99-rvdk-${TARGET_SLUG}.conf"
@@ -386,6 +386,29 @@ chown postgres:postgres "${CONF_DIR}/99-rvdk-${TARGET_SLUG}.conf"
 HBA_FILE="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
 if [[ -f "$HBA_FILE" ]] && ! grep -q "$LAB_SUBNET" "$HBA_FILE"; then
     echo "host    all             all             ${LAB_SUBNET}            scram-sha-256" >> "$HBA_FILE"
+fi
+
+# Target postgresql@.service (e.g. postgresql@18-main.service), NOT the meta
+# /bin/true postgresql.service wrapper, so postmaster + backends + WAL writer
+# receive VIP CPU & block I/O priority over bulk NFS/background transfers.
+PG_QOS_DIR="/etc/systemd/system/postgresql@.service.d"
+PG_QOS_FILE="${PG_QOS_DIR}/90-rvdk-qos.conf"
+WANT_PG_QOS="# Managed by RVDK (postgresql/18-6-io_uring/forge.sh)
+# VIP CPU & block I/O priority for PostgreSQL 18 clusters (io_uring + WAL fsync)
+# so bulk NFS dataset reads (CPUWeight=30, IOWeight=25) always yield to commits.
+[Service]
+CPUWeight=200
+IOWeight=500
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0"
+
+install -d -m 0755 "$PG_QOS_DIR"
+if ! printf "%s\n" "$WANT_PG_QOS" | cmp -s - "$PG_QOS_FILE" 2>/dev/null; then
+    printf "%s\n" "$WANT_PG_QOS" > "$PG_QOS_FILE"
+    chmod 0644 "$PG_QOS_FILE"
+    systemctl daemon-reload
+    log_ok "Applied VIP cgroup v2 CPU/IO QoS policy (${PG_QOS_FILE}: CPUWeight=200, IOWeight=500, Nice=-5)"
 fi
 
 systemctl enable --now postgresql

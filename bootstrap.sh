@@ -4,11 +4,12 @@
 # Path: riscv-data-kit/bootstrap.sh
 #
 # Usage (One-Shot Curl Day-0 OS + BSP Bootstrapper + CLI Install):
-#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname rv-node --nopasswd [--deeptune] [--tune data|ml|ai] [--with-tailscale]
+#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname rv-node --nopasswd [--deeptune] [--tune data|ai] [--with-tailscale]
 #
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
-#   sudo rvdk [day0|bsp|os|deeptune|postgresql|mods/*|utils/purge-user.sh|update] [--deeptune] [--tune data|ml|ai] [--no-apt-update] [--with-tailscale] [--noprogbar]
+#   sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update] [--deeptune] [--tune data|ai] [--no-apt-update] [--with-tailscale] [--noprogbar]
 #   rvdk kit [status|--refresh|--env]
+#   sudo rvdk storage [status|grow-psql|grow-nfs|shrink-nfs|autotune] [--gb <N>|--mb <N>]
 #   sudo rvdk quirk <name|list> [off|on|toggle|status]
 #   rvdk flash <board> <medium> <disk_or_flags...>
 # ==============================================================================
@@ -106,8 +107,9 @@ log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 print_cli_help() {
     cat <<'EOF'
 Usage:
-  sudo rvdk [day0|bsp|os|deeptune|postgresql|mods/*|utils/purge-user.sh|update] [flags]
+  sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update] [flags]
   rvdk kit [status|--refresh|--env]
+  sudo rvdk storage [status|grow-psql|grow-nfs|shrink-nfs|autotune] [--gb <N>|--mb <N>]
   sudo rvdk quirk <name|list> [toggle|off|on|status] [--ephemeral|--persist]
   rvdk flash <board> <medium> <disk_or_flags...>
   rvdk flash list
@@ -117,8 +119,9 @@ Core Commands:
   bsp                      Run Silicon BSP hardening (`bsp/<vendor>/<soc>/`)
   os                       Run OS normalization & OpenSSH CVE guard (`os/`)
   deeptune [--tune <t>]    Run multi-layer headless DeepTune (`os` -> `bsp` -> `boards`)
-                           Tunes: `data` (default) | `ml` | `ai`, or `rvdk deeptune status`
+                           Tunes: `data` (default) | `ai`, or `rvdk deeptune status`
   kit [status|--refresh]   Inspect or refresh cached hardware/OS Kit (`/etc/rvdk/kit.env`)
+  storage <subcmd> [...]   Live LVM capacity manager (`status`, `grow-psql`, `grow-nfs`, `shrink-nfs`, `autotune`)
   quirk <name|list> [...]  Toggle board-specific hardware quirks (`boards/<board>/quirks/`)
   flash <board> <medium>   Flash removable media on macOS/Linux (e.g. `rvdk flash p550 usb 4`)
   postgresql               Install or build PostgreSQL 18.6 (`--force-build` to compile)
@@ -128,7 +131,7 @@ Core Commands:
 
 Global Add-On Flags:
   --deeptune               Append multi-layer DeepTune to any Day-0 / BSP / Mod run
-  -t, --tune <data|ml|ai>  Target workload tune (also implies --deeptune on non-deeptune commands)
+  -t, --tune <data|ai>     Target workload tune (also implies --deeptune on non-deeptune commands)
   --with-tailscale         Append Tailscale Mesh VPN module
   --no-apt-update          Skip apt-get update calls
   --noprogbar              Disable persistent bottom progress bar
@@ -191,7 +194,7 @@ else
 fi
 
 # ==============================================================================
-# 2. Early Subcommands (`flash`, `kit`, `quirk`, `utils/*`)
+# 2. Early Subcommands (`flash`, `kit`, `storage`, `quirk`, `utils/*`)
 # ==============================================================================
 
 # 2.1 `rvdk flash <board> <medium> [disk_or_flags...]` (Host macOS/Linux Media Flashers)
@@ -295,7 +298,15 @@ EOF
     exit 0
 fi
 
-# 2.3 `rvdk quirk <name|list> [args...]`
+# 2.3 `rvdk storage [status|grow-psql|grow-nfs|shrink-nfs|autotune]`
+if [[ "${1:-}" == "storage" ]]; then
+    shift
+    STORAGE_SCRIPT="${LOCAL_ROOT}/utils/storage.sh"
+    [[ ! -f "$STORAGE_SCRIPT" ]] && log_fatal "Storage utility script not found: ${STORAGE_SCRIPT}"
+    exec bash "$STORAGE_SCRIPT" "$@"
+fi
+
+# 2.4 `rvdk quirk <name|list> [args...]`
 if [[ "${1:-}" == "quirk" || "${1:-}" == "quirks" ]]; then
     shift
     QUIRK_BOARD_OVERRIDE=""
@@ -438,7 +449,7 @@ while [[ $# -gt 0 ]]; do
             DEEPTUNE_TUNE="${1#*=}"
             [[ "$MODULE" != "deeptune" ]] && WITH_DEEPTUNE="true"
             shift ;;
-        data|ml|ai)
+        data|ai)
             if [[ "$MODULE" == "deeptune" ]]; then
                 DEEPTUNE_TUNE="$1"
             else
@@ -585,9 +596,8 @@ run_kit_deeptune() {
     local tune_mode tune_label
     case "$raw_tune" in
         data)               tune_mode="data"; tune_label="data" ;;
-        ml)                 tune_mode="ml";   tune_label="ml" ;;
-        ai|edge-ai|edge-ml) tune_mode="ml";   tune_label="ai" ;;
-        *) log_fatal "Invalid --tune '${raw_tune}' (expected: data | ml | ai)" ;;
+        ai|ml|edge-ai|edge-ml) tune_mode="ai"; tune_label="ai" ;;
+        *) log_fatal "Invalid --tune '${raw_tune}' (expected: data | ai)" ;;
     esac
 
     local dt_scripts=()

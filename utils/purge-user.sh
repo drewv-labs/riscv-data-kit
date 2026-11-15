@@ -14,7 +14,7 @@
 # Usage:
 #   sudo rvdk utils/purge-user.sh <target_user> [--to-user <admin_user>] [--overwrite-env]
 #       [--extra-dotdir <rel_dir>] [--relink-bin <symlink_path>:<dest_rel_target>]
-#       [--mount-point <path>]
+#       [--mount-point <path>] [--nfs-mount <path>]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -53,6 +53,7 @@ main() {
     local dest_user=""
     local overwrite_env="false"
     local cli_mount_pt=""
+    local cli_nfs_mount_pt=""
     local extra_dotdirs=()
     local relink_bins=()
 
@@ -82,6 +83,10 @@ main() {
                 cli_mount_pt="${2:-}"
                 shift 2
                 ;;
+            --nfs-mount)
+                cli_nfs_mount_pt="${2:-}"
+                shift 2
+                ;;
             -h|--help)
                 cat <<EOF
 Usage: sudo rvdk utils/purge-user.sh <target_user> [options]
@@ -91,7 +96,8 @@ Options:
   --overwrite-env                     Overwrite existing *.env files in destination dotdirs
   --extra-dotdir <rel_dir>            Additional home dot-directory to migrate (repeatable)
   --relink-bin <bin_path>:<rel_path>  Re-point symlink if targeting purged user's home (repeatable)
-  --mount-point <path>                Data mount root for nfs_vault ownership transfer
+  --mount-point <path>                Data mount root for fallback nfs_vault ownership transfer
+  --nfs-mount <path>                  Dedicated Dual-LVM NFS vault mount for ownership transfer
 
 Migrates /home/<target_user>/.rvdk (and any --extra-dotdir directories) into the
 destination user's home directory, then deletes <target_user>.
@@ -267,21 +273,30 @@ EOF
         fi
     done
 
-    # Re-own fallback NFS vault directory if it was originally created under target_uid
+    # Re-own dedicated Dual-LVM NFS vault and/or fallback NFS vault directory if created under target_uid
+    local env_cand="${RVDK_ENV_FILE:-${dest_home}/.rvdk/config.env}"
     local mount_pt="${cli_mount_pt:-}"
-    if [[ -z "$mount_pt" ]]; then
-        local env_cand="${RVDK_ENV_FILE:-${dest_home}/.rvdk/config.env}"
-        if [[ -f "$env_cand" ]]; then
+    local nfs_mount_pt="${cli_nfs_mount_pt:-}"
+    if [[ -f "$env_cand" ]]; then
+        if [[ -z "$mount_pt" ]]; then
             mount_pt="$(awk -F= '/^MOUNT_POINT=/ {gsub(/"|\047/, "", $2); print $2}' "$env_cand" 2>/dev/null || true)"
+        fi
+        if [[ -z "$nfs_mount_pt" ]]; then
+            nfs_mount_pt="$(awk -F= '/^NFS_MOUNT_POINT=/ {gsub(/"|\047/, "", $2); print $2}' "$env_cand" 2>/dev/null || true)"
         fi
     fi
     mount_pt="${mount_pt:-/mnt/nvme_pgdata}"
+    nfs_mount_pt="${nfs_mount_pt:-/mnt/nfs_vault}"
 
-    if [[ -n "$target_uid" && -d "${mount_pt}/nfs_vault" ]]; then
-        if [[ "$(stat -c '%u' "${mount_pt}/nfs_vault" 2>/dev/null || echo "")" == "$target_uid" ]]; then
-            chown -R "${dest_user}:${dest_grp}" "${mount_pt}/nfs_vault"
-            log_ok "Transferred ownership of ${mount_pt}/nfs_vault -> ${dest_user}:${dest_grp}"
-        fi
+    if [[ -n "$target_uid" ]]; then
+        local vdir
+        for vdir in "$nfs_mount_pt" "${mount_pt}/nfs_vault"; do
+            [[ -n "$vdir" && -d "$vdir" ]] || continue
+            if [[ "$(stat -c '%u' "$vdir" 2>/dev/null || echo "")" == "$target_uid" ]]; then
+                chown -R "${dest_user}:${dest_grp}" "$vdir"
+                log_ok "Transferred ownership of ${vdir} -> ${dest_user}:${dest_grp}"
+            fi
+        done
     fi
 
     # 3. Terminate lingering processes, remove sudoers rules, and delete target_user

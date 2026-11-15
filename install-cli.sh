@@ -173,13 +173,14 @@ if [[ "$QUIET_MODE" == "false" ]]; then
  Usage:
    sudo rvdk                      # Run full Day-0 (OS + Silicon BSP) bootstrap
    rvdk kit                       # Inspect resolved Board/SoC/OS Kit cache
-   sudo rvdk deeptune             # Multi-layer DeepTune (--tune data|ml|ai)
+   sudo rvdk deeptune             # Multi-layer DeepTune (--tune data|ai)
+   sudo rvdk storage [status|...] # Live LVM elastic manager (grow-psql, grow-nfs, shrink-nfs, autotune)
    sudo rvdk quirk <name|list>    # Toggle board quirks (e.g. hdmi, fusb)
    rvdk flash <board> <medium>    # Flash board media (e.g. rvdk flash p550 usb 4)
    sudo rvdk bsp                  # Run Silicon BSP hardening only
    sudo rvdk os                   # Run OS normalization & CVE guard only
    sudo rvdk postgresql           # Install PostgreSQL 18.6 (cache or --force-build)
-   sudo rvdk mods/nvme-4kn        # Format 4Kn NVMe + LVM vg_rvdk + XFS/ext4
+   sudo rvdk mods/nvme-4kn        # Format 4Kn NVMe + LVM vg_rvdk + XFS/Btrfs
    sudo rvdk mods/btrfs-raid
    sudo rvdk mods/mosquitto
    sudo rvdk mods/nfs-vault

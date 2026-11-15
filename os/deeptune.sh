@@ -18,7 +18,7 @@
 #     • Unloads & blacklists universal non-server kernel modules (`cfg80211`,
 #       `joydev`, `input_leds`, `apple_mfi_fastcharge`, `dm_multipath`, `nvme_fabrics`)
 #     • Applies reversible Transparent HugePages policy (`--tune data` -> `never`,
-#       `--tune ml|ai` -> `madvise`), bounded `journald` cap (`256M`), and
+#       `--tune ai` -> `madvise`), bounded `journald` cap (`256M`), and
 #       headless scheduler/VM sysctls (`kernel.sched_autogroup_enabled = 0`)
 # ==============================================================================
 set -Eeuo pipefail
@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--tune) TUNE_REQUEST="${2:-data}"; shift 2 ;;
         --tune=*)  TUNE_REQUEST="${1#*=}"; shift ;;
-        data|ml|ai) TUNE_REQUEST="$1"; shift ;;
+        data|ai|ml) TUNE_REQUEST="$1"; shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
         *) shift ;;
@@ -54,9 +54,8 @@ done
 
 TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "$TUNE_REQUEST")"
 case "$TUNE_REQUEST" in
-    ml)              TUNE_MODE="ml"; TUNE_LABEL="ml" ;;
-    ai|edge-ai|edge-ml) TUNE_MODE="ml"; TUNE_LABEL="ai" ;;
-    *)               TUNE_MODE="data"; TUNE_LABEL="data" ;;
+    ai|ml|edge-ai|edge-ml) TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
+    *)                     TUNE_MODE="data"; TUNE_LABEL="data" ;;
 esac
 
 _SCRIPT_DIR=""

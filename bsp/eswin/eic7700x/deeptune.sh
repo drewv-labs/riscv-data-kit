@@ -10,9 +10,9 @@
 #     • `data` tune (default):
 #       Unloads & blacklists the PowerVR BXM-4-64 GPU/compute driver (`pvrsrvkm`,
 #       ~2.7 MB) alongside unused EIC7700X I2S/ES8328/HDMI ALSA codec modules.
-#     • `ml` | `ai` tune:
+#     • `ai` tune:
 #       Suppresses unused ALSA audio codec modules while removing `pvrsrvkm` from
-#       the blacklist and reloading it live for OpenCL / edge ML compute.
+#       the blacklist and reloading it live for OpenCL / edge AI compute.
 #     • SiFive P550 4-Hart PLIC Interrupt Affinity (`eic7700x-irq-affinity.service`):
 #       Spreads high-rate xHCI USB 3.2 and primary GbE interrupts off CPU0 across
 #       harts 1..3 (`xhci-hcd:usb3` -> CPU1, primary NIC -> CPU2, `xhci-hcd:usb1` -> CPU3).
@@ -44,7 +44,7 @@ ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--tune)
-            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ml | ai"
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai"
             TUNE_REQUEST="$2"
             shift 2
             ;;
@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
             TUNE_REQUEST="${1#*=}"
             shift
             ;;
-        data|ml|ai)
+        data|ai|ml)
             TUNE_REQUEST="$1"
             shift
             ;;
@@ -74,7 +74,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             cat <<EOF
-Usage: sudo rvdk deeptune [--tune <data|ml|ai>] [status] [--force] [--noprogbar]
+Usage: sudo rvdk deeptune [--tune <data|ai>] [status] [--force] [--noprogbar]
 Layer 2 SoC script: bsp/eswin/eic7700x/deeptune.sh
 EOF
             exit 0
@@ -137,7 +137,7 @@ print_status() {
     systemctl is-enabled --quiet eic7700x-irq-affinity.service 2>/dev/null && irq_svc="enabled"
 
     log_info "Layer 2 SoC (eswin/eic7700x):"
-    printf "  • PowerVR GPU/ML    : %s\n" "$gpu_mod"
+    printf "  • PowerVR GPU/AI    : %s\n" "$gpu_mod"
     printf "  • PLIC IRQ Balancer : %s (%s)\n" "$irq_svc" "$IRQ_UNIT"
 }
 
@@ -152,10 +152,9 @@ fi
 TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "${TUNE_REQUEST:-data}")"
 
 case "$TUNE_REQUEST" in
-    ml)                 TUNE_MODE="ml";   TUNE_LABEL="ml" ;;
-    ai|edge-ai|edge-ml) TUNE_MODE="ml";   TUNE_LABEL="ai" ;;
-    data)               TUNE_MODE="data"; TUNE_LABEL="data" ;;
-    *)                  log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ml | ai)" ;;
+    ai|ml|edge-ai|edge-ml) TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
+    data)                  TUNE_MODE="data"; TUNE_LABEL="data" ;;
+    *)                     log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai)" ;;
 esac
 
 PRIMARY_NIC="${RVDK_PRIMARY_NIC:-end0}"
@@ -217,7 +216,7 @@ for m in "${TARGET_MODS[@]}"; do
 done
 [[ ${#UNLOADED_MODS[@]} -gt 0 ]] && log_ok "Unloaded live EIC7700X kernel modules: ${UNLOADED_MODS[*]}"
 
-if [[ "$TUNE_MODE" == "ml" ]]; then
+if [[ "$TUNE_MODE" == "ai" ]]; then
     if ! awk '$1 == "pvrsrvkm" { found=1 } END { exit !found }' /proc/modules 2>/dev/null; then
         if modinfo pvrsrvkm >/dev/null 2>&1 && modprobe pvrsrvkm 2>/dev/null; then
             log_ok "Reloaded PowerVR compute/GPU module (pvrsrvkm) live for '${TUNE_LABEL}' tune"
