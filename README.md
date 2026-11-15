@@ -123,6 +123,8 @@ rvdk deeptune --tune data                           # Multi-layer kernel tuning 
 rvdk quirk list                                     # List & toggle board hardware quirks (e.g. hdmi, fusb)
 ```
 
+---
+
 ### 2. A-La-Carte Storage, Database & Network Modules
 
 Every Layer 3 module runs standalone—accepting explicit CLI flags or optional defaults from `~/.rvdk/config.env` (`RVDK_ENV_FILE`):
@@ -149,6 +151,8 @@ You can also invoke any module directly inside an external CI/CD script without 
 ```bash
 curl -fsSL https://rvdk.drewv-labs.dev/postgresql/latest/forge.sh | sudo bash
 ```
+
+---
 
 ### 3. Host Recovery Media Flashers (macOS Zsh & Linux Bash supported)
 
