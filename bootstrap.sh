@@ -7,11 +7,12 @@
 #   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-node --nopasswd [--deeptune] [--tune data|ai] [--with-tailscale]
 #
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
-#   sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update] [--deeptune] [--tune data|ai] [--no-apt-update] [--with-tailscale] [--noprogbar]
+#   sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update|uninstall] [--deeptune] [--tune data|ai] [--no-apt-update] [--with-tailscale] [--noprogbar]
 #   rvdk kit [status|--refresh|--env]
 #   sudo rvdk storage [status|grow|shrink|autotune] [--lv <name>] [--gb <N>|--mb <N>]
 #   sudo rvdk quirk <name|list> [off|on|toggle|status]
 #   rvdk flash <board> <medium> <disk_or_flags...>
+#   sudo rvdk uninstall [--purge] [--dry-run] [-y]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -32,7 +33,7 @@ fi
 
 # Determine whether root privileges are required before escalating.
 # Host flashers (`rvdk flash ...`), Kit inspection (`rvdk kit`), help, and
-# read-only status/list subcommands run unprivileged first.
+# read-only status/list/dry-run subcommands run unprivileged first.
 NEED_ROOT="true"
 if [[ $# -gt 0 ]]; then
     for _arg in "$@"; do
@@ -67,6 +68,13 @@ if [[ $# -gt 0 ]]; then
                 for _arg in "$@"; do
                     case "$_arg" in
                         status|--status) NEED_ROOT="false" ;;
+                    esac
+                done
+                ;;
+            uninstall|remove|purge|utils/uninstall|utils/uninstall.sh|util/uninstall|util/uninstall.sh)
+                for _arg in "$@"; do
+                    case "$_arg" in
+                        -n|--dry-run) NEED_ROOT="false" ;;
                     esac
                 done
                 ;;
@@ -152,12 +160,13 @@ link_rvdk_cli() {
 print_cli_help() {
     cat <<'EOF'
 Usage:
-  sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update] [flags]
+  sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update|uninstall] [flags]
   rvdk kit [status|--refresh|--env]
   sudo rvdk storage [status|grow|shrink|autotune] [--lv <name>] [--gb <N>|--mb <N>]
   sudo rvdk quirk <name|list> [toggle|off|on|status] [--ephemeral|--persist]
   rvdk flash <board> <medium> <disk_or_flags...>
   rvdk flash list
+  sudo rvdk uninstall [--purge] [--dry-run] [-y]
 
 Core Commands:
   day0                     Run full Day-0 (OS normalization + Silicon BSP) forge (default)
@@ -173,6 +182,7 @@ Core Commands:
   mods/<mod>               Converge storage/network mod (`nvme-4kn`, `btrfs-raid`, `mosquitto`, `nfs-vault`, `tailscale`)
   utils/purge-user.sh      Migrate state & purge factory default user account
   update                   Pull latest RVDK engine from GitHub
+  uninstall [--purge]      Remove RVDK CLI, engine & caches (`--purge` wipes /etc/rvdk & tuning drop-ins)
 
 Global Add-On Flags:
   --deeptune               Append multi-layer DeepTune to any Day-0 / BSP / Mod run
@@ -205,6 +215,23 @@ if [[ "${1:-}" == "update" || "${1:-}" == "self-update" ]]; then
         exit 0
     fi
 fi
+
+case "${1:-}" in
+    uninstall|remove|purge|utils/uninstall|utils/uninstall.sh|util/uninstall|util/uninstall.sh)
+        _UNINSTALL_SUB="$1"
+        shift
+        _UNINSTALL_ARGS=()
+        [[ "$_UNINSTALL_SUB" == "purge" ]] && _UNINSTALL_ARGS+=("--purge")
+        if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/utils/uninstall.sh" ]]; then
+            exec bash "${CANDIDATE_ROOT}/utils/uninstall.sh" ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
+        elif [[ -f "${ENGINE_DIR}/utils/uninstall.sh" ]]; then
+            exec bash "${ENGINE_DIR}/utils/uninstall.sh" ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
+        else
+            curl -fsSL "${RVDK_BASE_URL}/utils/uninstall.sh" | bash -s -- ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
+            exit 0
+        fi
+        ;;
+esac
 
 if [[ $EUID -ne 0 && -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
@@ -723,7 +750,7 @@ case "$MODULE" in
             RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             sync_apt_stamp
             log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         fi
         # Refresh /etc/rvdk/kit.env after Day-0 networkd/interface changes
         rvdk_kit_resolve --refresh

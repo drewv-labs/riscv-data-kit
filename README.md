@@ -120,6 +120,7 @@ sudo rvdk os --user rvadmin --hostname rv-vf2 --nopasswd # OS normalization only
 sudo rvdk bsp                                            # Silicon BSP & PMU unlock only
 sudo rvdk deeptune --tune data                           # Multi-layer kernel tuning (data | ai)
 rvdk quirk list                                          # List & toggle board hardware quirks (e.g. hdmi, fusb)
+sudo rvdk uninstall                                      # Remove CLI & caches (add --purge to wipe /etc/rvdk & drop-ins)
 ```
 
 ---
@@ -219,7 +220,8 @@ riscv-data-kit/
 │   └── tailscale/                        # Module: Static riscv64 Tailscale mesh VPN + optional userspace netstack
 ├── utils/
 │   ├── storage.sh                        # Live online LVM grow, Btrfs shrink & priority-weighted autotuner
-│   └── purge-user.sh                     # Safe factory user state migration, UID re-own & account purge
+│   ├── purge-user.sh                     # Safe factory user state migration, UID re-own & account purge
+│   └── uninstall.sh                      # FHS-compliant uninstaller (`remove` vs `--purge` + `--dry-run`)
 └── tools/
     └── rvdk_ci.py                        # Manifest schema validator, security scanner & static Pages bundler
 ```

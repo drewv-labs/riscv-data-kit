@@ -243,6 +243,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    sudo rvdk mods/tailscale       # Install static riscv64 Tailscale VPN [--ssh|--up]
    sudo rvdk utils/purge-user.sh  # Migrate state & purge factory default user
    sudo rvdk update               # Pull latest RVDK engine from GitHub
+   sudo rvdk uninstall            # Remove RVDK CLI & caches (--purge for full wipe)
 ======================================================================
 EOF
 fi

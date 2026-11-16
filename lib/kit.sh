@@ -84,9 +84,9 @@ _rvdk_infer_from_dt_model() {
             echo "spacemit/k3|firefly/aibox-k3|aiboxk3|" ;;
         *"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
             echo "spacemit/k3|milkv/jupiter2|jptr2|" ;;
-        *"BPI-F3"*|*"Banana Pi BPI-F3"*)
+        *"BPI-F3"*|*"Banana Pi F3"*)
             echo "spacemit/k1|bananapi/f3|bpif3|" ;;
-        *"BPI-CM6"*|*"Banana Pi BPI-CM6"*)
+        *"BPI-CM6"*|*"Banana Pi CM6"*)
             echo "spacemit/k1|bananapi/cm6|bpicm6|" ;;
         *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*)
             echo "spacemit/k1|milkv/jupiter|jptr1|" ;;

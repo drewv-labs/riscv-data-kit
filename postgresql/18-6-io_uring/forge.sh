@@ -374,7 +374,8 @@ EOF
         fi
         log_info "Selected compiler ISA flags: ${OPT_FLAGS}"
 
-        export DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)"
+        DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)"
+        export DEB_BUILD_OPTIONS
         export DEB_CFLAGS_APPEND="$OPT_FLAGS"
         export DEB_CXXFLAGS_APPEND="$OPT_FLAGS"
 
