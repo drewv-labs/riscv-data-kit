@@ -4,10 +4,11 @@
 # Path: riscv-data-kit/utils/purge-user.sh
 #
 # Description:
-#   1. Migrates /home/<target>/.rvdk/ (engine, cache, config.env) and any
+#   1. Migrates /home/<target>/.rvdk/ (cache, config.env, plus any legacy
+#      per-home engine into /usr/local/share/rvdk/engine) and any
 #      caller-specified --extra-dotdir directories into the destination admin
-#      user's home directory, updating /usr/local/bin/rvdk (and any --relink-bin
-#      symlinks) if they pointed into /home/<target>/.
+#      user's home directory, updating /usr/bin/rvdk & /usr/local/bin/rvdk
+#      (and any --relink-bin symlinks) if they pointed into /home/<target>/.
 #   2. Safely transfers ownership of files owned by <target>'s UID across
 #      mounted data volumes (/mnt/*, /srv/*, or --reown-path) without clobbering
 #      system/service subtrees (e.g. postgres, mosquitto).
@@ -53,7 +54,8 @@ Options:
   --reown-path <path>                 Additional directory tree to re-own from <target_user> (repeatable)
 
 Migrates /home/<target_user>/.rvdk (and any --extra-dotdir directories) into the
-destination user's home directory, re-owns data files belonging to <target_user>'s UID
+destination user's home directory, promotes any legacy ~/.rvdk/engine checkout to
+/usr/local/share/rvdk/engine, re-owns data files belonging to <target_user>'s UID
 on local mounted volumes (/mnt/*, /srv/*), and deletes <target_user>.
 EOF
 }
@@ -184,7 +186,9 @@ main() {
 
     log_info "Migrating state from ${src_home} -> ${dest_home} (owner: ${dest_user}:${dest_grp})..."
 
-    # 1. Migrate .rvdk (engine, cache, config.env) so /usr/local/bin/rvdk stays valid
+    # 1. Migrate .rvdk (cache, config.env) and promote any legacy ~/.rvdk/engine
+    #    to /usr/local/share/rvdk/engine so /usr/bin/rvdk & /usr/local/bin/rvdk stay valid
+    local sys_engine="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
     if [[ -d "${src_home}/.rvdk" ]]; then
         install -d -m 0755 -o "$dest_user" -g "$dest_grp" "${dest_home}/.rvdk" "${dest_home}/.rvdk/cache"
 
@@ -207,21 +211,30 @@ main() {
             chown -R "${dest_user}:${dest_grp}" "${dest_home}/.rvdk/cache"
         fi
 
-        if [[ -d "${src_home}/.rvdk/engine/.git" && ! -d "${dest_home}/.rvdk/engine/.git" ]]; then
-            cp -a "${src_home}/.rvdk/engine" "${dest_home}/.rvdk/engine"
-            chown -R "${dest_user}:${dest_grp}" "${dest_home}/.rvdk/engine"
-            log_ok "Migrated RVDK engine -> ${dest_home}/.rvdk/engine"
+        if [[ -d "${src_home}/.rvdk/engine/.git" && ! -d "${sys_engine}/.git" ]]; then
+            install -d -m 0755 -o root -g root "$(dirname "$sys_engine")"
+            chmod 0755 /usr/local /usr/local/share "$(dirname "$sys_engine")" 2>/dev/null || true
+            rm -rf "$sys_engine"
+            cp -a "${src_home}/.rvdk/engine" "$sys_engine"
+            chown -R 0:0 "$sys_engine"
+            chmod -R a+rX "$sys_engine"
+            chmod 0755 "$sys_engine"
+            log_ok "Promoted legacy RVDK engine -> ${sys_engine}"
         fi
     fi
 
-    if [[ -L /usr/local/bin/rvdk ]]; then
-        local rvdk_target
-        rvdk_target="$(readlink -f /usr/local/bin/rvdk 2>/dev/null || true)"
-        if [[ "$rvdk_target" == "${src_home}/"* && -f "${dest_home}/.rvdk/engine/bootstrap.sh" ]]; then
-            ln -sf "${dest_home}/.rvdk/engine/bootstrap.sh" /usr/local/bin/rvdk
-            log_ok "Re-linked /usr/local/bin/rvdk -> ${dest_home}/.rvdk/engine/bootstrap.sh"
+    local bin_link rvdk_target
+    for bin_link in /usr/local/bin/rvdk /usr/bin/rvdk; do
+        if [[ -L "$bin_link" ]]; then
+            rvdk_target="$(readlink -f "$bin_link" 2>/dev/null || true)"
+            if [[ "$rvdk_target" == "${src_home}/"* && -f "${sys_engine}/bootstrap.sh" ]]; then
+                ln -sf "${sys_engine}/bootstrap.sh" /usr/local/bin/rvdk
+                [[ -d /usr/bin ]] && ln -sf "${sys_engine}/bootstrap.sh" /usr/bin/rvdk 2>/dev/null || true
+                log_ok "Re-linked /usr/bin/rvdk & /usr/local/bin/rvdk -> ${sys_engine}/bootstrap.sh"
+                break
+            fi
         fi
-    fi
+    done
 
     # 2. Migrate any caller-requested --extra-dotdir directories & --relink-bin symlinks
     local ddir

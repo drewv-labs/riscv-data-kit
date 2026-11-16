@@ -26,7 +26,7 @@ The `riscv-data-kit` (**RVDK**) transforms out-of-the-box `riscv64` single-board
 
 Vendor RISC-V OS images frequently ship with desktop GUI bloat, background package timers, locked hardware performance counters, board-specific interrupt quirks, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard `apt` upgrades. 
 
-`RVDK` decouples bare-metal bring-up and service provisioning into independent, strictly idempotent layers dispatched via `/usr/local/bin/rvdk` or standalone `curl | sudo bash` endpoints:
+`RVDK` decouples bare-metal bring-up and service provisioning into independent, strictly idempotent layers dispatched via `rvdk` (`/usr/bin/rvdk` & `/usr/local/bin/rvdk`) or standalone `curl | sudo bash` endpoints:
 
 ### **Layer 1 — OS Normalization (`os/`):** 
 
@@ -104,7 +104,7 @@ Self-contained, opt-in modules for:
 
 ### 1. Day-0 Bare-Metal Bootstrap (Auto-Detects Board, SoC & OS)
 
-Boot a freshly flashed RISC-V board and run `bootstrap.sh` to install the `rvdk` CLI (`~/.rvdk/engine` -> `/usr/local/bin/rvdk`), cache `/etc/rvdk/kit.env`, and converge both Layer 1 (`os/`) and Layer 2 (`bsp/`):
+Boot a freshly flashed RISC-V board and run `bootstrap.sh` to install the `rvdk` CLI (`/usr/local/share/rvdk/engine` -> `/usr/bin/rvdk` & `/usr/local/bin/rvdk`), cache `/etc/rvdk/kit.env`, and converge both Layer 1 (`os/`) and Layer 2 (`bsp/`):
 
 ```bash
 curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-p550 --nopasswd
@@ -176,8 +176,8 @@ rvdk flash p550 usb --device /dev/sdX --image /path/to/custom.img.zst --sha256 <
 riscv-data-kit/
 ├── README.md
 ├── LICENSE
-├── bootstrap.sh                          # Universal dispatcher & `/usr/local/bin/rvdk` CLI entrypoint
-├── install-cli.sh                        # Clones ~/.rvdk/engine, caches /etc/rvdk/kit.env & links `rvdk`
+├── bootstrap.sh                          # Universal dispatcher & `rvdk` CLI entrypoint
+├── install-cli.sh                        # Stages /usr/local/share/rvdk/engine, caches /etc/rvdk/kit.env & links `rvdk`
 ├── lib/
 │   ├── common.sh                         # Safe non-executing .env parser/writer, validators & logging
 │   ├── kit.sh                            # Hardware/OS Kit inference & <1ms /etc/rvdk/kit.env cache

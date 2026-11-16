@@ -2,8 +2,11 @@
 # ==============================================================================
 # DREW-V Labs // RVDK CLI & Engine Installer
 # Path: riscv-data-kit/install-cli.sh
-# Description: Clones or updates the riscv-data-kit engine in ~/.rvdk/engine
-#              and links /usr/local/bin/rvdk without modifying OS/BSP state.
+# Description: Clones or updates the riscv-data-kit engine in
+#              /usr/local/share/rvdk/engine (root-owned, world-readable 0755)
+#              and links /usr/local/bin/rvdk (+ /usr/bin/rvdk on Linux so sudo
+#              and sudo-rs secure_path always resolve `rvdk`) without modifying
+#              OS/BSP state.
 #
 # Usage:
 #   curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash
@@ -18,7 +21,13 @@ else
     set -Eeuo pipefail
 fi
 
-SCRIPT_SELF="${BASH_SOURCE[0]:-}"
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_SELF="${BASH_SOURCE[0]}"
+elif [[ -n "${ZSH_VERSION:-}" && "${0:-}" != "zsh" && "${0:-}" != "-zsh" && -f "${0:-}" ]]; then
+    SCRIPT_SELF="$0"
+else
+    SCRIPT_SELF=""
+fi
 if [[ $EUID -ne 0 ]]; then
     if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
         exec sudo -E bash "$SCRIPT_SELF" "$@"
@@ -27,6 +36,10 @@ if [[ $EUID -ne 0 ]]; then
         exit 1
     fi
 fi
+
+# Enforce 022 umask so system directories and cloned scripts remain 0755/0644
+# even on hardened root environments with umask 077/027.
+umask 022
 
 # Sanitize SSH-forwarded LC_* environment variables before target locales exist
 if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
@@ -63,7 +76,9 @@ fi
 
 RVDK_DIR="${REAL_HOME}/.rvdk"
 CACHE_DIR="${RVDK_DIR}/cache"
-ENGINE_DIR="${RVDK_DIR}/engine"
+LEGACY_HOME_ENGINE="${RVDK_DIR}/engine"
+ENGINE_DIR="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
+ENGINE_PARENT="$(dirname "$ENGINE_DIR")"
 REPO_URL="${RVDK_REPO_URL:-https://github.com/drewv-labs/riscv-data-kit.git}"
 REPO_BRANCH="${RVDK_BRANCH:-main}"
 QUIET_MODE="false"
@@ -81,14 +96,6 @@ log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 if [[ ! "$REPO_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
     log_fatal "Invalid RVDK_BRANCH name: '${REPO_BRANCH}'."
 fi
-
-run_as_real_user() {
-    if [[ "$REAL_USER" == "root" ]] || ! command -v sudo >/dev/null 2>&1; then
-        "$@"
-    else
-        sudo -u "$REAL_USER" "$@"
-    fi
-}
 
 # 1. Ensure bash, git (+ HTTPS transport), and curl are installed across Debian/Ubuntu/Bianbu & OpenWrt
 NEED_GIT_HTTP="false"
@@ -114,21 +121,32 @@ if ! command -v bash >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! co
     fi
 fi
 
-# 2. Clone or update ~/.rvdk/engine (BusyBox-safe mkdir/chmod/chown without requiring coreutils-install)
-mkdir -p "$RVDK_DIR" "$CACHE_DIR"
-chmod 0755 "$RVDK_DIR" "$CACHE_DIR"
-chown "${REAL_USER}:${REAL_GRP}" "$RVDK_DIR" "$CACHE_DIR" 2>/dev/null || true
+# 2. Ensure per-user ~/.rvdk/cache exists for media/package downloads, and stage
+#    shared root-owned engine in /usr/local/share/rvdk/engine (0755 traversal so
+#    Debian 0700 /home/<user> permissions and sudo-rs never block `sudo rvdk`).
+if [[ -d "$REAL_HOME" ]]; then
+    mkdir -p "$RVDK_DIR" "$CACHE_DIR"
+    chmod 0755 "$RVDK_DIR" "$CACHE_DIR"
+    chown "${REAL_USER}:${REAL_GRP}" "$RVDK_DIR" "$CACHE_DIR" 2>/dev/null || true
+fi
+
+mkdir -p "$ENGINE_PARENT"
+chmod 0755 /usr/local /usr/local/share "$ENGINE_PARENT" 2>/dev/null || true
 
 if [[ -d "${ENGINE_DIR}/.git" ]]; then
     log_info "Updating RVDK engine in ${ENGINE_DIR} (${REPO_BRANCH})..."
-    run_as_real_user git -C "$ENGINE_DIR" fetch origin "$REPO_BRANCH" -q
-    run_as_real_user git -C "$ENGINE_DIR" reset --hard "origin/${REPO_BRANCH}" -q
+    chown -R 0:0 "$ENGINE_DIR" 2>/dev/null || true
+    git -C "$ENGINE_DIR" fetch origin "$REPO_BRANCH" -q
+    git -C "$ENGINE_DIR" reset --hard "origin/${REPO_BRANCH}" -q
 else
     log_info "Cloning ${REPO_URL} into ${ENGINE_DIR}..."
     rm -rf "$ENGINE_DIR"
-    run_as_real_user git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
+    git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
 fi
 
+chown -R 0:0 "$ENGINE_DIR" 2>/dev/null || true
+chmod -R a+rX "$ENGINE_DIR" 2>/dev/null || true
+chmod 0755 "$ENGINE_DIR"
 chmod +x \
     "${ENGINE_DIR}/bootstrap.sh" \
     "${ENGINE_DIR}/install-cli.sh" \
@@ -141,6 +159,11 @@ chmod +x \
     "${ENGINE_DIR}"/mods/*/forge.sh \
     "${ENGINE_DIR}"/utils/*.sh 2>/dev/null || true
 
+# Clean up legacy per-user ~/.rvdk/engine checkout if migrating onto system engine
+if [[ "$ENGINE_DIR" != "$LEGACY_HOME_ENGINE" && -d "$LEGACY_HOME_ENGINE" ]]; then
+    rm -rf "$LEGACY_HOME_ENGINE" 2>/dev/null || true
+fi
+
 # Persist /etc/rvdk/kit.env cache on Linux target nodes right away if recognized
 if [[ "$(uname -s)" == "Linux" && -f "${ENGINE_DIR}/lib/kit.sh" ]]; then
     # shellcheck source=lib/kit.sh
@@ -148,15 +171,19 @@ if [[ "$(uname -s)" == "Linux" && -f "${ENGINE_DIR}/lib/kit.sh" ]]; then
     rvdk_kit_resolve --refresh || true
 fi
 
-# 3. Link /usr/local/bin/rvdk (plus /usr/bin/rvdk on OpenWrt where /usr/local/bin may not be in default PATH)
+# 3. Link /usr/local/bin/rvdk AND (on Linux) /usr/bin/rvdk so classic sudo,
+#    Debian forky/sid sudo-rs, doas, OpenWrt, and root/user shells always resolve `rvdk`.
 mkdir -p /usr/local/bin
-chmod 0755 /usr/local/bin
+chmod 0755 /usr/local /usr/local/bin 2>/dev/null || true
 ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/local/bin/rvdk
-if [[ -f /etc/openwrt_release ]]; then
-    ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/bin/rvdk
+LINKED_PATHS="/usr/local/bin/rvdk"
+if [[ "$(uname -s)" == "Linux" && -d /usr/bin ]]; then
+    if ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/bin/rvdk 2>/dev/null; then
+        LINKED_PATHS="/usr/bin/rvdk & /usr/local/bin/rvdk"
+    fi
 fi
 COMMIT_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo "main")"
-log_ok "Linked /usr/local/bin/rvdk -> ${ENGINE_DIR}/bootstrap.sh (${COMMIT_SHA})"
+log_ok "Linked ${LINKED_PATHS} -> ${ENGINE_DIR}/bootstrap.sh (${COMMIT_SHA})"
 
 if [[ "$QUIET_MODE" == "false" ]]; then
     DT_MODEL="${RVDK_DT_MODEL:-Unknown}"

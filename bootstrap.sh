@@ -22,7 +22,13 @@ else
     set -Eeuo pipefail
 fi
 
-SCRIPT_SELF="${BASH_SOURCE[0]:-}"
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_SELF="${BASH_SOURCE[0]}"
+elif [[ -n "${ZSH_VERSION:-}" && "${0:-}" != "zsh" && "${0:-}" != "-zsh" && -f "${0:-}" ]]; then
+    SCRIPT_SELF="$0"
+else
+    SCRIPT_SELF=""
+fi
 
 # Determine whether root privileges are required before escalating.
 # Host flashers (`rvdk flash ...`), Kit inspection (`rvdk kit`), help, and
@@ -109,11 +115,39 @@ if [[ -z "$REAL_HOME" ]]; then
     fi
 fi
 
-ENGINE_DIR="${REAL_HOME}/.rvdk/engine"
+ENGINE_DIR="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
 RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
 
 log_rvdk()  { printf "\033[1;36m[RVDK]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+
+resolve_script_path() {
+    local src="$1" dir=""
+    if readlink -f "$src" >/dev/null 2>&1; then
+        readlink -f "$src"
+        return 0
+    elif command -v realpath >/dev/null 2>&1; then
+        realpath "$src"
+        return 0
+    fi
+    while [[ -L "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="${dir}/${src}"
+    done
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    printf '%s/%s\n' "$dir" "$(basename "$src")"
+}
+
+link_rvdk_cli() {
+    local target_script="$1"
+    mkdir -p /usr/local/bin
+    chmod 0755 /usr/local /usr/local/bin 2>/dev/null || true
+    ln -sf "$target_script" /usr/local/bin/rvdk
+    if [[ "$(uname -s)" == "Linux" && -d /usr/bin ]]; then
+        ln -sf "$target_script" /usr/bin/rvdk 2>/dev/null || true
+    fi
+}
 
 print_cli_help() {
     cat <<'EOF'
@@ -155,8 +189,8 @@ if [[ $# -gt 0 ]] && [[ "$1" == "help" || "$1" == "-h" || "$1" == "--help" ]]; t
 fi
 
 # 1. Resolve RVDK Engine Root (`LOCAL_ROOT`)
-if [[ -n "$SCRIPT_SELF" ]]; then
-    SCRIPT_REAL="$(readlink -f "$SCRIPT_SELF" 2>/dev/null || realpath "$SCRIPT_SELF" 2>/dev/null || echo "$SCRIPT_SELF")"
+if [[ -n "$SCRIPT_SELF" && -e "$SCRIPT_SELF" ]]; then
+    SCRIPT_REAL="$(resolve_script_path "$SCRIPT_SELF")"
     CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
 else
     CANDIDATE_ROOT=""
@@ -176,20 +210,28 @@ if [[ $EUID -ne 0 && -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
 elif [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]] && ! [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
-    if [[ $EUID -eq 0 && ! -L /usr/local/bin/rvdk ]]; then
-        mkdir -p /usr/local/bin && chmod 0755 /usr/local/bin
-        ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/local/bin/rvdk
-        [[ -f /etc/openwrt_release ]] && ln -sf "${LOCAL_ROOT}/bootstrap.sh" /usr/bin/rvdk
+    if [[ $EUID -eq 0 ]]; then
+        if [[ ! -L /usr/local/bin/rvdk ]]; then
+            link_rvdk_cli "${LOCAL_ROOT}/bootstrap.sh"
+        elif [[ "$LOCAL_ROOT" == "$ENGINE_DIR" && "$(uname -s)" == "Linux" && -d /usr/bin && ! -L /usr/bin/rvdk ]]; then
+            link_rvdk_cli "${LOCAL_ROOT}/bootstrap.sh"
+        fi
     fi
 else
-    if [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" && ! -d "${ENGINE_DIR}/.git" ]]; then
-        mkdir -p "${REAL_HOME}/.rvdk" "${REAL_HOME}/.rvdk/cache"
-        chmod 0755 "${REAL_HOME}/.rvdk" "${REAL_HOME}/.rvdk/cache"
-        cp -a "$CANDIDATE_ROOT" "$ENGINE_DIR"
-        chown -R "${REAL_USER}:${REAL_GRP}" "${REAL_HOME}/.rvdk" 2>/dev/null || true
-        mkdir -p /usr/local/bin && chmod 0755 /usr/local/bin
-        ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/local/bin/rvdk
-        [[ -f /etc/openwrt_release ]] && ln -sf "${ENGINE_DIR}/bootstrap.sh" /usr/bin/rvdk
+    if [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" ]]; then
+        umask 022
+        ENGINE_PARENT="$(dirname "$ENGINE_DIR")"
+        mkdir -p "$ENGINE_PARENT"
+        chmod 0755 /usr/local /usr/local/share "$ENGINE_PARENT" 2>/dev/null || true
+        if [[ ! -d "${ENGINE_DIR}/.git" ]]; then
+            rm -rf "$ENGINE_DIR"
+            cp -a "$CANDIDATE_ROOT" "$ENGINE_DIR"
+        fi
+        chown -R 0:0 "$ENGINE_DIR" 2>/dev/null || true
+        chmod -R a+rX "$ENGINE_DIR" 2>/dev/null || true
+        chmod 0755 "$ENGINE_DIR"
+        link_rvdk_cli "${ENGINE_DIR}/bootstrap.sh"
+        rm -rf "$CANDIDATE_ROOT" 2>/dev/null || true
     else
         curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
     fi
@@ -681,7 +723,7 @@ case "$MODULE" in
             RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
             sync_apt_stamp
             log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
         fi
         # Refresh /etc/rvdk/kit.env after Day-0 networkd/interface changes
         rvdk_kit_resolve --refresh
