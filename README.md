@@ -1,10 +1,9 @@
 <div align="center">
 
   <img src="./.github/images/rvdk-banner.png" alt="RVDK Banner" width="80%"/>
-
-  ---
-
-  Idempotent Day-0 Bare-Metal Bootstrap, Multi-Layer Kernel Tuning, & Prebuilt Package Catalog for  
+  <br><br>
+  
+  Idempotent Day-0 Bare-Metal Bootstrap, Multi-Layer Kernel Tuning, & Prebuilt Package Catalog for<br>
   **[RISC-V](https://riscv.org/) Data, Storage, Networking, and Edge AI Systems.**
 
 </div>
@@ -12,7 +11,6 @@
 ---
 
 The `riscv-data-kit` (**RVDK**) transforms out-of-the-box `riscv64` single-board computers and workstations into deterministic, headless Linux servers ready to get to work. 
-
 * Vendor-isolated Board Support Package (BSP) guards
 * Cached hardware/OS Kit discovery (`/etc/rvdk/kit.env`)
 * Hardware Performance Monitoring Unit (PMU) counter exposure (`kptr_restrict = 1` safe default)
@@ -31,42 +29,33 @@ Vendor RISC-V OS images frequently ship with desktop GUI bloat, background packa
 `RVDK` lives strictly in system space (`/usr/local/share/rvdk/engine`, `/etc/rvdk/`, `/var/cache/rvdk/`, `/var/lib/rvdk/`) with zero `~/.rvdk` user-home footprint, decoupling bare-metal bring-up and service provisioning into independent, strictly idempotent layers dispatched via `rvdk` (`/usr/bin/rvdk` & `/usr/local/bin/rvdk`) or standalone `curl | sudo bash` endpoints:
 
 ### **Layer 1 — OS Normalization (`os/`):** 
-
 Converges Debian, Ubuntu, Bianbu, and OpenWrt root filesystems into lean, headless server/router baselines. 
-
 * Non-interactive operator account provisioning with SSH `authorized_keys` inheritance
 * Optional `NOPASSWD` sudoers drop-in (`visudo -cf` verified)
 * UTF-8 locales & RFC-1123 hostnames (systemd & OpenWrt UCI)
 * Ubuntu/Bianbu `snapd` & GUI eradication with APT pin locks
 * Reboot- & reload-persistent raw `nftables` prerouting + MPTCP kernel network hardening
-
----
+<br>
 
 ### **Layer 2 — Silicon BSP, Quirks & Multi-Layer `DeepTune` (`bsp/` & `boards/`):** 
-
 Organizes silicon hooks by SoC die (`bsp/<vendor>/<soc>/`) and board specifics (`boards/<vendor>/<board>/`). 
-
 * Protects vendor `extlinux` and `zz-u-boot-menu` hooks (`--force-confdef` / `--force-confold`)
 * Migrates stale factory APT snapshots onto signed HTTPS mirrors
 * Masks unstable sleep targets & persists active SSH/wired NICs safely
 * Unlocks hardware PMU counters (`kernel.perf_event_paranoid = -1`, `kernel.kptr_restrict = 1`)
 * Toggles for board quirks (`hdmi`, `fusb`)
 * Chains `os -> bsp -> board` kernel/IRQ/VM tuning (`--tune data|ai`) with bounded persistent `journald`
-
----
+<br>
 
 ### **Layer 3 — Composable Data, Storage & Network Modules (`postgresql/`, `mods/`):** 
-
 Self-contained, opt-in modules for: 
-
 * `io_uring` PostgreSQL 18.6 (SHA-256 verified prebuilt `.tar.zst` bundle by default, or `--force-build` cold compilation)
 * Native `4Kn` NVMe + Single/Dual-LVM (`vg_rvdk`) with OS/swap disk wipe guards
 * Kernel Btrfs RAID 10
 * Eclipse Mosquitto MQTT (loopback-safe by default; authenticated LAN bind)
 * NFSv4 (explicit `--allow-cidr` / `--auto-subnet`, `root_squash` default, auto kernel `nfsd` -> userspace `nfs-ganesha`)
 * `riscv64` Tailscale mesh VPN
-
----
+<br>
 
 ## Supported Silicon Matrix
 
@@ -88,9 +77,7 @@ Self-contained, opt-in modules for:
 | Firefly | AIBOX-K3 | `firefly/aibox-k3` | `spacemit/k3` | 8x SpacemiT X100 (4-Wide OoO) | RVA23 + RVV 1.0 | Planned (Jupiter 2 proxy) |
 | Tenstorrent | Atlantis | `tenstorrent/atlantis` | `tenstorrent/atlantis` | 8x Tenstorrent Ascalon-X (Wide OoO) | RVA23 + RVV 1.0 | Planned |
 
----
-
-**Matrix Status Legend**
+--- 
 
 | Status | Desc |
 | :--- | :--- |
@@ -124,7 +111,6 @@ sudo rvdk deeptune --tune data                           # Multi-layer kernel tu
 rvdk quirk list                                          # List & toggle board hardware quirks (e.g. hdmi, fusb)
 sudo rvdk uninstall                                      # Remove CLI & caches (add --purge to wipe /etc/rvdk & drop-ins)
 ```
-
 ---
 
 ### 2. A-La-Carte Storage, Database & Network Modules
@@ -157,7 +143,6 @@ You can also invoke any module directly inside an external CI/CD script without 
 ```bash
 curl -fsSL https://rvdk.drewv-labs.dev/postgresql/latest/forge.sh | sudo bash
 ```
-
 ---
 
 ### 3. Host Recovery Media Flashers (macOS Zsh & Linux Bash supported)
@@ -245,18 +230,18 @@ riscv-data-kit/
 #### Industry
 - [SiFive](https://www.sifive.com/)
 - [Tenstorrent](https://tenstorrent.com/en)
----
+  <br>
 - [Milk-V](https://milkv.io/)
 - [SpacemiT](https://www.spacemit.com/)
 - [StarFive](https://www.starfivetech.com/en/)
 - [UltraRISC](https://ultrarisc.com/en/)
----
+  <br>
 - [BananaPi](https://banana-pi.org/)
 - [Firefly RISC-V](https://www.t-firefly.com/pages/riscv)
 - [OrangePi RISC-V](https://orangepi.net/shop.html?tag=risc-v)
 
 #### Software
-- [PostgreSQL 18.6 Release Notes (`io_uring`)](https://www.postgresql.org/docs/18/release-18-6.html)
+- [PostgreSQL](https://www.postgresql.org)
 - [NFS-Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)
 - [MQTT](https://mqtt.org/)
 - [Eclipse Mosquitto](https://mosquitto.org/)
@@ -275,4 +260,4 @@ riscv-data-kit/
 ---
 
 ###### Trademarks & Non-Affiliation Notice
-> **RVDK** (`riscv-data-kit`) is an independent open-source project developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **Tenstorrent**, **StarFive**, **Milk-V**, **SpacemiT**, **UltraRISC**, **Banana Pi**, **Firefly**, or **Orange Pi**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
+> **RVDK** (`riscv-data-kit`) is an independent open-source project developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **Tenstorrent**, **StarFive**, **Milk-V**, **SpacemiT**, **UltraRISC**, **Banana Pi**, **Firefly**, **Orange Pi**, or **PostgreSQL**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
