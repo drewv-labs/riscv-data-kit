@@ -2,6 +2,8 @@
 
   <img src="./.github/images/rvdk-banner.png" alt="RVDK Banner" width="80%"/>
 
+  ---
+
   Idempotent Day-0 Bare-Metal Bootstrap, Multi-Layer Kernel Tuning, & Prebuilt Package Catalog for  
   **[RISC-V](https://riscv.org/) Data, Storage, Networking, and Edge AI Systems.**
 
