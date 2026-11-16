@@ -169,21 +169,15 @@ rvdk_kv_load() {
     return 0
 }
 
-# Load optional RVDK configuration keys safely (checks /etc/rvdk/config.env then ~/.rvdk/config.env)
+# Load optional system-wide RVDK configuration keys safely (/etc/rvdk/config.env or $RVDK_ENV_FILE)
 # Existing non-empty caller environment variables take precedence.
 rvdk_load_config_env() {
-    [[ -n "${REAL_HOME:-}" ]] || rvdk_resolve_caller
     if [[ -n "${RVDK_ENV_FILE:-}" ]]; then
         if [[ -r "$RVDK_ENV_FILE" ]]; then
             rvdk_kv_load "$RVDK_ENV_FILE" --preserve-existing "$@"
         fi
-    else
-        if [[ -r /etc/rvdk/config.env ]]; then
-            rvdk_kv_load /etc/rvdk/config.env --preserve-existing "$@"
-        fi
-        if [[ -r "${REAL_HOME}/.rvdk/config.env" ]]; then
-            rvdk_kv_load "${REAL_HOME}/.rvdk/config.env" --preserve-existing "$@"
-        fi
+    elif [[ -r /etc/rvdk/config.env ]]; then
+        rvdk_kv_load /etc/rvdk/config.env --preserve-existing "$@"
     fi
     return 0
 }

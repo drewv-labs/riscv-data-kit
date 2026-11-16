@@ -26,7 +26,7 @@ The `riscv-data-kit` (**RVDK**) transforms out-of-the-box `riscv64` single-board
 
 Vendor RISC-V OS images frequently ship with desktop GUI bloat, background package timers, locked hardware performance counters, board-specific interrupt quirks, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard `apt` upgrades. 
 
-`RVDK` decouples bare-metal bring-up and service provisioning into independent, strictly idempotent layers dispatched via `rvdk` (`/usr/bin/rvdk` & `/usr/local/bin/rvdk`) or standalone `curl | sudo bash` endpoints:
+`RVDK` lives strictly in system space (`/usr/local/share/rvdk/engine`, `/etc/rvdk/`, `/var/cache/rvdk/`, `/var/lib/rvdk/`) with zero `~/.rvdk` user-home footprint, decoupling bare-metal bring-up and service provisioning into independent, strictly idempotent layers dispatched via `rvdk` (`/usr/bin/rvdk` & `/usr/local/bin/rvdk`) or standalone `curl | sudo bash` endpoints:
 
 ### **Layer 1 — OS Normalization (`os/`):** 
 
@@ -126,7 +126,7 @@ rvdk quirk list                                          # List & toggle board h
 
 ### 2. A-La-Carte Storage, Database & Network Modules
 
-Every Layer 3 module runs standalone—accepting explicit CLI flags or optional key-value defaults from `/etc/rvdk/config.env` / `~/.rvdk/config.env` (`RVDK_ENV_FILE`):
+Every Layer 3 module runs standalone—accepting explicit CLI flags or optional system-wide key-value defaults from `/etc/rvdk/config.env` (`RVDK_ENV_FILE`):
 
 ```bash
 # Format secondary NVMe to native 4Kn (4096B) sectors + LVM (vg_rvdk/lv_data) + XFS/ext4/Btrfs
@@ -159,7 +159,7 @@ curl -fsSL https://rvdk.drewv-labs.dev/postgresql/latest/forge.sh | sudo bash
 
 ### 3. Host Recovery Media Flashers (macOS Zsh & Linux Bash supported)
 
-Install `rvdk` on a macOS or Linux workstation to pull, `SHA-256` verify, cache (`~/.rvdk/cache/`), and flash vendor recovery media with hardware safety interlocks (blocking internal/OS drives, non-removable Linux disks, and drives `>256 GiB`):
+Install `rvdk` on a macOS or Linux workstation to pull, `SHA-256` verify, cache (`/var/cache/rvdk/`), and flash vendor recovery media with hardware safety interlocks (blocking internal/OS drives, non-removable Linux disks, and drives `>256 GiB`):
 
 ```bash
 rvdk flash list
@@ -177,7 +177,7 @@ riscv-data-kit/
 ├── README.md
 ├── LICENSE
 ├── bootstrap.sh                          # Universal dispatcher & `rvdk` CLI entrypoint
-├── install-cli.sh                        # Stages /usr/local/share/rvdk/engine, caches /etc/rvdk/kit.env & links `rvdk`
+├── install-cli.sh                        # Stages /usr/local/share/rvdk/engine, /etc/rvdk, /var/cache/rvdk & links `rvdk`
 ├── lib/
 │   ├── common.sh                         # Safe non-executing .env parser/writer, validators & logging
 │   ├── kit.sh                            # Hardware/OS Kit inference & <1ms /etc/rvdk/kit.env cache

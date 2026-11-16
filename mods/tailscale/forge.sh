@@ -5,7 +5,7 @@
 #
 # Description:
 #   Pulls and SHA-256 verifies official first-party static riscv64 releases from
-#   pkgs.tailscale.com, caches them in ~/.rvdk/cache/tailscale, auto-detects
+#   pkgs.tailscale.com, caches them in /var/cache/rvdk/tailscale, auto-detects
 #   kernel CONFIG_TUN (falling back to userspace networking on stripped vendor
 #   kernels), and converges tailscaled with trap-guarded secret/temp cleanup.
 #
@@ -193,8 +193,10 @@ BINARIES_CHANGED="false"
 if [[ "$INSTALLED_VER" == "$TS_VERSION" && -x /usr/sbin/tailscaled && -f /etc/systemd/system/tailscaled.service && "$FORCE_REINSTALL" == "false" ]]; then
     log_skip "Tailscale ${TS_VERSION} (${TARBALL_ARCH}) binaries already installed"
 else
-    CACHE_DIR="${REAL_HOME}/.rvdk/cache/tailscale"
-    install -d -m 0755 -o "$REAL_USER" -g "$REAL_GRP" "${REAL_HOME}/.rvdk" "${REAL_HOME}/.rvdk/cache" "$CACHE_DIR"
+    BASE_CACHE_DIR="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
+    CACHE_DIR="${BASE_CACHE_DIR}/tailscale"
+    mkdir -p "$CACHE_DIR"
+    chmod 0755 "$BASE_CACHE_DIR" "$CACHE_DIR" 2>/dev/null || true
     CACHED_TGZ="${CACHE_DIR}/${TGZ_NAME}"
 
     rvdk_prog 30 "Tailscale: fetching SHA-256 digest for ${TGZ_NAME}..."
@@ -223,7 +225,8 @@ else
         fi
         mv -f "$_TS_TMP_TGZ" "$CACHED_TGZ"
         _TS_TMP_TGZ=""
-        chown "${REAL_USER}:${REAL_GRP}" "$CACHED_TGZ"
+        chown 0:0 "$CACHED_TGZ" 2>/dev/null || true
+        chmod 0644 "$CACHED_TGZ"
         log_ok "Verified SHA-256 (${EXPECTED_SHA:0:16}...) -> ${CACHED_TGZ}"
     fi
 

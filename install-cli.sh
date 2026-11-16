@@ -2,11 +2,10 @@
 # ==============================================================================
 # DREW-V Labs // RVDK CLI & Engine Installer
 # Path: riscv-data-kit/install-cli.sh
-# Description: Clones or updates the riscv-data-kit engine in
-#              /usr/local/share/rvdk/engine (root-owned, world-readable 0755)
-#              and links /usr/local/bin/rvdk (+ /usr/bin/rvdk on Linux so sudo
-#              and sudo-rs secure_path always resolve `rvdk`) without modifying
-#              OS/BSP state.
+# Description: Stages the riscv-data-kit engine and caches strictly in system
+#              space (/usr/local/share/rvdk/engine, /etc/rvdk, /var/cache/rvdk)
+#              with zero ~/.rvdk user-home footprint, and links /usr/bin/rvdk +
+#              /usr/local/bin/rvdk without modifying OS/BSP state.
 #
 # Usage:
 #   curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash
@@ -54,7 +53,6 @@ REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root
 if [[ ! "$REAL_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     REAL_USER="root"
 fi
-REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 
 REAL_HOME=""
 if command -v getent >/dev/null 2>&1; then
@@ -74,9 +72,9 @@ if [[ -z "$REAL_HOME" ]]; then
     fi
 fi
 
-RVDK_DIR="${REAL_HOME}/.rvdk"
-CACHE_DIR="${RVDK_DIR}/cache"
-LEGACY_HOME_ENGINE="${RVDK_DIR}/engine"
+LEGACY_HOME_RVDK="${REAL_HOME}/.rvdk"
+SYS_ETC_DIR="/etc/rvdk"
+CACHE_DIR="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
 ENGINE_DIR="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
 ENGINE_PARENT="$(dirname "$ENGINE_DIR")"
 REPO_URL="${RVDK_REPO_URL:-https://github.com/drewv-labs/riscv-data-kit.git}"
@@ -121,17 +119,16 @@ if ! command -v bash >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! co
     fi
 fi
 
-# 2. Ensure per-user ~/.rvdk/cache exists for media/package downloads, and stage
-#    shared root-owned engine in /usr/local/share/rvdk/engine (0755 traversal so
-#    Debian 0700 /home/<user> permissions and sudo-rs never block `sudo rvdk`).
-if [[ -d "$REAL_HOME" ]]; then
-    mkdir -p "$RVDK_DIR" "$CACHE_DIR"
-    chmod 0755 "$RVDK_DIR" "$CACHE_DIR"
-    chown "${REAL_USER}:${REAL_GRP}" "$RVDK_DIR" "$CACHE_DIR" 2>/dev/null || true
+# 2. Stage system-space directories (/etc/rvdk, /var/cache/rvdk, /usr/local/share/rvdk/engine)
+mkdir -p "$SYS_ETC_DIR" "$CACHE_DIR" "$ENGINE_PARENT"
+chmod 0755 "$SYS_ETC_DIR" /usr/local /usr/local/share "$ENGINE_PARENT" 2>/dev/null || true
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    chown 0:admin "$CACHE_DIR" 2>/dev/null || chown 0:0 "$CACHE_DIR" 2>/dev/null || true
+    chmod 1775 "$CACHE_DIR" 2>/dev/null || chmod 0755 "$CACHE_DIR" 2>/dev/null || true
+else
+    chown 0:0 "$CACHE_DIR" 2>/dev/null || true
+    chmod 0755 "$CACHE_DIR" 2>/dev/null || true
 fi
-
-mkdir -p "$ENGINE_PARENT"
-chmod 0755 /usr/local /usr/local/share "$ENGINE_PARENT" 2>/dev/null || true
 
 if [[ -d "${ENGINE_DIR}/.git" ]]; then
     log_info "Updating RVDK engine in ${ENGINE_DIR} (${REPO_BRANCH})..."
@@ -159,9 +156,26 @@ chmod +x \
     "${ENGINE_DIR}"/mods/*/forge.sh \
     "${ENGINE_DIR}"/utils/*.sh 2>/dev/null || true
 
-# Clean up legacy per-user ~/.rvdk/engine checkout if migrating onto system engine
-if [[ "$ENGINE_DIR" != "$LEGACY_HOME_ENGINE" && -d "$LEGACY_HOME_ENGINE" ]]; then
-    rm -rf "$LEGACY_HOME_ENGINE" 2>/dev/null || true
+# Promote & retire any legacy ~/.rvdk user-home directory into system space
+if [[ -d "$LEGACY_HOME_RVDK" && "$ENGINE_DIR" != "${LEGACY_HOME_RVDK}/engine" ]]; then
+    if [[ -f "${LEGACY_HOME_RVDK}/config.env" ]]; then
+        if [[ ! -f "${SYS_ETC_DIR}/config.env" ]]; then
+            cp -a "${LEGACY_HOME_RVDK}/config.env" "${SYS_ETC_DIR}/config.env"
+            chown 0:0 "${SYS_ETC_DIR}/config.env" 2>/dev/null || true
+            chmod 0640 "${SYS_ETC_DIR}/config.env" 2>/dev/null || true
+        fi
+        rm -f "${LEGACY_HOME_RVDK}/config.env" 2>/dev/null || true
+    fi
+    if [[ -d "${LEGACY_HOME_RVDK}/cache" ]]; then
+        for _citem in "${LEGACY_HOME_RVDK}/cache/"*; do
+            [[ -e "$_citem" ]] || continue
+            _cbase="$(basename "$_citem")"
+            [[ -e "${CACHE_DIR}/${_cbase}" ]] || mv -f "$_citem" "${CACHE_DIR}/${_cbase}" 2>/dev/null || true
+        done
+        rm -rf "${LEGACY_HOME_RVDK}/cache" 2>/dev/null || true
+    fi
+    rm -rf "${LEGACY_HOME_RVDK}/engine" 2>/dev/null || true
+    rmdir "$LEGACY_HOME_RVDK" 2>/dev/null || true
 fi
 
 # Persist /etc/rvdk/kit.env cache on Linux target nodes right away if recognized

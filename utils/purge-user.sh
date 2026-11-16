@@ -4,11 +4,12 @@
 # Path: riscv-data-kit/utils/purge-user.sh
 #
 # Description:
-#   1. Migrates /home/<target>/.rvdk/ (cache, config.env, plus any legacy
-#      per-home engine into /usr/local/share/rvdk/engine) and any
-#      caller-specified --extra-dotdir directories into the destination admin
-#      user's home directory, updating /usr/bin/rvdk & /usr/local/bin/rvdk
-#      (and any --relink-bin symlinks) if they pointed into /home/<target>/.
+#   1. Promotes any legacy /home/<target>/.rvdk/ artifacts (config.env, cache,
+#      engine) into system space (/etc/rvdk, /var/cache/rvdk,
+#      /usr/local/share/rvdk/engine) and migrates any caller-specified
+#      --extra-dotdir user-space directories into the destination admin user's
+#      home directory, updating /usr/bin/rvdk, /usr/local/bin/rvdk, and any
+#      --relink-bin symlinks if they pointed into /home/<target>/.
 #   2. Safely transfers ownership of files owned by <target>'s UID across
 #      mounted data volumes (/mnt/*, /srv/*, or --reown-path) without clobbering
 #      system/service subtrees (e.g. postgres, mosquitto).
@@ -49,14 +50,14 @@ Usage: sudo rvdk utils/purge-user.sh <target_user> [options]
 Options:
   --to-user <admin_user>              Destination admin user (defaults to invoking sudo user)
   --overwrite-env                     Overwrite existing *.env files in destination dotdirs
-  --extra-dotdir <rel_dir>            Additional home dot-directory to migrate (repeatable)
+  --extra-dotdir <rel_dir>            User-space home dot-directory to migrate (repeatable)
   --relink-bin <bin_path>:<rel_path>  Re-point symlink if targeting purged user's home (repeatable)
   --reown-path <path>                 Additional directory tree to re-own from <target_user> (repeatable)
 
-Migrates /home/<target_user>/.rvdk (and any --extra-dotdir directories) into the
-destination user's home directory, promotes any legacy ~/.rvdk/engine checkout to
-/usr/local/share/rvdk/engine, re-owns data files belonging to <target_user>'s UID
-on local mounted volumes (/mnt/*, /srv/*), and deletes <target_user>.
+Promotes any legacy /home/<target_user>/.rvdk artifacts into system space (/etc/rvdk,
+/var/cache/rvdk, /usr/local/share/rvdk/engine), migrates caller-requested --extra-dotdir
+user-space directories into the destination user's home, re-owns data files belonging to
+<target_user>'s UID on local mounted volumes (/mnt/*, /srv/*), and deletes <target_user>.
 EOF
 }
 
@@ -184,31 +185,32 @@ main() {
     dest_home="$(getent passwd "$dest_user" 2>/dev/null | cut -d: -f6 || true)"
     [[ -z "$dest_home" ]] && dest_home="/home/${dest_user}"
 
-    log_info "Migrating state from ${src_home} -> ${dest_home} (owner: ${dest_user}:${dest_grp})..."
+    log_info "Migrating user-space state from ${src_home} -> ${dest_home} (owner: ${dest_user}:${dest_grp})..."
 
-    # 1. Migrate .rvdk (cache, config.env) and promote any legacy ~/.rvdk/engine
-    #    to /usr/local/share/rvdk/engine so /usr/bin/rvdk & /usr/local/bin/rvdk stay valid
+    # 1. Promote any legacy ${src_home}/.rvdk artifacts into system space
+    #    (/etc/rvdk, /var/cache/rvdk, /usr/local/share/rvdk/engine) — zero ~/.rvdk in dest_home!
     local sys_engine="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
+    local sys_cache="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
     if [[ -d "${src_home}/.rvdk" ]]; then
-        install -d -m 0755 -o "$dest_user" -g "$dest_grp" "${dest_home}/.rvdk" "${dest_home}/.rvdk/cache"
-
-        if [[ -f "${src_home}/.rvdk/config.env" ]] && [[ ! -f "${dest_home}/.rvdk/config.env" || "$overwrite_env" == "true" ]]; then
-            cp -a "${src_home}/.rvdk/config.env" "${dest_home}/.rvdk/config.env"
-            chown "${dest_user}:${dest_grp}" "${dest_home}/.rvdk/config.env"
-            chmod 0640 "${dest_home}/.rvdk/config.env"
-            log_ok "Migrated config.env -> ${dest_home}/.rvdk/config.env"
+        if [[ -f "${src_home}/.rvdk/config.env" ]] && [[ ! -f /etc/rvdk/config.env || "$overwrite_env" == "true" ]]; then
+            install -d -m 0755 -o root -g root /etc/rvdk
+            cp -a "${src_home}/.rvdk/config.env" /etc/rvdk/config.env
+            chown 0:0 /etc/rvdk/config.env
+            chmod 0640 /etc/rvdk/config.env
+            log_ok "Promoted legacy config.env -> /etc/rvdk/config.env"
         fi
 
         if [[ -d "${src_home}/.rvdk/cache" ]]; then
+            install -d -m 0755 -o root -g root "$sys_cache"
             local cfile cbase
             for cfile in "${src_home}/.rvdk/cache/"*; do
                 [[ -e "$cfile" ]] || continue
                 cbase="$(basename "$cfile")"
-                if [[ ! -e "${dest_home}/.rvdk/cache/${cbase}" ]]; then
-                    cp -a "$cfile" "${dest_home}/.rvdk/cache/${cbase}"
+                if [[ ! -e "${sys_cache}/${cbase}" ]]; then
+                    cp -a "$cfile" "${sys_cache}/${cbase}"
+                    chown -R 0:0 "${sys_cache}/${cbase}"
                 fi
             done
-            chown -R "${dest_user}:${dest_grp}" "${dest_home}/.rvdk/cache"
         fi
 
         if [[ -d "${src_home}/.rvdk/engine/.git" && ! -d "${sys_engine}/.git" ]]; then
@@ -303,7 +305,7 @@ main() {
     # 3. Safely transfer ownership of UID-matched files on configured or mounted local data volumes
     if [[ -n "$target_uid" ]]; then
         local MOUNT_POINT="" SECONDARY_MOUNT_POINT="" NFS_MOUNT_POINT=""
-        local env_cand="${RVDK_ENV_FILE:-${dest_home}/.rvdk/config.env}"
+        local env_cand="${RVDK_ENV_FILE:-/etc/rvdk/config.env}"
         if [[ -r "$env_cand" ]]; then
             rvdk_kv_load "$env_cand" MOUNT_POINT SECONDARY_MOUNT_POINT NFS_MOUNT_POINT
         fi

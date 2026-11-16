@@ -286,7 +286,18 @@ PY
     fi
 
     rvdk_resolve_caller
-    local cache_dir="${RVDK_CACHE_DIR:-${REAL_HOME}/.rvdk/cache}"
+    local os_type
+    os_type="$(uname -s)"
+    local cache_dir="${RVDK_CACHE_DIR:-}"
+    if [[ -z "$cache_dir" ]]; then
+        if [[ "${EUID:-$(id -u)}" -eq 0 ]] || [[ -d /var/cache/rvdk && -w /var/cache/rvdk ]]; then
+            cache_dir="/var/cache/rvdk"
+        elif [[ "$os_type" == "Darwin" ]]; then
+            cache_dir="${REAL_HOME}/Library/Caches/rvdk"
+        else
+            cache_dir="${XDG_CACHE_HOME:-${REAL_HOME}/.cache}/rvdk"
+        fi
+    fi
     local mirror_url="${RVDK_MIRROR_URL:-https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1}"
     [[ "$min_size_gib" =~ ^[0-9]+$ ]] || min_size_gib=8
     local min_bytes=$(( min_size_gib * 1024 * 1024 * 1024 ))
@@ -295,8 +306,6 @@ PY
     # ==========================================================================
     # 1. PLATFORM-SPECIFIC DEVICE RESOLUTION & HARDWARE SAFETY INTERLOCKS
     # ==========================================================================
-    local os_type
-    os_type="$(uname -s)"
     local block_dev="" raw_dev="" media_name="" disk_bytes=0 mkfs_ext4=""
 
     if [[ "$os_type" == "Darwin" ]]; then
