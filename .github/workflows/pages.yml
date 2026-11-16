@@ -1,5 +1,5 @@
 # Path: riscv-data-kit/.github/workflows/pages.yml
-name: Deploy RVDK to GitHub Pages (Dereference Symlinks)
+name: Deploy RVDK to GitHub Pages (Standalone Bundler)
 
 on:
   push:
@@ -23,25 +23,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Stage static tree and dereference board/version symlinks (cp -rL)
+      - name: Validate manifests, symlinks, agnosticism & ShellCheck
         run: |
-          mkdir -p _site
-          # Copy all top-level RVDK directories while dereferencing symlinks (-L)
-          for item in bootstrap.sh install-cli.sh lib bsp boards mods os postgresql utils mosquitto nfs-vault storage README.md LICENSE; do
-            if [ -e "$item" ]; then
-              cp -rL "$item" _site/
-            fi
-          done
-          echo "rvdk.drewv-labs.dev" > _site/CNAME
-          touch _site/.nojekyll
+          python3 tools/rvdk_ci.py --check
+          find . -path './.git' -prune -o -path './_site' -prune -o -name '*.sh' -type f -print0 \
+            | xargs -0 shellcheck -x -S warning
+
+      - name: Bundle standalone endpoints and dereference symlinks
+        run: |
+          python3 tools/rvdk_ci.py --bundle-dist _site
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: "_site"
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

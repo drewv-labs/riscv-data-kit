@@ -8,13 +8,16 @@
 #      caller-specified --extra-dotdir directories into the destination admin
 #      user's home directory, updating /usr/local/bin/rvdk (and any --relink-bin
 #      symlinks) if they pointed into /home/<target>/.
-#   2. Terminates lingering sessions/processes for <target>, removes sudoers
+#   2. Safely transfers ownership of files owned by <target>'s UID across
+#      mounted data volumes (/mnt/*, /srv/*, or --reown-path) without clobbering
+#      system/service subtrees (e.g. postgres, mosquitto).
+#   3. Terminates lingering sessions/processes for <target>, removes sudoers
 #      drop-ins, and purges the <target> user account + home directory.
 #
 # Usage:
 #   sudo rvdk utils/purge-user.sh <target_user> [--to-user <admin_user>] [--overwrite-env]
 #       [--extra-dotdir <rel_dir>] [--relink-bin <symlink_path>:<dest_rel_target>]
-#       [--mount-point <path>] [--nfs-mount <path>]
+#       [--reown-path <dir>]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -25,22 +28,53 @@ else
     set -Eeuo pipefail
 fi
 
-main() {
-    local script_self="${BASH_SOURCE[0]:-}"
-    if [[ $EUID -ne 0 ]]; then
-        if [[ -n "$script_self" && -f "$script_self" ]]; then
-            exec sudo -E bash "$script_self" "$@"
-        else
-            echo "[RVDK:FATAL] Run as root: sudo rvdk utils/purge-user.sh <target_user>" >&2
-            exit 1
-        fi
-    fi
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+_REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
-    log_info()  { printf "\033[1;36m[RVDK:PURGE]\033[0m %s\n" "$1"; }
-    log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-    log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-    log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-    log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+# @RVDK_INLINE_LIBS: common
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+    # shellcheck source=lib/common.sh
+    source "${_REPO_ROOT}/lib/common.sh"
+fi
+
+print_purge_help() {
+    cat <<'EOF'
+Usage: sudo rvdk utils/purge-user.sh <target_user> [options]
+
+Options:
+  --to-user <admin_user>              Destination admin user (defaults to invoking sudo user)
+  --overwrite-env                     Overwrite existing *.env files in destination dotdirs
+  --extra-dotdir <rel_dir>            Additional home dot-directory to migrate (repeatable)
+  --relink-bin <bin_path>:<rel_path>  Re-point symlink if targeting purged user's home (repeatable)
+  --reown-path <path>                 Additional directory tree to re-own from <target_user> (repeatable)
+
+Migrates /home/<target_user>/.rvdk (and any --extra-dotdir directories) into the
+destination user's home directory, re-owns data files belonging to <target_user>'s UID
+on local mounted volumes (/mnt/*, /srv/*), and deletes <target_user>.
+EOF
+}
+
+main() {
+    rvdk_log_init "RVDK:PURGE"
+
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                print_purge_help
+                exit 0
+                ;;
+        esac
+    done
+
+    local script_self="${BASH_SOURCE[0]:-}"
+    rvdk_require_root "$script_self" "$@"
+    rvdk_sanitize_locale
+    rvdk_resolve_caller
 
     if [[ "$(uname -s)" != "Linux" ]]; then
         log_fatal "purge-user.sh is only supported on Linux target nodes (detected $(uname -s))."
@@ -48,12 +82,11 @@ main() {
 
     cd /
 
-    local caller_user="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+    local caller_user="$REAL_USER"
     local target_user=""
     local dest_user=""
     local overwrite_env="false"
-    local cli_mount_pt=""
-    local cli_nfs_mount_pt=""
+    local reown_paths=()
     local extra_dotdirs=()
     local relink_bins=()
 
@@ -79,30 +112,9 @@ main() {
                 [[ -n "${2:-}" ]] && relink_bins+=("$2")
                 shift 2
                 ;;
-            --mount-point)
-                cli_mount_pt="${2:-}"
+            --reown-path|--mount-point|--nfs-mount)
+                [[ -n "${2:-}" ]] && reown_paths+=("$2")
                 shift 2
-                ;;
-            --nfs-mount)
-                cli_nfs_mount_pt="${2:-}"
-                shift 2
-                ;;
-            -h|--help)
-                cat <<EOF
-Usage: sudo rvdk utils/purge-user.sh <target_user> [options]
-
-Options:
-  --to-user <admin_user>              Destination admin user (defaults to invoking sudo user)
-  --overwrite-env                     Overwrite existing *.env files in destination dotdirs
-  --extra-dotdir <rel_dir>            Additional home dot-directory to migrate (repeatable)
-  --relink-bin <bin_path>:<rel_path>  Re-point symlink if targeting purged user's home (repeatable)
-  --mount-point <path>                Data mount root for fallback nfs_vault ownership transfer
-  --nfs-mount <path>                  Dedicated Dual-LVM NFS vault mount for ownership transfer
-
-Migrates /home/<target_user>/.rvdk (and any --extra-dotdir directories) into the
-destination user's home directory, then deletes <target_user>.
-EOF
-                exit 0
                 ;;
             -*)
                 log_fatal "Unknown option: $1"
@@ -128,8 +140,11 @@ EOF
             ;;
     esac
 
-    if [[ ! "$target_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    if ! rvdk_validate_username "$target_user"; then
         log_fatal "Invalid POSIX username: '${target_user}'."
+    fi
+    if ! rvdk_validate_username "$dest_user"; then
+        log_fatal "Invalid destination POSIX username: '${dest_user}'."
     fi
 
     if [[ "$target_user" == "$dest_user" || "$target_user" == "$caller_user" ]]; then
@@ -181,9 +196,9 @@ EOF
         fi
 
         if [[ -d "${src_home}/.rvdk/cache" ]]; then
+            local cfile cbase
             for cfile in "${src_home}/.rvdk/cache/"*; do
                 [[ -e "$cfile" ]] || continue
-                local cbase
                 cbase="$(basename "$cfile")"
                 if [[ ! -e "${dest_home}/.rvdk/cache/${cbase}" ]]; then
                     cp -a "$cfile" "${dest_home}/.rvdk/cache/${cbase}"
@@ -224,7 +239,6 @@ EOF
             if [[ -f "$entry" && "$ebase" == *.env ]]; then
                 if [[ ! -f "${d_dir}/${ebase}" || "$overwrite_env" == "true" ]]; then
                     cp -a "$entry" "${d_dir}/${ebase}"
-                    sed -i "s/^ADMIN_USER=\"${target_user}\"/ADMIN_USER=\"${dest_user}\"/" "${d_dir}/${ebase}" 2>/dev/null || true
                     chown "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
                     chmod 0640 "${d_dir}/${ebase}"
                     log_ok "Migrated ${ddir}/${ebase} -> ${d_dir}/${ebase}"
@@ -273,33 +287,46 @@ EOF
         fi
     done
 
-    # Re-own dedicated Dual-LVM NFS vault and/or fallback NFS vault directory if created under target_uid
-    local env_cand="${RVDK_ENV_FILE:-${dest_home}/.rvdk/config.env}"
-    local mount_pt="${cli_mount_pt:-}"
-    local nfs_mount_pt="${cli_nfs_mount_pt:-}"
-    if [[ -f "$env_cand" ]]; then
-        if [[ -z "$mount_pt" ]]; then
-            mount_pt="$(awk -F= '/^MOUNT_POINT=/ {gsub(/"|\047/, "", $2); print $2}' "$env_cand" 2>/dev/null || true)"
-        fi
-        if [[ -z "$nfs_mount_pt" ]]; then
-            nfs_mount_pt="$(awk -F= '/^NFS_MOUNT_POINT=/ {gsub(/"|\047/, "", $2); print $2}' "$env_cand" 2>/dev/null || true)"
-        fi
-    fi
-    mount_pt="${mount_pt:-/mnt/nvme_pgdata}"
-    nfs_mount_pt="${nfs_mount_pt:-/mnt/nfs_vault}"
-
+    # 3. Safely transfer ownership of UID-matched files on configured or mounted local data volumes
     if [[ -n "$target_uid" ]]; then
+        local MOUNT_POINT="" SECONDARY_MOUNT_POINT="" NFS_MOUNT_POINT=""
+        local env_cand="${RVDK_ENV_FILE:-${dest_home}/.rvdk/config.env}"
+        if [[ -r "$env_cand" ]]; then
+            rvdk_kv_load "$env_cand" MOUNT_POINT SECONDARY_MOUNT_POINT NFS_MOUNT_POINT
+        fi
+        [[ -n "$MOUNT_POINT" ]] && reown_paths+=("$MOUNT_POINT")
+        [[ -n "$SECONDARY_MOUNT_POINT" ]] && reown_paths+=("$SECONDARY_MOUNT_POINT")
+        [[ -n "$NFS_MOUNT_POINT" ]] && reown_paths+=("$NFS_MOUNT_POINT")
+
+        if [[ -r /proc/mounts ]]; then
+            local m_pt m_fs
+            while read -r _ m_pt m_fs _; do
+                case "$m_fs" in
+                    xfs|ext4|ext3|btrfs|f2fs)
+                        case "$m_pt" in
+                            /mnt/*|/srv/*) reown_paths+=("$m_pt") ;;
+                        esac
+                        ;;
+                esac
+            done < /proc/mounts
+        fi
+
+        local seen_paths=" "
         local vdir
-        for vdir in "$nfs_mount_pt" "${mount_pt}/nfs_vault"; do
+        for vdir in ${reown_paths[@]+"${reown_paths[@]}"}; do
             [[ -n "$vdir" && -d "$vdir" ]] || continue
-            if [[ "$(stat -c '%u' "$vdir" 2>/dev/null || echo "")" == "$target_uid" ]]; then
-                chown -R "${dest_user}:${dest_grp}" "$vdir"
-                log_ok "Transferred ownership of ${vdir} -> ${dest_user}:${dest_grp}"
+            [[ "$vdir" == "/" || "$vdir" == "/home" || "$vdir" == "$src_home" ]] && continue
+            [[ "$seen_paths" == *"|${vdir}|"* ]] && continue
+            seen_paths="${seen_paths}|${vdir}|"
+
+            if find "$vdir" -xdev -user "$target_uid" -print -quit 2>/dev/null | grep -q .; then
+                find "$vdir" -xdev -user "$target_uid" -exec chown -h "${dest_user}:${dest_grp}" {} +
+                log_ok "Transferred UID ${target_uid} files under ${vdir} -> ${dest_user}:${dest_grp}"
             fi
         done
     fi
 
-    # 3. Terminate lingering processes, remove sudoers rules, and delete target_user
+    # 4. Terminate lingering processes, remove sudoers rules, and delete target_user
     if [[ -n "$target_uid" ]]; then
         loginctl disable-linger "$target_user" 2>/dev/null || true
         loginctl terminate-user "$target_user" 2>/dev/null || true

@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "milkv/titan",
   "tag": "titan",
   "name": "Milk-V Titan (DP1000)",

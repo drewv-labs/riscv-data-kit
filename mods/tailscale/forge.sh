@@ -4,42 +4,60 @@
 # Path: riscv-data-kit/mods/tailscale/forge.sh
 #
 # Description:
-#   Tailscale's Debian/Ubuntu APT repos do not publish riscv64 .deb packages or
-#   Debian sid/Bianbu suites. This module pulls and SHA-256 verifies official
-#   first-party static riscv64 releases from pkgs.tailscale.com, caches them in
-#   ~/.rvdk/cache/tailscale, auto-detects kernel CONFIG_TUN (falling back to
-#   userspace networking on stripped vendor kernels), and converges tailscaled.
+#   Pulls and SHA-256 verifies official first-party static riscv64 releases from
+#   pkgs.tailscale.com, caches them in ~/.rvdk/cache/tailscale, auto-detects
+#   kernel CONFIG_TUN (falling back to userspace networking on stripped vendor
+#   kernels), and converges tailscaled with trap-guarded secret/temp cleanup.
 #
 # Usage:
-#   sudo rvdk mods/tailscale [--up] [--ssh] [--qr] [--authkey <tskey-...>] [--no-apt-update] [--noprogbar]
-#   sudo rvdk mods/tailscale [--advertise-routes 10.0.10.0/24] [--exit-node]
+#   sudo rvdk mods/tailscale [--up] [--ssh] [--qr] [--authkey <tskey-...>]
+#   sudo rvdk mods/tailscale [--advertise-routes 192.168.1.0/24] [--exit-node]
 #   sudo rvdk mods/tailscale [--userspace | --kernel-tun] [--track stable|unstable]
-#   curl -fsSL https://rvdk.drewv-labs.dev/mods/tailscale/forge.sh | sudo bash
 # ==============================================================================
 set -Eeuo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
-    else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL ... | sudo bash" >&2
-        exit 1
-    fi
-fi
+ORIG_ARGS=("$@")
+export DEBIAN_FRONTEND=noninteractive
+APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
-# Sanitize SSH-forwarded LC_* (e.g. ZedBook / macOS SendEnv)
-if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
-    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
-elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
-    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+_REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../.." && pwd)"
+
+# @RVDK_INLINE_LIBS: common apt progbar
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+    # shellcheck source=lib/common.sh
+    source "${_REPO_ROOT}/lib/common.sh"
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
+    # shellcheck source=lib/apt.sh
+    source "${_REPO_ROOT}/lib/apt.sh"
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
+    # shellcheck source=lib/progbar.sh
+    source "${_REPO_ROOT}/lib/progbar.sh"
 else
-    export LANG="C" LC_ALL="C"
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
 fi
 
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
-REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
-REAL_HOME="$(getent passwd "${REAL_USER}" 2>/dev/null | cut -d: -f6 || eval echo "~${REAL_USER}")"
-[[ -z "$REAL_HOME" || "$REAL_HOME" == "~"* ]] && REAL_HOME="/root"
+rvdk_log_init "RVDK:TAILSCALE"
+rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+rvdk_sanitize_locale
+rvdk_resolve_caller
+
+_TS_TMP_EXTRACT=""
+_TS_TMP_TGZ=""
+_TS_KEY_FILE=""
+_rvdk_ts_cleanup() {
+    [[ -n "$_TS_KEY_FILE" ]] && rm -f "$_TS_KEY_FILE" 2>/dev/null || true
+    [[ -n "$_TS_TMP_TGZ" ]] && rm -f "$_TS_TMP_TGZ" 2>/dev/null || true
+    [[ -n "$_TS_TMP_EXTRACT" && -d "$_TS_TMP_EXTRACT" ]] && rm -rf "$_TS_TMP_EXTRACT" 2>/dev/null || true
+}
+trap '_rvdk_ts_cleanup' EXIT INT TERM
 
 TRACK="${TAILSCALE_TRACK:-stable}"
 TS_PORT="${TAILSCALE_PORT:-41641}"
@@ -77,6 +95,27 @@ while [[ $# -gt 0 ]]; do
         --no-apt-update|--skip-apt-update)
                                         export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)       export RVDK_NO_PROGBAR="1"; shift ;;
+        -h|--help)
+            cat <<'EOF'
+Usage: sudo rvdk mods/tailscale [options]
+
+Options:
+  --up                         Run `tailscale up` after daemon convergence
+  --ssh                        Enable Tailscale SSH (`--ssh`)
+  --qr                         Display QR login code during `tailscale up`
+  --authkey <tskey-...>        Authenticate non-interactively via ephemeral file
+  --advertise-routes <CIDRs>   Comma-separated IPv4/IPv6 subnet routes to advertise
+  --exit-node                  Advertise node as a Tailnet exit node
+  --accept-routes              Accept subnet routes advertised by peers
+  --hostname <name>            Custom RFC-1123 Tailnet node hostname
+  --operator <user>            Grant non-root POSIX user Tailscale operator control
+  --kernel-tun | --userspace   Force kernel /dev/net/tun or userspace networking
+  --track <stable|unstable>    Tailscale release track (default: stable)
+  --port <1..65535>            UDP WireGuard port (default: 41641)
+  --force                      Reinstall binaries even if version matches
+EOF
+            exit 0
+            ;;
         *)                              shift ;;
     esac
 done
@@ -85,56 +124,27 @@ done
 
 case "$TRACK" in
     stable|unstable) ;;
-    *)
-        echo "[RVDK:FATAL] Unknown Tailscale track '${TRACK}' (expected: stable | unstable)" >&2
-        exit 1
-        ;;
+    *) log_fatal "Unknown Tailscale track '${TRACK}' (expected: stable | unstable)" ;;
 esac
-
-_SCRIPT_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ "$TS_PORT" =~ ^[0-9]+$ ]] && (( TS_PORT >= 1 && TS_PORT <= 65535 )) || log_fatal "Invalid --port '${TS_PORT}'."
+if [[ -n "$TS_HOSTNAME" ]] && ! rvdk_validate_hostname "$TS_HOSTNAME"; then
+    log_fatal "Invalid --hostname '${TS_HOSTNAME}'."
 fi
-
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../lib/progbar.sh"
-if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
-    # shellcheck disable=SC1090
-    source "$_PROGBAR_CANDIDATE"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
+if [[ -n "$TS_OPERATOR" ]] && ! rvdk_validate_username "$TS_OPERATOR"; then
+    log_fatal "Invalid --operator username '${TS_OPERATOR}'."
 fi
-
-export DEBIAN_FRONTEND=noninteractive
-APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
-
-_APT_CANDIDATE="${RVDK_APT_LIB:-}"
-[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../lib/apt.sh"
-if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
-    # shellcheck disable=SC1090
-    source "$_APT_CANDIDATE"
-else
-    rvdk_apt_ensure() {
-        local m=() p
-        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
-        [[ ${#m[@]} -eq 0 ]] && return 0
-        if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" ]] || ! compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
-            apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
-            export RVDK_NO_APT_UPDATE="1"
-            [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
+if [[ -n "$TS_ADVERTISE_ROUTES" ]]; then
+    IFS=',' read -r -a _route_items <<< "$TS_ADVERTISE_ROUTES"
+    for _r in "${_route_items[@]}"; do
+        if [[ "$_r" == *:* ]]; then
+            [[ "$_r" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || log_fatal "Invalid IPv6 route CIDR '${_r}'."
+        else
+            rvdk_validate_cidr "$_r" || log_fatal "Invalid IPv4 route CIDR '${_r}'."
         fi
-        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
-    }
+    done
 fi
 
 rvdk_prog_init "Tailscale: checking architecture & prerequisites..."
-
-log_info()  { printf "\033[1;36m[RVDK:TAILSCALE]\033[0m %s\n" "$1"; }
-log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 UNAME_M="$(uname -m)"
 case "$UNAME_M" in
@@ -193,7 +203,7 @@ else
 
     NEED_DOWNLOAD="true"
     if [[ -f "$CACHED_TGZ" ]]; then
-        ACTUAL_CACHED_SHA="$(sha256sum "$CACHED_TGZ" | awk '{print $1}')"
+        ACTUAL_CACHED_SHA="$(rvdk_sha256_file "$CACHED_TGZ")"
         if [[ "$ACTUAL_CACHED_SHA" == "$EXPECTED_SHA" ]]; then
             NEED_DOWNLOAD="false"
             log_skip "Using verified RVDK cache artifact: ${CACHED_TGZ}"
@@ -203,24 +213,25 @@ else
     if [[ "$NEED_DOWNLOAD" == "true" ]]; then
         rvdk_prog 42 "Tailscale: downloading ${TGZ_NAME} (${TARBALL_ARCH})..."
         log_info "Downloading ${TGZ_URL}..."
-        TMP_TGZ="${CACHED_TGZ}.tmp.$$"
-        curl -fL --retry 3 -o "$TMP_TGZ" "$TGZ_URL"
-        ACTUAL_SHA="$(sha256sum "$TMP_TGZ" | awk '{print $1}')"
+        _TS_TMP_TGZ="${CACHED_TGZ}.tmp.$$"
+        curl -fL --retry 3 -o "$_TS_TMP_TGZ" "$TGZ_URL"
+        ACTUAL_SHA="$(rvdk_sha256_file "$_TS_TMP_TGZ")"
         if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
-            rm -f "$TMP_TGZ"
+            rm -f "$_TS_TMP_TGZ"
+            _TS_TMP_TGZ=""
             log_fatal "SHA-256 mismatch for ${TGZ_NAME}: expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}"
         fi
-        mv -f "$TMP_TGZ" "$CACHED_TGZ"
+        mv -f "$_TS_TMP_TGZ" "$CACHED_TGZ"
+        _TS_TMP_TGZ=""
         chown "${REAL_USER}:${REAL_GRP}" "$CACHED_TGZ"
         log_ok "Verified SHA-256 (${EXPECTED_SHA:0:16}...) -> ${CACHED_TGZ}"
     fi
 
     rvdk_prog 60 "Tailscale: installing ${TS_VERSION} binaries & systemd units..."
-    TMP_EXTRACT="$(mktemp -d)"
-    tar -xzf "$CACHED_TGZ" -C "$TMP_EXTRACT"
-    PKG_DIR="$(find "$TMP_EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    _TS_TMP_EXTRACT="$(mktemp -d)"
+    tar -xzf "$CACHED_TGZ" -C "$_TS_TMP_EXTRACT"
+    PKG_DIR="$(find "$_TS_TMP_EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -n1)"
     if [[ -z "$PKG_DIR" || ! -f "${PKG_DIR}/tailscale" || ! -f "${PKG_DIR}/tailscaled" ]]; then
-        rm -rf "$TMP_EXTRACT"
         log_fatal "Unexpected archive layout inside ${CACHED_TGZ}"
     fi
 
@@ -232,7 +243,8 @@ else
             install -m 0644 "${PKG_DIR}/systemd/${unit_name}" "/etc/systemd/system/${unit_name}"
         fi
     done
-    rm -rf "$TMP_EXTRACT"
+    rm -rf "$_TS_TMP_EXTRACT"
+    _TS_TMP_EXTRACT=""
     BINARIES_CHANGED="true"
     log_ok "Installed Tailscale ${TS_VERSION} (${TARBALL_ARCH}) to /usr/bin/tailscale & /usr/sbin/tailscaled"
 fi
@@ -285,7 +297,6 @@ if ! printf '%s' "$WANT_DEFAULTS" | cmp -s - "$DEFAULTS_FILE" 2>/dev/null; then
     DEFAULTS_CHANGED="true"
 fi
 
-# Enable IPv4/IPv6 forwarding if subnet routing or exit-node is requested
 if [[ -n "$TS_ADVERTISE_ROUTES" || "$TS_EXIT_NODE" == "true" ]]; then
     FWD_SYSCTL="/etc/sysctl.d/90-rvdk-tailscale-forwarding.conf"
     cat << 'EOF' > "$FWD_SYSCTL"
@@ -296,7 +307,6 @@ EOF
     log_ok "Enabled IPv4/IPv6 packet forwarding (${FWD_SYSCTL})"
 fi
 
-# Best-effort UDP GRO forwarding optimization on primary egress NIC (Linux 6.2+)
 PRIMARY_NIC="$(ip -o route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' || true)"
 if [[ -n "$PRIMARY_NIC" ]] && command -v ethtool >/dev/null 2>&1; then
     ethtool -K "$PRIMARY_NIC" rx-udp-gro-forwarding on rx-gro-list off >/dev/null 2>&1 || true
@@ -337,16 +347,18 @@ if [[ "$WANT_UP" == "true" ]]; then
     rvdk_prog 92 "Tailscale: running tailscale up..."
     if [[ -n "$TS_AUTHKEY_VAL" ]]; then
         install -d -m 0755 /run/tailscale
-        KEY_FILE="/run/tailscale/.rvdk-authkey.$$"
+        _TS_KEY_FILE="/run/tailscale/.rvdk-authkey.$$"
         (
             umask 077
-            printf '%s' "$TS_AUTHKEY_VAL" > "$KEY_FILE"
+            printf '%s' "$TS_AUTHKEY_VAL" > "$_TS_KEY_FILE"
         )
-        /usr/bin/tailscale up --auth-key="file:${KEY_FILE}" ${UP_ARGS[@]+"${UP_ARGS[@]}"} || {
-            rm -f "$KEY_FILE"
+        if ! /usr/bin/tailscale up --auth-key="file:${_TS_KEY_FILE}" ${UP_ARGS[@]+"${UP_ARGS[@]}"}; then
+            rm -f "$_TS_KEY_FILE"
+            _TS_KEY_FILE=""
             log_fatal "tailscale up with authkey failed"
-        }
-        rm -f "$KEY_FILE"
+        fi
+        rm -f "$_TS_KEY_FILE"
+        _TS_KEY_FILE=""
     else
         /usr/bin/tailscale up ${UP_ARGS[@]+"${UP_ARGS[@]}"}
     fi

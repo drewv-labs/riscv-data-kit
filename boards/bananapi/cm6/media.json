@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "bananapi/cm6",
   "tag": "bpicm6",
   "name": "Banana Pi BPI-CM6 (SpacemiT K1)",

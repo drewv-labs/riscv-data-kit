@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "orangepi/rv2",
   "tag": "rv2",
   "name": "Orange Pi RV2 (Ky X1 / K1)",

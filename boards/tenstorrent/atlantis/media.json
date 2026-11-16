@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "tenstorrent/atlantis",
   "tag": "atlantis",
   "name": "Tenstorrent Atlantis (8x Ascalon-X)",

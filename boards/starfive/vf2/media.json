@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "starfive/vf2",
   "tag": "vf2",
   "name": "StarFive VisionFive 2",
@@ -6,9 +7,11 @@
   "default_os": "debian-12",
   "media": {
     "sd": {
+      "mode": "raw",
       "script": "flash-sd.sh",
       "description": "Raw block SD/eMMC image flasher for StarFive VisionFive 2 Debian",
-      "image": "starfive-jh7110-202510-minimal-desktop-wayland.img.zst"
+      "image": "starfive-jh7110-202510-minimal-desktop-wayland.img.zst",
+      "min_size_gib": 8
     }
   },
   "quirks": []

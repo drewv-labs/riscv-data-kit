@@ -5,178 +5,128 @@
 # Description: Idempotent Layer 2 BSP hardening for StarFive JH7110 / JH7110S
 #              (VisionFive 2, VisionFive 2 Lite, Milk-V Mars, Orange Pi RV) on Debian:
 #              - Protects vendor U-Boot & DTB hooks (/etc/kernel/postinst.d/zz-u-boot-menu)
-#              - Migrates dead 2023/VF2-Lite snapshot repos to official Debian sid
+#              - Migrates legacy StarFive snapshot/debian-ports sources over HTTPS
+#                using signed Debian keyrings (never touches healthy DEB822 installs)
 #              - Purges Wayland/Weston/X11/GTK & unblocks t64 prior to full-upgrade
-#              - Persists primary wired NIC (eth0/end0) DHCP, masks sleep targets,
-#                locks U74 max OPP governor (1.50 GHz JH7110 / 1.25 GHz JH7110S),
-#                and unlocks SiFive U74 PMU counters.
+#              - Persists primary wired NIC (eth0/end0) safely, masks sleep targets,
+#                locks U74 max OPP governor, and unlocks SiFive U74 PMU counters.
 #
 # Usage:
-#   sudo rvdk bsp [--skip-upgrade] [--no-apt-update] [--noprogbar]
-#   curl -fsSL https://rvdk.drewv-labs.dev/bsp/starfive/jh7110/bootstrap-debian.sh | sudo bash
+#   sudo rvdk bsp [--skip-upgrade] [--debian-suite trixie|unstable] [--expose-kallsyms]
 # ==============================================================================
 
 set -Eeuo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
-    else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL ... | sudo bash" >&2
-        exit 1
-    fi
-fi
-
-# Silence SSH-forwarded LC_* warnings (ZedBook / macOS SendEnv) prior to Stage 2 locale-gen
-if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
-    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
-elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
-    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
-else
-    export LANG="C" LC_ALL="C"
-fi
-
+ORIG_ARGS=("$@")
 SKIP_UPGRADE="false"
+DEBIAN_SUITE="trixie"
+EXPOSE_KALLSYMS="false"
+
+export DEBIAN_FRONTEND=noninteractive
+APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+_REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
+
+# @RVDK_INLINE_LIBS: common apt bsp progbar
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+    # shellcheck source=lib/common.sh
+    source "${_REPO_ROOT}/lib/common.sh"
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
+    # shellcheck source=lib/apt.sh
+    source "${_REPO_ROOT}/lib/apt.sh"
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/bsp.sh" ]]; then
+    # shellcheck source=lib/bsp.sh
+    source "${_REPO_ROOT}/lib/bsp.sh"
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
+    # shellcheck source=lib/progbar.sh
+    source "${_REPO_ROOT}/lib/progbar.sh"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_log_init "RVDK:JH7110"
+rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+rvdk_sanitize_locale
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-upgrade)                    SKIP_UPGRADE="true"; shift ;;
+        --debian-suite)                    DEBIAN_SUITE="${2:-trixie}"; shift 2 ;;
+        --expose-kallsyms)                 EXPOSE_KALLSYMS="true"; shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
         *)                                 shift ;;
     esac
 done
 
-_SCRIPT_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
-
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-[[ -z "$_PROGBAR_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../../lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_SCRIPT_DIR}/../../../lib/progbar.sh"
-if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
-    # shellcheck disable=SC1090
-    source "$_PROGBAR_CANDIDATE"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
-fi
-
-export DEBIAN_FRONTEND=noninteractive
-APT_FLAGS=(
-    -y
-    -o DPkg::Lock::Timeout=120
-    -o Dpkg::Options::="--force-overwrite"
-    -o Dpkg::Options::="--force-confdef"
-    -o Dpkg::Options::="--force-confold"
-)
-
-_APT_CANDIDATE="${RVDK_APT_LIB:-}"
-[[ -z "$_APT_CANDIDATE" && -n "$_SCRIPT_DIR" && -f "${_SCRIPT_DIR}/../../../lib/apt.sh" ]] && _APT_CANDIDATE="${_SCRIPT_DIR}/../../../lib/apt.sh"
-if [[ -n "$_APT_CANDIDATE" && -f "$_APT_CANDIDATE" ]]; then
-    # shellcheck disable=SC1090
-    source "$_APT_CANDIDATE"
-else
-    rvdk_apt_mark_updated() {
-        export RVDK_NO_APT_UPDATE="1"
-        [[ -n "${RVDK_APT_STAMP_FILE:-}" ]] && touch "$RVDK_APT_STAMP_FILE" 2>/dev/null || true
-    }
-    rvdk_apt_update() {
-        if [[ "${RVDK_NO_APT_UPDATE:-0}" == "1" ]] && compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1; then
-            return 0
-        fi
-        apt-get -o Acquire::Check-Valid-Until=false update -q || apt-get update -q
-        rvdk_apt_mark_updated
-    }
-    rvdk_apt_ensure() {
-        local m=() p
-        for p in "$@"; do dpkg-query -W -f='${Status}\n' "$p" 2>/dev/null | grep -qx "install ok installed" || m+=("$p"); done
-        [[ ${#m[@]} -eq 0 ]] && return 0
-        rvdk_apt_update
-        apt-get install "${APT_FLAGS[@]}" "${m[@]}"
-    }
-fi
+case "$DEBIAN_SUITE" in
+    trixie|testing|sid|unstable) ;;
+    *) log_fatal "Invalid --debian-suite '${DEBIAN_SUITE}' (expected trixie or unstable)." ;;
+esac
 
 rvdk_prog_init "JH7110 BSP: inspecting device tree..."
-
-log_info() { printf "\033[1;36m[RVDK:JH7110]\033[0m %s\n" "$1"; }
-log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[1;31m[WARN]\033[0m %s\n" "$1"; }
-
-# ==============================================================================
-# 1. VERIFY STARFIVE JH7110 / JH7110S DEVICE TREE
-# ==============================================================================
-DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+DT_MODEL="$(rvdk_bsp_read_dt_model)"
 log_info "Detected Device-Tree Model: ${DT_MODEL}"
 
-# ==============================================================================
-# 2. BOOTLOADER, FIT & VENDOR U-BOOT HOOK PROTECTION (zz-u-boot-menu)
-# ==============================================================================
-rvdk_prog 10 "JH7110 BSP: protecting U-Boot & FIT/DTB hooks..."
-APT_BSP_CONF="/etc/apt/apt.conf.d/90-starfive-bsp-protect"
-APT_BSP_CONTENT='Dpkg::Options {
-   "--force-overwrite";
-   "--force-confdef";
-   "--force-confold";
-};'
+# 1. Bootloader, FIT & Vendor U-Boot Hook Protection (without permanent --force-overwrite)
+rvdk_prog 12 "JH7110 BSP: protecting U-Boot & FIT/DTB hooks..."
+rvdk_bsp_protect_dpkg "/etc/apt/apt.conf.d/90-starfive-bsp-protect" "StarFive U-Boot/DTB"
+rvdk_bsp_backup_boot_configs \
+    /boot/extlinux/extlinux.conf \
+    /boot/boot/extlinux/extlinux.conf \
+    /boot/efi/extlinux.conf \
+    /etc/default/u-boot \
+    /etc/kernel/postinst.d/zz-u-boot-menu
 
-if [[ ! -f "$APT_BSP_CONF" ]] || [[ "$(cat "$APT_BSP_CONF")" != "$APT_BSP_CONTENT" ]]; then
-    echo "$APT_BSP_CONTENT" > "$APT_BSP_CONF"
-    log_ok "Configured dpkg confold protection for StarFive U-Boot/DTB hooks ($APT_BSP_CONF)"
-else
-    log_skip "StarFive U-Boot/DTB dpkg protection already active"
-fi
-
-for boot_cfg in /boot/extlinux/extlinux.conf /boot/boot/extlinux/extlinux.conf /boot/efi/extlinux.conf /etc/default/u-boot /etc/kernel/postinst.d/zz-u-boot-menu; do
-    if [[ -f "$boot_cfg" && ! -f "${boot_cfg}.factory.bak" ]]; then
-        cp -a "$boot_cfg" "${boot_cfg}.factory.bak"
-        log_ok "Backed up factory boot artifact to ${boot_cfg}.factory.bak"
+# 2. Migrate ONLY Legacy StarFive Snapshot / debian-ports Images Over Signed HTTPS
+rvdk_prog 28 "JH7110 BSP: checking APT sources & keyring..."
+SNAPSHOT_MIGRATION="false"
+if grep -rqE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+    SNAPSHOT_MIGRATION="true"
+    DEBIAN_KEYRING="/usr/share/keyrings/debian-archive-keyring.gpg"
+    if [[ ! -s "$DEBIAN_KEYRING" ]]; then
+        log_fatal "Cannot safely migrate legacy StarFive snapshot sources: missing ${DEBIAN_KEYRING}. Install debian-archive-keyring manually before retrying."
     fi
-done
 
-# ==============================================================================
-# 3. MIGRATE SNAPSHOT REPOS, PURGE GUI & UNBLOCK T64 UPGRADE
-# ==============================================================================
-rvdk_prog 25 "JH7110 BSP: checking APT sources & keyring..."
-DESIRED_SOURCES="deb http://deb.debian.org/debian unstable main
-deb https://debianrepo-t.starfivetech.com starfive-debian main"
-
-if grep -qE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list 2>/dev/null || \
-   ! grep -q "http://deb.debian.org/debian" /etc/apt/sources.list 2>/dev/null; then
-    log_info "Migrating /etc/apt/sources.list from factory snapshot to official Debian unstable..."
+    log_info "Migrating legacy StarFive snapshot APT sources to signed HTTPS Debian (${DEBIAN_SUITE})..."
+    cp -a /etc/apt/sources.list "/etc/apt/sources.list.rvdk.bak" 2>/dev/null || true
     rm -f /etc/apt/trusted.gpg.d/debian-ports* 2>/dev/null || true
 
-    cat << 'EOF' > /etc/apt/sources.list
-deb [trusted=yes] http://deb.debian.org/debian unstable main
+    cat <<EOF > /etc/apt/sources.list
+deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE} main contrib non-free-firmware
+EOF
+    if [[ -f /etc/apt/trusted.gpg.d/starfive.gpg || -f /usr/share/keyrings/starfive-archive-keyring.gpg ]]; then
+        cat <<'EOF' >> /etc/apt/sources.list
 deb https://debianrepo-t.starfivetech.com starfive-debian main
 EOF
+    fi
 
     rm -rf /var/lib/apt/lists/*
     apt-get clean
-    apt-get -o Acquire::Check-Valid-Until=false update -y
-    apt-get install "${APT_FLAGS[@]}" --allow-unauthenticated debian-archive-keyring
-
-    echo "$DESIRED_SOURCES" > /etc/apt/sources.list
-    apt-get update -y
-    rvdk_apt_mark_updated
-    log_ok "Migrated APT sources to official Debian unstable + StarFive BSP repo"
+    RVDK_NO_APT_UPDATE="0" rvdk_apt_update
+    rvdk_apt_ensure ca-certificates debian-archive-keyring
+    log_ok "Migrated legacy StarFive snapshot sources to signed HTTPS (${DEBIAN_SUITE})"
 else
-    log_skip "APT sources (/etc/apt/sources.list) already pointing to official Debian unstable"
+    log_skip "APT sources are modern (non-snapshot); preserving existing Debian repository layout"
 fi
 
-if [[ "$(systemctl get-default)" != "multi-user.target" ]]; then
+if command -v systemctl >/dev/null 2>&1 && [[ "$(systemctl get-default 2>/dev/null || true)" != "multi-user.target" ]]; then
     systemctl set-default multi-user.target
     log_ok "Boot target set to headless multi-user.target"
-else
-    log_skip "Boot target is already multi-user.target"
 fi
 
-# Strip frozen 2023 Wayland/Weston/X11/GTK packages BEFORE full-upgrade to prevent t64 collisions
-rvdk_prog 40 "JH7110 BSP: checking desktop GUI & t64 blockers..."
-VF2_GUI_PKGS=(
-    "weston*" "wayland*" "x11-common" "libx11-*" "libgtk*"
-    "lightdm*" "task-desktop" "plymouth"
-)
+# 3. Strip Legacy Factory Wayland/Weston/X11/GTK Prior to t64 Upgrade
+rvdk_prog 42 "JH7110 BSP: checking desktop GUI & t64 blockers..."
+VF2_GUI_PKGS=("weston*" "wayland*" "x11-common" "libx11-*" "libgtk*" "lightdm*" "task-desktop" "plymouth")
 NEED_GUI_PURGE="false"
 for pattern in weston x11-common lightdm task-desktop plymouth; do
     if dpkg -l "$pattern" 2>/dev/null | grep -q "^ii"; then
@@ -186,7 +136,7 @@ for pattern in weston x11-common lightdm task-desktop plymouth; do
 done
 
 if [[ "$NEED_GUI_PURGE" == "true" ]]; then
-    log_info "Purging StarFive desktop GUI packages prior to t64 upgrade..."
+    log_info "Purging StarFive desktop GUI packages prior to upgrade..."
     apt-get purge "${APT_FLAGS[@]}" "${VF2_GUI_PKGS[@]}" || true
     apt-get autoremove "${APT_FLAGS[@]}" --purge
     apt-get clean
@@ -195,17 +145,19 @@ else
     log_skip "Desktop GUI packages already purged"
 fi
 
-# Unblock libcurl3-gnutls t64 transition dependency if present
-if dpkg -l 2>/dev/null | grep -q "^ii.*libcurl3-gnutls"; then
+if [[ "$SNAPSHOT_MIGRATION" == "true" ]] && dpkg -l 2>/dev/null | grep -q "^ii.*libcurl3-gnutls"; then
     dpkg --remove --force-depends libcurl3-gnutls:riscv64 2>/dev/null || true
     log_ok "Removed legacy libcurl3-gnutls:riscv64 t64 blocker"
 fi
 
 if [[ "$SKIP_UPGRADE" == "false" ]]; then
-    rvdk_prog 55 "JH7110 BSP: running apt full-upgrade & core packages..."
-    log_info "Running non-interactive full-upgrade and verifying core JH7110 packages..."
+    rvdk_prog 58 "JH7110 BSP: converging system packages & utilities..."
     rvdk_apt_update
-    apt-get full-upgrade "${APT_FLAGS[@]}"
+    UPGRADE_FLAGS=("${APT_FLAGS[@]}")
+    if [[ "$SNAPSHOT_MIGRATION" == "true" ]]; then
+        UPGRADE_FLAGS+=(-o Dpkg::Options::="--force-overwrite")
+    fi
+    apt-get full-upgrade "${UPGRADE_FLAGS[@]}"
     rvdk_prog 72 "JH7110 BSP: verifying core build & perf packages..."
     rvdk_apt_ensure \
         build-essential dkms pciutils nvme-cli lvm2 parted git curl wget \
@@ -219,57 +171,12 @@ else
     log_skip "Skipped apt-get full-upgrade (--skip-upgrade)"
 fi
 
-# ==============================================================================
-# 4. PERSISTENT PRIMARY WIRED NIC (eth0 / end0) CONFIGURATION
-# ==============================================================================
+# 4. SSH-Safe Primary Wired NIC Persistence & Sleep Lockout
 rvdk_prog 82 "JH7110 BSP: persisting primary wired NIC & masking sleep..."
-PRIMARY_WIRED_NIC=""
-for cand_nic in eth0 end0; do
-    if ip link show "$cand_nic" >/dev/null 2>&1; then
-        PRIMARY_WIRED_NIC="$cand_nic"
-        break
-    fi
-done
+rvdk_bsp_persist_wired_nic "jh7110" eth0 end0
+rvdk_bsp_mask_sleep_targets apt-daily.timer apt-daily-upgrade.timer
 
-if [[ -n "$PRIMARY_WIRED_NIC" && -d /etc/network/interfaces.d ]]; then
-    if grep -rqE "iface ${PRIMARY_WIRED_NIC}\\b" /etc/network/ 2>/dev/null; then
-        log_skip "Interface '${PRIMARY_WIRED_NIC}' is already persisted in /etc/network/"
-    else
-        cat <<EOF > "/etc/network/interfaces.d/${PRIMARY_WIRED_NIC}"
-allow-hotplug ${PRIMARY_WIRED_NIC}
-iface ${PRIMARY_WIRED_NIC} inet dhcp
-EOF
-        log_ok "Persisted ${PRIMARY_WIRED_NIC} DHCP configuration in /etc/network/interfaces.d/${PRIMARY_WIRED_NIC}"
-    fi
-fi
-
-# ==============================================================================
-# 5. JH7110 / JH7110S SLEEP TARGET LOCKOUT & BACKGROUND APT TIMER MASK
-# ==============================================================================
-MASK_UNITS=(
-    sleep.target suspend.target hibernate.target hybrid-sleep.target
-    apt-daily.timer apt-daily-upgrade.timer
-)
-NEED_MASK="false"
-for unit in "${MASK_UNITS[@]}"; do
-    if [[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" != "masked" ]]; then
-        NEED_MASK="true"
-        break
-    fi
-done
-
-if [[ "$NEED_MASK" == "true" ]]; then
-    systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-    systemctl mask "${MASK_UNITS[@]}" 2>/dev/null || true
-    log_ok "Masked sleep/suspend targets and background apt-daily timers"
-else
-    log_skip "Sleep/suspend targets and apt-daily timers already masked"
-fi
-
-# ==============================================================================
-# 6. LOCK MAX OPP CPUFREQ PERFORMANCE GOVERNOR & UNLOCK U74 PMU COUNTERS
-#    (1500 MHz on JH7110 VF2/Mars/OPi-RV; 1250 MHz on JH7110S VF2 Lite)
-# ==============================================================================
+# 5. Lock Max OPP Governor & Unlock SiFive U74 PMU Counters (kptr_restrict=1 default)
 MAX_KHZ="$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo "")"
 if [[ "$MAX_KHZ" =~ ^[0-9]+$ ]] && (( MAX_KHZ > 0 )); then
     MAX_MHZ_LABEL="$(( MAX_KHZ / 1000 )) MHz"
@@ -278,41 +185,8 @@ else
 fi
 
 rvdk_prog 92 "JH7110 BSP: locking ${MAX_MHZ_LABEL} governor & U74 PMU..."
-GOV_UNIT="/etc/systemd/system/jh7110-cpufreq-performance.service"
-GOV_UNIT_CONTENT='[Unit]
-Description=Lock StarFive JH7110/JH7110S SiFive U74 Harts to Performance Governor
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c "for g in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do [ -f \"$g\" ] && echo performance > \"$g\" || true; done"
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target'
-
-if [[ ! -f "$GOV_UNIT" ]] || [[ "$(cat "$GOV_UNIT")" != "$GOV_UNIT_CONTENT" ]]; then
-    echo "$GOV_UNIT_CONTENT" > "$GOV_UNIT"
-    systemctl daemon-reload
-    systemctl enable --now jh7110-cpufreq-performance.service >/dev/null
-    log_ok "Enabled persistent ${MAX_MHZ_LABEL} performance governor service ($GOV_UNIT)"
-else
-    systemctl start jh7110-cpufreq-performance.service 2>/dev/null || true
-    log_skip "U74 performance governor service (${MAX_MHZ_LABEL}) already active"
-fi
-
-PMU_SYSCTL="/etc/sysctl.d/90-starfive-u74-pmu.conf"
-PMU_CONTENT="# Unlock SiFive U74 hardware performance counters for Linux perf & PMU telemetry
-kernel.perf_event_paranoid = -1
-kernel.kptr_restrict = 0"
-
-if [[ ! -f "$PMU_SYSCTL" ]] || [[ "$(cat "$PMU_SYSCTL")" != "$PMU_CONTENT" ]]; then
-    echo "$PMU_CONTENT" > "$PMU_SYSCTL"
-    sysctl -p "$PMU_SYSCTL" >/dev/null 2>&1 || true
-    log_ok "Unlocked SiFive U74 PMU counters in $PMU_SYSCTL"
-else
-    log_skip "SiFive U74 PMU sysctls already configured"
-fi
+rvdk_bsp_lock_cpufreq_performance "jh7110" "Lock StarFive JH7110/JH7110S SiFive U74 Harts to Performance Governor"
+rvdk_bsp_unlock_pmu "/etc/sysctl.d/90-starfive-u74-pmu.conf" "SiFive U74" "$EXPOSE_KALLSYMS"
 
 rvdk_prog 100 "StarFive JH7110/JH7110S BSP hardening complete"
 log_info "StarFive JH7110/JH7110S (Debian) BSP bootstrap complete."

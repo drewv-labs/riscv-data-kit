@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "firefly/aibox-k3",
   "tag": "aiboxk3",
   "name": "Firefly AIBOX-K3 (SpacemiT K3)",

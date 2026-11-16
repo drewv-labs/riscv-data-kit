@@ -11,6 +11,11 @@
 #                               can skip redundant updates on subsequent modules.
 # ==============================================================================
 
+if [[ "${_RVDK_APT_SOURCED:-0}" == "1" ]]; then
+    return 0 2>/dev/null || true
+fi
+_RVDK_APT_SOURCED="1"
+
 rvdk_apt_has_lists() {
     compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1 || \
     compgen -G "/var/lib/apt/lists/*InRelease" >/dev/null 2>&1

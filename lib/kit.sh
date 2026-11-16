@@ -6,12 +6,49 @@
 # Description:
 #   Resolves the hardware & OS "Kit" identity (Board, SoC, OS, Primary NIC,
 #   CPU Hart Count, Factory Default User) once and caches it system-wide at
-#   `/etc/rvdk/kit.env` (0644) so all subsequent RVDK and downstream operations
-#   read directly from cache in <1ms without re-probing sysfs/device-tree.
+#   `/etc/rvdk/kit.env` (0644) using safe non-executing key-value I/O so all
+#   subsequent RVDK operations load from cache in <1ms without re-probing sysfs.
 # ==============================================================================
 
 RVDK_KIT_CACHE_FILE="${RVDK_KIT_CACHE_FILE:-/etc/rvdk/kit.env}"
 RVDK_KIT_SCHEMA_VERSION="1"
+
+_RVDK_KIT_ALLOWED_KEYS=" RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS "
+
+# Safe non-executing parser for /etc/rvdk/kit.env (never invokes `source`)
+_rvdk_kit_read_cache() {
+    local cache_file="$1"
+    [[ -r "$cache_file" ]] || return 1
+    local raw_line line key val
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        line="${raw_line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        val="${line#*=}"
+        [[ "$key" =~ ^RVDK_[A-Z0-9_]+$ ]] || continue
+        [[ "$_RVDK_KIT_ALLOWED_KEYS" == *" ${key} "* ]] || continue
+        if [[ ${#val} -ge 2 && "${val:0:1}" == '"' && "${val:$(( ${#val} - 1 )):1}" == '"' ]]; then
+            val="${val:1:$(( ${#val} - 2 ))}"
+            val="${val//\\\"/\"}"
+            val="${val//\\\$/\$}"
+            val="${val//\\\`/\`}"
+            val="${val//\\\\/\\}"
+        fi
+        printf -v "$key" '%s' "$val"
+    done < "$cache_file"
+}
+
+_rvdk_kit_escape_val() {
+    local v="${1:-}"
+    v="${v//$'\n'/ }"
+    v="${v//$'\r'/}"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//\$/\\\$}"
+    v="${v//\`/\\\`}"
+    printf '%s' "$v"
+}
 
 # Map a Device Tree model string -> "SOC|BOARD|BOARD_TAG|FACTORY_USER"
 _rvdk_infer_from_dt_model() {
@@ -170,10 +207,9 @@ rvdk_kit_resolve() {
         return 0
     fi
 
-    # <1ms disk fast-path: load cached /etc/rvdk/kit.env when present and no overrides/refresh requested
+    # <1ms disk fast-path: parse cached /etc/rvdk/kit.env safely without `source`
     if [[ "$force_refresh" == "false" && "$has_override" == "false" && -r "$RVDK_KIT_CACHE_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$RVDK_KIT_CACHE_FILE"
+        _rvdk_kit_read_cache "$RVDK_KIT_CACHE_FILE" || true
         if [[ "${RVDK_KIT_SCHEMA:-}" == "$RVDK_KIT_SCHEMA_VERSION" && -n "${RVDK_SOC:-}" && -n "${RVDK_OS_ID:-}" ]]; then
             export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS
             export RVDK_KIT_SOURCE="cache"
@@ -234,6 +270,10 @@ rvdk_kit_resolve() {
         esac
     fi
 
+    # Reject malformed CLI overrides before persisting
+    [[ -z "$soc"   || "$soc"   =~ ^[a-z0-9_-]+/[a-z0-9._-]+$ ]] || soc=""
+    [[ -z "$board" || "$board" =~ ^[a-z0-9_-]+/[a-z0-9._-]+$ ]] || board=""
+
     local os_id="${cli_os:-}"
     local os_ver=""
     local os_like=""
@@ -289,30 +329,30 @@ rvdk_kit_resolve() {
 
     export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS RVDK_KIT_SOURCE
 
-    # Persist system-wide cache on Linux target nodes when running as root without ephemeral CLI overrides
-    if [[ "$(uname -s)" == "Linux" && $EUID -eq 0 && -n "$RVDK_SOC" ]] && [[ "$has_override" == "false" || "$force_refresh" == "true" ]]; then
+    # Persist system-wide cache on Linux target nodes using escaped non-executing serialization
+    if [[ "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 && -n "$RVDK_SOC" ]] && [[ "$has_override" == "false" || "$force_refresh" == "true" ]]; then
         local cache_dir
         cache_dir="$(dirname "$RVDK_KIT_CACHE_FILE")"
         mkdir -p "$cache_dir"
         chmod 0755 "$cache_dir"
         local tmp_kit="${RVDK_KIT_CACHE_FILE}.tmp.$$"
-        cat <<EOF > "$tmp_kit"
-# ==============================================================================
-# DREW-V Labs // RVDK Kit Hardware & OS Cache (${RVDK_KIT_CACHE_FILE})
-# Auto-generated once by lib/kit.sh. Refresh anytime via: sudo rvdk kit --refresh
-# ==============================================================================
-RVDK_KIT_SCHEMA="${RVDK_KIT_SCHEMA}"
-RVDK_DT_MODEL="${RVDK_DT_MODEL}"
-RVDK_SOC="${RVDK_SOC}"
-RVDK_SOC_SLUG="${RVDK_SOC_SLUG}"
-RVDK_BOARD="${RVDK_BOARD}"
-RVDK_BOARD_TAG="${RVDK_BOARD_TAG}"
-RVDK_FACTORY_USER="${RVDK_FACTORY_USER}"
-RVDK_OS_ID="${RVDK_OS_ID}"
-RVDK_OS_VERSION_ID="${RVDK_OS_VERSION_ID}"
-RVDK_PRIMARY_NIC="${RVDK_PRIMARY_NIC}"
-RVDK_CPU_HARTS="${RVDK_CPU_HARTS}"
-EOF
+        {
+            printf '# ==============================================================================\n'
+            printf '# DREW-V Labs // RVDK Kit Hardware & OS Cache (%s)\n' "$RVDK_KIT_CACHE_FILE"
+            printf '# Auto-generated once by lib/kit.sh. Refresh anytime via: sudo rvdk kit --refresh\n'
+            printf '# ==============================================================================\n'
+            printf 'RVDK_KIT_SCHEMA="%s"\n'    "$(_rvdk_kit_escape_val "$RVDK_KIT_SCHEMA")"
+            printf 'RVDK_DT_MODEL="%s"\n'      "$(_rvdk_kit_escape_val "$RVDK_DT_MODEL")"
+            printf 'RVDK_SOC="%s"\n'           "$(_rvdk_kit_escape_val "$RVDK_SOC")"
+            printf 'RVDK_SOC_SLUG="%s"\n'      "$(_rvdk_kit_escape_val "$RVDK_SOC_SLUG")"
+            printf 'RVDK_BOARD="%s"\n'         "$(_rvdk_kit_escape_val "$RVDK_BOARD")"
+            printf 'RVDK_BOARD_TAG="%s"\n'     "$(_rvdk_kit_escape_val "$RVDK_BOARD_TAG")"
+            printf 'RVDK_FACTORY_USER="%s"\n'  "$(_rvdk_kit_escape_val "$RVDK_FACTORY_USER")"
+            printf 'RVDK_OS_ID="%s"\n'         "$(_rvdk_kit_escape_val "$RVDK_OS_ID")"
+            printf 'RVDK_OS_VERSION_ID="%s"\n' "$(_rvdk_kit_escape_val "$RVDK_OS_VERSION_ID")"
+            printf 'RVDK_PRIMARY_NIC="%s"\n'   "$(_rvdk_kit_escape_val "$RVDK_PRIMARY_NIC")"
+            printf 'RVDK_CPU_HARTS="%s"\n'     "$(_rvdk_kit_escape_val "$RVDK_CPU_HARTS")"
+        } > "$tmp_kit"
         chmod 0644 "$tmp_kit"
         mv -f "$tmp_kit" "$RVDK_KIT_CACHE_FILE"
     fi
@@ -341,19 +381,17 @@ rvdk_collect_deeptune_scripts() {
 }
 
 rvdk_kit_print_env() {
-    cat <<EOF
-RVDK_KIT_SCHEMA="${RVDK_KIT_SCHEMA:-}"
-RVDK_DT_MODEL="${RVDK_DT_MODEL:-}"
-RVDK_SOC="${RVDK_SOC:-}"
-RVDK_SOC_SLUG="${RVDK_SOC_SLUG:-}"
-RVDK_BOARD="${RVDK_BOARD:-}"
-RVDK_BOARD_TAG="${RVDK_BOARD_TAG:-}"
-RVDK_FACTORY_USER="${RVDK_FACTORY_USER:-}"
-RVDK_OS_ID="${RVDK_OS_ID:-}"
-RVDK_OS_VERSION_ID="${RVDK_OS_VERSION_ID:-}"
-RVDK_PRIMARY_NIC="${RVDK_PRIMARY_NIC:-}"
-RVDK_CPU_HARTS="${RVDK_CPU_HARTS:-}"
-EOF
+    printf 'RVDK_KIT_SCHEMA=%q\n'    "${RVDK_KIT_SCHEMA:-}"
+    printf 'RVDK_DT_MODEL=%q\n'      "${RVDK_DT_MODEL:-}"
+    printf 'RVDK_SOC=%q\n'           "${RVDK_SOC:-}"
+    printf 'RVDK_SOC_SLUG=%q\n'      "${RVDK_SOC_SLUG:-}"
+    printf 'RVDK_BOARD=%q\n'         "${RVDK_BOARD:-}"
+    printf 'RVDK_BOARD_TAG=%q\n'     "${RVDK_BOARD_TAG:-}"
+    printf 'RVDK_FACTORY_USER=%q\n'  "${RVDK_FACTORY_USER:-}"
+    printf 'RVDK_OS_ID=%q\n'         "${RVDK_OS_ID:-}"
+    printf 'RVDK_OS_VERSION_ID=%q\n' "${RVDK_OS_VERSION_ID:-}"
+    printf 'RVDK_PRIMARY_NIC=%q\n'   "${RVDK_PRIMARY_NIC:-}"
+    printf 'RVDK_CPU_HARTS=%q\n'     "${RVDK_CPU_HARTS:-}"
 }
 
 rvdk_kit_print_summary() {
@@ -367,7 +405,7 @@ rvdk_kit_print_summary() {
     local s rel
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
-        rel="${s#${repo_root}/}"
+        rel="${s#"${repo_root}/"}"
         if [[ -z "$chain_str" ]]; then
             chain_str="$rel"
         else

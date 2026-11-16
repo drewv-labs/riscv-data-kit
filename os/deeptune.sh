@@ -6,6 +6,8 @@
 # Description:
 #   Silicon- and board-agnostic headless Linux OS deep-tuning across Debian,
 #   Ubuntu, Bianbu, and OpenWrt RISC-V nodes:
+#     • Configures persistent bounded `systemd-journald` (`Storage=persistent`,
+#       `SystemMaxUse=256M`) BEFORE retiring `rsyslog` so boot/SSH logs survive reboot
 #     • Silences periodic background polling (`smartd` & `sysstat` timers) while
 #       preserving on-demand diagnostic CLIs (`smartctl`, `iostat`, `mpstat`, `pidstat`)
 #     • Masks OS/desktop/filesystem background jitter timers (`fwupd-refresh`,
@@ -18,25 +20,47 @@
 #     • Unloads & blacklists universal non-server kernel modules (`cfg80211`,
 #       `joydev`, `input_leds`, `apple_mfi_fastcharge`, `dm_multipath`, `nvme_fabrics`)
 #     • Applies reversible Transparent HugePages policy (`--tune data` -> `never`,
-#       `--tune ai` -> `madvise`), bounded `journald` cap (`256M`), and
-#       headless scheduler/VM sysctls (`kernel.sched_autogroup_enabled = 0`)
+#       `--tune ai` -> `madvise`) and headless scheduler/VM sysctls
 # ==============================================================================
 set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
-log_info() { printf "\033[1;36m[RVDK:OS-DEEPTUNE]\033[0m %s\n" "$1"; }
-log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip() { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
-if [[ $EUID -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
-        exec sudo -E bash "$0" "$@"
+# @RVDK_INLINE_LIBS: common progbar
+if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/common.sh" ]]; then
+    # shellcheck source=lib/common.sh
+    source "${REPO_ROOT}/lib/common.sh"
+else
+    log_info()  { printf "\033[1;36m[RVDK:OS-DEEPTUNE]\033[0m %s\n" "$1"; }
+    log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+    log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+    log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+    log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+    rvdk_log_init() { :; }
+fi
+if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/progbar.sh" ]]; then
+    # shellcheck source=lib/progbar.sh
+    source "${REPO_ROOT}/lib/progbar.sh"
+else
+    rvdk_prog_init() { :; }
+    rvdk_prog()      { :; }
+fi
+
+rvdk_log_init "RVDK:OS-DEEPTUNE"
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
+        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
     else
-        echo "[RVDK:FATAL] Run as root." >&2
-        exit 1
+        log_fatal "Run as root."
     fi
 fi
 
@@ -58,27 +82,14 @@ case "$TUNE_REQUEST" in
     *)                     TUNE_MODE="data"; TUNE_LABEL="data" ;;
 esac
 
-_SCRIPT_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
-REPO_ROOT=""
-[[ -n "$_SCRIPT_DIR" ]] && REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
-
 if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/kit.sh" ]]; then
     # shellcheck disable=SC1091
     source "${REPO_ROOT}/lib/kit.sh"
     rvdk_kit_resolve
 fi
 
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-[[ -z "$_PROGBAR_CANDIDATE" && -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${REPO_ROOT}/lib/progbar.sh"
-if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
-    # shellcheck disable=SC1090
-    source "$_PROGBAR_CANDIDATE"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
+if [[ -z "${RVDK_PRIMARY_NIC:-}" ]] && command -v ip >/dev/null 2>&1; then
+    RVDK_PRIMARY_NIC="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}' || true)"
 fi
 
 rvdk_prog_init "OS DeepTune (--tune ${TUNE_LABEL}): inspecting services & timers..."
@@ -136,6 +147,32 @@ EOF
     exit 0
 fi
 
+# ==============================================================================
+# 0. ENSURE PERSISTENT SYSTEMD-JOURNALD BEFORE RETIRING RSYSLOG
+# ==============================================================================
+rvdk_prog 8 "OS DeepTune: persisting bounded systemd-journald (256M)..."
+mkdir -p /etc/systemd/journald.conf.d /var/log/journal
+chmod 0755 /etc/systemd/journald.conf.d
+systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+
+JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-rvdk-deeptune.conf"
+WANT_JOURNALD="[Journal]
+Storage=persistent
+SystemMaxUse=256M
+RuntimeMaxUse=64M
+ForwardToSyslog=no
+ForwardToWall=no"
+
+if ! printf "%s\n" "$WANT_JOURNALD" | cmp -s - "$JOURNALD_DROPIN" 2>/dev/null; then
+    printf "%s\n" "$WANT_JOURNALD" > "$JOURNALD_DROPIN"
+    systemctl restart systemd-journald.service 2>/dev/null || true
+    journalctl --flush >/dev/null 2>&1 || true
+    journalctl --vacuum-size=256M >/dev/null 2>&1 || true
+    log_ok "Configured persistent bounded systemd-journald (Storage=persistent, 256M max)"
+else
+    log_skip "Persistent systemd-journald cap already configured"
+fi
+
 mask_units_quiet() {
     local units=("$@")
     local to_stop=()
@@ -164,7 +201,7 @@ mask_units_quiet() {
 # ==============================================================================
 # 1. SILENCE BACKGROUND POLLING DAEMONS & JITTER TIMERS (KEEPING CLI TOOLS)
 # ==============================================================================
-rvdk_prog 15 "OS DeepTune: masking background jitter timers & bloat daemons..."
+rvdk_prog 20 "OS DeepTune: masking background jitter timers & bloat daemons..."
 
 CLI_BG_UNITS=(
     smartmontools.service
@@ -254,7 +291,7 @@ fi
 # ==============================================================================
 # 2. LOCK DOWN PER-SSH `systemd --user` AUDIO & KEYRING SPAWNERS
 # ==============================================================================
-rvdk_prog 35 "OS DeepTune: masking user-session PipeWire & GNOME Keyring units..."
+rvdk_prog 40 "OS DeepTune: masking user-session PipeWire & GNOME Keyring units..."
 mkdir -p /etc/systemd/user && chmod 0755 /etc/systemd/user
 USER_MASK_UNITS=(
     pipewire.service
@@ -293,7 +330,7 @@ fi
 # ==============================================================================
 # 3. PURGE WORKSTATION, PRINTER, AUDIO & SAN BLOAT PACKAGES
 # ==============================================================================
-rvdk_prog 55 "OS DeepTune: purging workstation, printer & SAN bloat packages..."
+rvdk_prog 60 "OS DeepTune: purging workstation, printer & SAN bloat packages..."
 CANDIDATE_PURGE_PKGS=(
     firefox
     firefox-esr
@@ -361,7 +398,7 @@ fi
 # ==============================================================================
 # 4. BLACKLIST & UNLOAD UNIVERSAL NON-SERVER KERNEL MODULES
 # ==============================================================================
-rvdk_prog 75 "OS DeepTune: blacklisting universal non-server kernel modules..."
+rvdk_prog 78 "OS DeepTune: blacklisting universal non-server kernel modules..."
 OS_BLACKLIST_MODS=(
     joydev
     input_leds
@@ -398,9 +435,9 @@ done
 [[ ${#UNLOADED_OS_MODS[@]} -gt 0 ]] && log_ok "Unloaded live OS kernel modules: ${UNLOADED_OS_MODS[*]}"
 
 # ==============================================================================
-# 5. REVERSIBLE TRANSPARENT HUGEPAGES, JOURNALD CAP & HEADLESS SYSCTLS
+# 5. REVERSIBLE TRANSPARENT HUGEPAGES & HEADLESS SYSCTLS
 # ==============================================================================
-rvdk_prog 90 "OS DeepTune: applying THP (${TUNE_LABEL}), journald cap & scheduler sysctls..."
+rvdk_prog 92 "OS DeepTune: applying THP (${TUNE_LABEL}) & scheduler sysctls..."
 
 if [[ "$TUNE_MODE" == "data" ]]; then
     THP_MODE="never"
@@ -408,7 +445,6 @@ else
     THP_MODE="madvise"
 fi
 
-# Migrate legacy unit name if present
 if [[ -f /etc/systemd/system/eic7700x-thp-tune.service ]]; then
     systemctl disable eic7700x-thp-tune.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/eic7700x-thp-tune.service
@@ -440,23 +476,6 @@ if [[ -d /sys/kernel/mm/transparent_hugepage ]]; then
         done
         log_skip "Transparent HugePages policy already converged at '${THP_MODE}'"
     fi
-fi
-
-mkdir -p /etc/systemd/journald.conf.d && chmod 0755 /etc/systemd/journald.conf.d
-JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-rvdk-deeptune.conf"
-WANT_JOURNALD="[Journal]
-SystemMaxUse=256M
-RuntimeMaxUse=64M
-ForwardToSyslog=no
-ForwardToWall=no"
-
-if ! printf "%s\n" "$WANT_JOURNALD" | cmp -s - "$JOURNALD_DROPIN" 2>/dev/null; then
-    printf "%s\n" "$WANT_JOURNALD" > "$JOURNALD_DROPIN"
-    systemctl restart systemd-journald.service 2>/dev/null || true
-    journalctl --vacuum-size=256M >/dev/null 2>&1 || true
-    log_ok "Configured bounded systemd-journald cap (256M max, ForwardToSyslog=no)"
-else
-    log_skip "systemd-journald cap already configured"
 fi
 
 DEEPTUNE_SYSCTL="/etc/sysctl.d/95-rvdk-deeptune.conf"

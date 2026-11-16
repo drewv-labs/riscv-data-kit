@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "milkv/mars",
   "tag": "mars",
   "name": "Milk-V Mars (JH7110)",

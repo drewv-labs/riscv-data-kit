@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "milkv/jupiter",
   "tag": "jptr1",
   "name": "Milk-V Jupiter (M1/K1)",

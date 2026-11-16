@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "bananapi/f3",
   "tag": "bpif3",
   "name": "Banana Pi BPI-F3 (SpacemiT K1)",

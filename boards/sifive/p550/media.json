@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "sifive/p550",
   "tag": "p550",
   "name": "SiFive HiFive Premier P550",
@@ -6,11 +7,25 @@
   "default_os": "ubuntu-24.04",
   "media": {
     "usb": {
+      "mode": "uboot_ext4",
       "script": "flash-usb.sh",
       "description": "U-Boot ext4 recovery USB stick for eMMC installation (es_fs write usb 0 -> mmc 0)",
       "image": "sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst",
+      "fallback_url": "https://github.com/sifiveinc/hifive-premier-p550-ubuntu/releases/download/2025.11.00/ubuntu-24.04-preinstalled-server-riscv64.img.xz",
       "uboot_payload": "ubuntu-24.04-preinstalled-server-riscv64.img",
-      "min_size_gib": 8
+      "fs_label": "P550_RECOVERY",
+      "min_size_gib": 8,
+      "post_flash_notes": [
+        "======================================================================",
+        " U-Boot eMMC Recovery Procedure (115200 8N1 on /dev/ttyUSB2):",
+        "   1. Unplug USB JBOD enclosures so recovery stick enumerates as usb 0",
+        "   2. Halt autoboot in U-Boot and run:",
+        "      => usb reset",
+        "      => ls usb 0",
+        "      => es_fs write usb 0 ubuntu-24.04-preinstalled-server-riscv64.img mmc 0",
+        "      => reset",
+        "======================================================================"
+      ]
     }
   },
   "quirks": [

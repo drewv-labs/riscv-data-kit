@@ -4,12 +4,12 @@
 # Path: riscv-data-kit/bootstrap.sh
 #
 # Usage (One-Shot Curl Day-0 OS + BSP Bootstrapper + CLI Install):
-#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user drew --hostname rv-node --nopasswd [--deeptune] [--tune data|ai] [--with-tailscale]
+#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-node --nopasswd [--deeptune] [--tune data|ai] [--with-tailscale]
 #
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
 #   sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update] [--deeptune] [--tune data|ai] [--no-apt-update] [--with-tailscale] [--noprogbar]
 #   rvdk kit [status|--refresh|--env]
-#   sudo rvdk storage [status|grow-psql|grow-nfs|shrink-nfs|autotune] [--gb <N>|--mb <N>]
+#   sudo rvdk storage [status|grow|shrink|autotune] [--lv <name>] [--gb <N>|--mb <N>]
 #   sudo rvdk quirk <name|list> [off|on|toggle|status]
 #   rvdk flash <board> <medium> <disk_or_flags...>
 # ==============================================================================
@@ -77,7 +77,7 @@ if [[ "$NEED_ROOT" == "true" && $EUID -ne 0 ]]; then
     fi
 fi
 
-# Sanitize SSH-forwarded LC_* (e.g. ZedBook / macOS SendEnv) before en_US.UTF-8 exists on target
+# Sanitize SSH-forwarded LC_* environment variables before target locales are generated
 if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
     export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
 elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
@@ -87,16 +87,27 @@ else
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+if [[ ! "$REAL_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    REAL_USER="root"
+fi
 REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
+REAL_HOME=""
 if command -v getent >/dev/null 2>&1; then
     REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
 elif command -v dscl >/dev/null 2>&1; then
     REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
-else
-    REAL_HOME=""
 fi
-[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}" 2>/dev/null || true)"
-[[ -z "$REAL_HOME" || "$REAL_HOME" == "~"* ]] && REAL_HOME="/root"
+if [[ -z "$REAL_HOME" ]]; then
+    if [[ "$REAL_USER" == "root" ]]; then
+        REAL_HOME="/root"
+    elif [[ -d "/Users/${REAL_USER}" ]]; then
+        REAL_HOME="/Users/${REAL_USER}"
+    elif [[ -d "/home/${REAL_USER}" ]]; then
+        REAL_HOME="/home/${REAL_USER}"
+    else
+        REAL_HOME="/root"
+    fi
+fi
 
 ENGINE_DIR="${REAL_HOME}/.rvdk/engine"
 RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
@@ -109,7 +120,7 @@ print_cli_help() {
 Usage:
   sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update] [flags]
   rvdk kit [status|--refresh|--env]
-  sudo rvdk storage [status|grow-psql|grow-nfs|shrink-nfs|autotune] [--gb <N>|--mb <N>]
+  sudo rvdk storage [status|grow|shrink|autotune] [--lv <name>] [--gb <N>|--mb <N>]
   sudo rvdk quirk <name|list> [toggle|off|on|status] [--ephemeral|--persist]
   rvdk flash <board> <medium> <disk_or_flags...>
   rvdk flash list
@@ -117,11 +128,11 @@ Usage:
 Core Commands:
   day0                     Run full Day-0 (OS normalization + Silicon BSP) forge (default)
   bsp                      Run Silicon BSP hardening (`bsp/<vendor>/<soc>/`)
-  os                       Run OS normalization & OpenSSH CVE guard (`os/`)
+  os                       Run OS normalization & Kernel CVE-2026-98432 / MPTCP guard (`os/`)
   deeptune [--tune <t>]    Run multi-layer headless DeepTune (`os` -> `bsp` -> `boards`)
                            Tunes: `data` (default) | `ai`, or `rvdk deeptune status`
   kit [status|--refresh]   Inspect or refresh cached hardware/OS Kit (`/etc/rvdk/kit.env`)
-  storage <subcmd> [...]   Live LVM capacity manager (`status`, `grow-psql`, `grow-nfs`, `shrink-nfs`, `autotune`)
+  storage <subcmd> [...]   Live LVM capacity manager (`status`, `grow`, `shrink`, `autotune`)
   quirk <name|list> [...]  Toggle board-specific hardware quirks (`boards/<board>/quirks/`)
   flash <board> <medium>   Flash removable media on macOS/Linux (e.g. `rvdk flash p550 usb 4`)
   postgresql               Install or build PostgreSQL 18.6 (`--force-build` to compile)
@@ -185,9 +196,13 @@ else
     LOCAL_ROOT="$ENGINE_DIR"
 fi
 
-# Load Kit Inference & Cache Library
+# Load Core Runtime & Kit Inference Libraries
+if [[ -f "${LOCAL_ROOT}/lib/common.sh" ]]; then
+    # shellcheck source=lib/common.sh
+    source "${LOCAL_ROOT}/lib/common.sh"
+fi
 if [[ -f "${LOCAL_ROOT}/lib/kit.sh" ]]; then
-    # shellcheck disable=SC1091
+    # shellcheck source=lib/kit.sh
     source "${LOCAL_ROOT}/lib/kit.sh"
 else
     log_fatal "Missing RVDK Kit library: ${LOCAL_ROOT}/lib/kit.sh"
@@ -197,73 +212,15 @@ fi
 # 2. Early Subcommands (`flash`, `kit`, `storage`, `quirk`, `utils/*`)
 # ==============================================================================
 
-# 2.1 `rvdk flash <board> <medium> [disk_or_flags...]` (Host macOS/Linux Media Flashers)
+# 2.1 `rvdk flash [list | <board> <medium> <disk_or_flags...>]` (Host macOS/Linux Media Flashers)
 if [[ "${1:-}" == "flash" ]]; then
     shift
-    print_flash_targets() {
-        printf "\033[1;36m[RVDK:FLASH]\033[0m Available Board Media Flashers:\n"
-        local f rel b_path b_short m_name
-        for f in "${LOCAL_ROOT}"/boards/*/*/flash-*.sh; do
-            [[ -f "$f" ]] || continue
-            rel="${f#${LOCAL_ROOT}/boards/}"
-            b_path="${rel%/flash-*.sh}"
-            b_short="${b_path##*/}"
-            m_name="$(basename "$f" .sh)"
-            m_name="${m_name#flash-}"
-            printf "  • rvdk flash %-10s %-6s <disk>   (%s)\n" "$b_short" "$m_name" "boards/${rel}"
-        done
-    }
-
-    if [[ $# -eq 0 || "${1:-}" == "list" || "${1:-}" == "--list" ]]; then
-        print_flash_targets
-        exit 0
+    FLASH_LIB="${LOCAL_ROOT}/lib/flash.sh"
+    [[ ! -f "$FLASH_LIB" ]] && log_fatal "Flash library not found: ${FLASH_LIB}"
+    if [[ $# -eq 0 ]]; then
+        exec bash "$FLASH_LIB" list
     fi
-    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-        cat <<'EOF'
-Usage:
-  rvdk flash <board> <medium> <disk_number_or_path> [--image /path/to/img] [--yes] [--force]
-  rvdk flash list
-
-Examples:
-  rvdk flash p550 usb 4
-  rvdk flash vf2 sd 4
-  rvdk flash p550 usb --device /dev/sdX --image ~/custom.img.zst
-EOF
-        print_flash_targets
-        exit 0
-    fi
-
-    FLASH_BOARD_QUERY="$1"
-    shift
-    FLASH_BOARD_DIR="$(rvdk_resolve_board_dir "$LOCAL_ROOT" "$FLASH_BOARD_QUERY" || true)"
-    if [[ -z "$FLASH_BOARD_DIR" ]]; then
-        print_flash_targets >&2
-        log_fatal "Unknown board '${FLASH_BOARD_QUERY}'. Run 'rvdk flash list' to see supported boards."
-    fi
-
-    avail_media=()
-    for mf in "${FLASH_BOARD_DIR}"/flash-*.sh; do
-        [[ -f "$mf" ]] || continue
-        mn="$(basename "$mf" .sh)"
-        avail_media+=("${mn#flash-}")
-    done
-
-    if [[ $# -eq 0 || "${1:-}" == "list" || "${1:-}" == "--list" ]]; then
-        log_rvdk "Board ${FLASH_BOARD_DIR#${LOCAL_ROOT}/boards/} media targets: ${avail_media[*]:-none}"
-        log_fatal "Missing medium type. Usage: rvdk flash ${FLASH_BOARD_QUERY} <medium> <disk>"
-    fi
-
-    FLASH_MEDIUM="$(tr '[:upper:]' '[:lower:]' <<< "$1")"
-    FLASH_MEDIUM="${FLASH_MEDIUM#flash-}"
-    FLASH_MEDIUM="${FLASH_MEDIUM%.sh}"
-    shift
-
-    FLASH_SCRIPT="${FLASH_BOARD_DIR}/flash-${FLASH_MEDIUM}.sh"
-    if [[ ! -f "$FLASH_SCRIPT" ]]; then
-        log_fatal "Unsupported medium '${FLASH_MEDIUM}' for '${FLASH_BOARD_QUERY}' (available: ${avail_media[*]:-none}). Usage: rvdk flash ${FLASH_BOARD_QUERY} <medium> <disk>"
-    fi
-
-    exec bash "$FLASH_SCRIPT" "$@"
+    exec bash "$FLASH_LIB" "$@"
 fi
 
 # 2.2 `rvdk kit [status|--refresh|--env]`
@@ -282,7 +239,7 @@ if [[ "${1:-}" == "kit" ]]; then
 Usage:
   rvdk kit [status]          Show resolved Board, SoC, OS, NIC, DeepTune chain & Quirks
   sudo rvdk kit --refresh    Re-probe hardware/OS and update /etc/rvdk/kit.env
-  rvdk kit --env             Print shell-sourceable RVDK_KIT_* variables
+  rvdk kit --env             Print shell-escaped RVDK_KIT_* variables
 EOF
                 exit 0
                 ;;
@@ -298,7 +255,7 @@ EOF
     exit 0
 fi
 
-# 2.3 `rvdk storage [status|grow-psql|grow-nfs|shrink-nfs|autotune]`
+# 2.3 `rvdk storage [status|grow|shrink|autotune]`
 if [[ "${1:-}" == "storage" ]]; then
     shift
     STORAGE_SCRIPT="${LOCAL_ROOT}/utils/storage.sh"
@@ -372,6 +329,9 @@ EOF
     [[ -z "${RVDK_BOARD:-}" ]] && log_fatal "Could not auto-detect board from Kit cache or Device Tree. Pass --board <board> (e.g., --board p550)."
 
     QUIRK_NAME="${QUIRK_REST[0]%.sh}"
+    if [[ ! "$QUIRK_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        log_fatal "Invalid quirk identifier: '${QUIRK_NAME}'."
+    fi
     QUIRK_ARGS=("${QUIRK_REST[@]:1}")
     QUIRK_SCRIPT="${LOCAL_ROOT}/boards/${RVDK_BOARD}/quirks/${QUIRK_NAME}.sh"
     if [[ ! -f "$QUIRK_SCRIPT" ]]; then
@@ -482,6 +442,9 @@ done
 
 # Dispatch `utils/*` early (e.g. `sudo rvdk utils/purge-user.sh <user>`)
 if [[ "$MODULE" == utils/* ]]; then
+    if [[ "$MODULE" == *".."* ]]; then
+        log_fatal "Invalid utility path: ${MODULE}"
+    fi
     TARGET_UTIL="${LOCAL_ROOT}/${MODULE%.sh}.sh"
     [[ ! -f "$TARGET_UTIL" ]] && log_fatal "Utility script not found: ${TARGET_UTIL}"
     exec bash "$TARGET_UTIL" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
@@ -513,7 +476,13 @@ read_saved_tune() {
         sf="$LEGACY_DEEPTUNE_STATE"
     fi
     if [[ -n "$sf" ]]; then
-        awk -F= '/^RVDK_TUNE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' "$sf" 2>/dev/null || true
+        local RVDK_TUNE=""
+        if declare -F rvdk_kv_load >/dev/null 2>&1; then
+            rvdk_kv_load "$sf" RVDK_TUNE
+            printf '%s\n' "$RVDK_TUNE"
+        else
+            awk -F= '/^RVDK_TUNE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' "$sf" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -570,6 +539,7 @@ log_rvdk "Kit: board=${BOARD_PATH:-generic} | soc=${SOC_PATH} | os=${OS_ID} (${R
 # (excludes bootstrap.sh symlinks to prevent recursion)
 resolve_os_script() {
     local base_dir="$1"
+    local candidate
     for candidate in \
         "${base_dir}/bootstrap-${OS_ID}.sh" \
         "${base_dir}/forge-${OS_ID}.sh" \
@@ -591,11 +561,11 @@ run_kit_deeptune() {
     local prev_tune
     prev_tune="$(read_saved_tune)"
     local raw_tune="${DEEPTUNE_TUNE:-${prev_tune:-data}}"
-    raw_tune="$(tr '[:upper:]' '[:lower:]' <<< "$raw_tune")"
+    raw_tune="$(printf '%s' "$raw_tune" | tr '[:upper:]' '[:lower:]')"
 
     local tune_mode tune_label
     case "$raw_tune" in
-        data)               tune_mode="data"; tune_label="data" ;;
+        data)                  tune_mode="data"; tune_label="data" ;;
         ai|ml|edge-ai|edge-ml) tune_mode="ai"; tune_label="ai" ;;
         *) log_fatal "Invalid --tune '${raw_tune}' (expected: data | ai)" ;;
     esac
@@ -638,19 +608,15 @@ run_kit_deeptune() {
         idx=$((idx + 1))
     done
 
-    mkdir -p /etc/rvdk && chmod 0755 /etc/rvdk
     local layers_joined
     layers_joined="$(IFS=','; echo "${rel_layers[*]}")"
-    cat <<EOF > "$DEEPTUNE_STATE_FILE"
-# Managed by RVDK (rvdk deeptune)
-RVDK_TUNE="${tune_label}"
-RVDK_TUNE_MODE="${tune_mode}"
-RVDK_SOC="${SOC_PATH}"
-RVDK_BOARD="${BOARD_PATH}"
-RVDK_OS_ID="${OS_ID}"
-RVDK_DEEPTUNE_LAYERS="${layers_joined}"
-EOF
-    chmod 0644 "$DEEPTUNE_STATE_FILE"
+    rvdk_kv_write "$DEEPTUNE_STATE_FILE" 0644 "Managed by RVDK (rvdk deeptune)" \
+        "RVDK_TUNE=${tune_label}" \
+        "RVDK_TUNE_MODE=${tune_mode}" \
+        "RVDK_SOC=${SOC_PATH}" \
+        "RVDK_BOARD=${BOARD_PATH}" \
+        "RVDK_OS_ID=${OS_ID}" \
+        "RVDK_DEEPTUNE_LAYERS=${layers_joined}"
     rm -f "$LEGACY_DEEPTUNE_STATE" 2>/dev/null || true
 }
 
@@ -749,6 +715,9 @@ case "$MODULE" in
         rvdk_prog 100 "PostgreSQL 18.6 converged"
         ;;
     *)
+        if [[ "$MODULE" == *".."* ]]; then
+            log_fatal "Invalid module path: ${MODULE}"
+        fi
         TARGET_MOD="${LOCAL_ROOT}/${MODULE}/forge.sh"
         [[ ! -f "$TARGET_MOD" ]] && log_fatal "Module script not found: ${TARGET_MOD}"
         if [[ "$MODULE" == "mods/tailscale" && -n "$TS_AUTHKEY_CLI" ]]; then

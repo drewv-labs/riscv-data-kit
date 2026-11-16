@@ -20,7 +20,7 @@ fi
 
 SCRIPT_SELF="${BASH_SOURCE[0]:-}"
 if [[ $EUID -ne 0 ]]; then
-    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
+    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
         exec sudo -E bash "$SCRIPT_SELF" "$@"
     else
         echo "[RVDK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash" >&2
@@ -28,7 +28,7 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-# Sanitize SSH-forwarded LC_* (e.g. ZedBook / macOS SendEnv) before en_US.UTF-8 exists on target
+# Sanitize SSH-forwarded LC_* environment variables before target locales exist
 if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
     export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
 elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
@@ -38,17 +38,28 @@ else
 fi
 
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+if [[ ! "$REAL_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    REAL_USER="root"
+fi
 REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
 
+REAL_HOME=""
 if command -v getent >/dev/null 2>&1; then
     REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
 elif command -v dscl >/dev/null 2>&1; then
     REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
-else
-    REAL_HOME=""
 fi
-[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}" 2>/dev/null || true)"
-[[ -z "$REAL_HOME" || "$REAL_HOME" == "~"* ]] && REAL_HOME="/root"
+if [[ -z "$REAL_HOME" ]]; then
+    if [[ "$REAL_USER" == "root" ]]; then
+        REAL_HOME="/root"
+    elif [[ -d "/Users/${REAL_USER}" ]]; then
+        REAL_HOME="/Users/${REAL_USER}"
+    elif [[ -d "/home/${REAL_USER}" ]]; then
+        REAL_HOME="/home/${REAL_USER}"
+    else
+        REAL_HOME="/root"
+    fi
+fi
 
 RVDK_DIR="${REAL_HOME}/.rvdk"
 CACHE_DIR="${RVDK_DIR}/cache"
@@ -66,6 +77,10 @@ done
 log_info()  { printf "\033[1;36m[RVDK:CLI]\033[0m %s\n" "$1"; }
 log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+
+if [[ ! "$REPO_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+    log_fatal "Invalid RVDK_BRANCH name: '${REPO_BRANCH}'."
+fi
 
 run_as_real_user() {
     if [[ "$REAL_USER" == "root" ]] || ! command -v sudo >/dev/null 2>&1; then
@@ -85,7 +100,7 @@ if ! command -v bash >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! co
     if command -v apt-get >/dev/null 2>&1; then
         log_info "Installing bash, git, and curl prerequisites (APT)..."
         export DEBIAN_FRONTEND=noninteractive
-        apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
+        apt-get -o DPkg::Lock::Timeout=120 update -q || true
         apt-get -o DPkg::Lock::Timeout=120 install -y bash git ca-certificates curl
     elif command -v opkg >/dev/null 2>&1; then
         log_info "Installing bash, git-http, and curl prerequisites (OpenWrt opkg)..."
@@ -128,7 +143,7 @@ chmod +x \
 
 # Persist /etc/rvdk/kit.env cache on Linux target nodes right away if recognized
 if [[ "$(uname -s)" == "Linux" && -f "${ENGINE_DIR}/lib/kit.sh" ]]; then
-    # shellcheck disable=SC1091
+    # shellcheck source=lib/kit.sh
     source "${ENGINE_DIR}/lib/kit.sh"
     rvdk_kit_resolve --refresh || true
 fi
@@ -154,10 +169,10 @@ if [[ "$QUIET_MODE" == "false" ]]; then
     fi
 
     OS_PRETTY="Unknown"
-    if [[ -f /etc/os-release ]]; then
-        OS_PRETTY="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-Unknown}" || echo "Unknown")"
-    elif [[ -f /etc/openwrt_release ]]; then
-        OS_PRETTY="$(. /etc/openwrt_release 2>/dev/null && echo "${DISTRIB_DESCRIPTION:-OpenWrt}" || echo "OpenWrt")"
+    if [[ -r /etc/os-release ]]; then
+        OS_PRETTY="$(awk -F= '/^PRETTY_NAME=/ {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' /etc/os-release 2>/dev/null || echo "Unknown")"
+    elif [[ -r /etc/openwrt_release ]]; then
+        OS_PRETTY="$(awk -F= '/^DISTRIB_DESCRIPTION=/ {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' /etc/openwrt_release 2>/dev/null || echo "OpenWrt")"
     elif command -v sw_vers >/dev/null 2>&1; then
         OS_PRETTY="$(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null) ($(uname -m))"
     fi
@@ -174,7 +189,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    sudo rvdk                      # Run full Day-0 (OS + Silicon BSP) bootstrap
    rvdk kit                       # Inspect resolved Board/SoC/OS Kit cache
    sudo rvdk deeptune             # Multi-layer DeepTune (--tune data|ai)
-   sudo rvdk storage [status|...] # Live LVM elastic manager (grow-psql, grow-nfs, shrink-nfs, autotune)
+   sudo rvdk storage [status|...] # Live LVM elastic manager (grow, shrink, autotune)
    sudo rvdk quirk <name|list>    # Toggle board quirks (e.g. hdmi, fusb)
    rvdk flash <board> <medium>    # Flash board media (e.g. rvdk flash p550 usb 4)
    sudo rvdk bsp                  # Run Silicon BSP hardening only

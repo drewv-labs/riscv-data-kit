@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "milkv/megrez",
   "tag": "megrez",
   "name": "Milk-V Megrez (ESWIN EIC7700X)",

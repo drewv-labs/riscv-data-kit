@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "orangepi/rv",
   "tag": "opirv",
   "name": "Orange Pi RV (JH7110)",

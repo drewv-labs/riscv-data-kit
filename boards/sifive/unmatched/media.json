@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "board": "sifive/unmatched",
   "tag": "unmatched",
   "name": "SiFive HiFive Unmatched Rev B (FU740)",
