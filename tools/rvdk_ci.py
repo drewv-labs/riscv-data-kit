@@ -11,7 +11,8 @@ Modes:
          SoC BSP directory mappings, media flash scripts, and quirk scripts.
       2. Verifies every repository symlink resolves within the repository root.
       3. Runs `bash -n` syntax validation across all `.sh` scripts.
-      4. Scans repository files for downstream project bleed, PII/hostnames,
+      4. Runs `shellcheck -x -S warning` across all `.sh` scripts.
+      5. Scans repository files for downstream project bleed, PII/hostnames,
          and security anti-patterns (untrusted `.env` sourcing, `kptr_restrict=0`,
          unsigned HTTP APT repos, hardcoded `10.0.10.0/24`, etc.).
 
@@ -21,7 +22,8 @@ Modes:
       2. Expands `# @RVDK_WRAPPER_DISTRO:`, `# @RVDK_WRAPPER_FILE:`, and
          `# @RVDK_INLINE_LIBS:` directives so every `.sh` endpoint works 100%
          standalone via `curl -fsSL https://rvdk.drewv-labs.dev/<path>.sh | sudo bash`.
-      3. Verifies `bash -n` on every bundled `.sh` artifact in `<out_dir>`.
+      3. Verifies `bash -n` and `shellcheck -S warning` on every bundled `.sh`
+         artifact in `<out_dir>`.
 """
 
 from __future__ import annotations
@@ -219,16 +221,19 @@ def check_symlinks(repo_root: Path) -> list[str]:
     return errors
 
 
-def check_bash_syntax(root_dir: Path, label_root: Path) -> list[str]:
-    errors: list[str] = []
+def collect_sh_files(root_dir: Path) -> list[Path]:
     sh_files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         for fn in sorted(filenames):
             if fn.endswith(".sh"):
                 sh_files.append(Path(dirpath) / fn)
+    return sorted(sh_files)
 
-    for sh in sorted(sh_files):
+
+def check_bash_syntax(root_dir: Path, label_root: Path) -> list[str]:
+    errors: list[str] = []
+    for sh in collect_sh_files(root_dir):
         proc = subprocess.run(
             ["bash", "-n", str(sh)],
             capture_output=True,
@@ -239,6 +244,36 @@ def check_bash_syntax(root_dir: Path, label_root: Path) -> list[str]:
             rel = sh.relative_to(label_root)
             errors.append(f"{rel}: bash -n failed:\n{proc.stderr.strip()}")
     return errors
+
+
+def check_shellcheck(root_dir: Path, label_root: Path, external_sources: bool = False) -> list[str]:
+    sc_bin = shutil.which("shellcheck")
+    if not sc_bin:
+        return [
+            "shellcheck binary not found on PATH (install with `brew install shellcheck` or `apt-get install shellcheck`)"
+        ]
+
+    sh_files = collect_sh_files(root_dir)
+    if not sh_files:
+        return []
+
+    cmd = [sc_bin]
+    if external_sources:
+        cmd.append("-x")
+    cmd.extend(["-S", "warning"])
+    cmd.extend(str(sh.relative_to(label_root)) for sh in sh_files)
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(label_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        details = (proc.stdout or proc.stderr).strip()
+        return [f"shellcheck failed:\n{details}"]
+    return []
 
 
 def check_forbidden_patterns(repo_root: Path) -> list[str]:
@@ -315,7 +350,7 @@ def render_standalone_script(script_text: str, repo_root: Path) -> str:
     return re.sub(r"^#\s*@RVDK_INLINE_LIBS:\s*(.+)$", _replace_libs, script_text, flags=re.MULTILINE)
 
 
-def bundle_dist(repo_root: Path, out_dir: Path) -> list[str]:
+def bundle_dist(repo_root: Path, out_dir: Path, skip_shellcheck: bool = False) -> list[str]:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -346,14 +381,19 @@ def bundle_dist(repo_root: Path, out_dir: Path) -> list[str]:
                 bundled_count += 1
 
     print(f"[RVDK:BUNDLE] Staged static site in {out_dir} ({bundled_count} standalone scripts inlined).")
-    return check_bash_syntax(out_dir, out_dir)
+    errors = check_bash_syntax(out_dir, out_dir)
+    if not skip_shellcheck:
+        errors.extend(check_shellcheck(out_dir, out_dir, external_sources=False))
+    return errors
 
 
-def run_checks(repo_root: Path) -> int:
+def run_checks(repo_root: Path, skip_shellcheck: bool = False) -> int:
     all_errors: list[str] = []
     all_errors.extend(check_manifests(repo_root))
     all_errors.extend(check_symlinks(repo_root))
     all_errors.extend(check_bash_syntax(repo_root, repo_root))
+    if not skip_shellcheck:
+        all_errors.extend(check_shellcheck(repo_root, repo_root, external_sources=True))
     all_errors.extend(check_forbidden_patterns(repo_root))
 
     if all_errors:
@@ -363,14 +403,16 @@ def run_checks(repo_root: Path) -> int:
         return 1
 
     manifest_cnt = len(glob.glob(str(repo_root / "boards" / "*" / "*" / "media.json")))
-    print(f"[RVDK:CI] OK — {manifest_cnt} board manifests, symlinks, bash syntax, and security/agnosticism checks passed.")
+    sc_note = " (ShellCheck skipped)" if skip_shellcheck else ", ShellCheck"
+    print(f"[RVDK:CI] OK — {manifest_cnt} board manifests, symlinks, bash syntax{sc_note}, and security/agnosticism checks passed.")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="RVDK CI validator & static standalone bundler")
-    parser.add_argument("--check", action="store_true", help="Run manifest, symlink, syntax, and security checks")
+    parser.add_argument("--check", action="store_true", help="Run manifest, symlink, syntax, ShellCheck, and security checks")
     parser.add_argument("--bundle-dist", metavar="OUT_DIR", help="Build standalone dereferenced static site into OUT_DIR")
+    parser.add_argument("--skip-shellcheck", action="store_true", help="Skip ShellCheck verification")
     args = parser.parse_args()
 
     if not args.check and not args.bundle_dist:
@@ -380,19 +422,20 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
 
     if args.check:
-        rc = run_checks(repo_root)
+        rc = run_checks(repo_root, skip_shellcheck=args.skip_shellcheck)
         if rc != 0:
             return rc
 
     if args.bundle_dist:
         out_dir = Path(args.bundle_dist).resolve()
-        bundle_errors = bundle_dist(repo_root, out_dir)
+        bundle_errors = bundle_dist(repo_root, out_dir, skip_shellcheck=args.skip_shellcheck)
         if bundle_errors:
-            print(f"[RVDK:BUNDLE] FAILED syntax verification with {len(bundle_errors)} issue(s):", file=sys.stderr)
+            print(f"[RVDK:BUNDLE] FAILED verification with {len(bundle_errors)} issue(s):", file=sys.stderr)
             for err in bundle_errors:
                 print(f"  - {err}", file=sys.stderr)
             return 1
-        print("[RVDK:BUNDLE] OK — all bundled standalone scripts passed bash -n.")
+        sc_note = "" if args.skip_shellcheck else " and ShellCheck"
+        print(f"[RVDK:BUNDLE] OK — all bundled standalone scripts passed bash -n{sc_note}.")
 
     return 0
 

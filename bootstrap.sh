@@ -122,6 +122,7 @@ if [[ -z "$REAL_HOME" ]]; then
         REAL_HOME="/root"
     fi
 fi
+export REAL_USER REAL_GRP REAL_HOME
 
 ENGINE_DIR="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
 RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"

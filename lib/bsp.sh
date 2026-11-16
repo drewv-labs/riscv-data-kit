@@ -126,6 +126,8 @@ EOF
     fi
 }
 
+# Optional extra systemd units may be passed via "$@" (e.g., apt-daily timers)
+# shellcheck disable=SC2120
 rvdk_bsp_mask_sleep_targets() {
     if ! command -v systemctl >/dev/null 2>&1; then
         log_skip "systemd not present (procd); sleep target mask not required"
