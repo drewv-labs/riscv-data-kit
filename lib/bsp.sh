@@ -7,6 +7,7 @@
 # Tenstorrent, and UltraRISC silicon BSP scripts:
 #   • Vendor U-Boot/DTB/UEFI dpkg confold protection & boot config backups
 #   • SSH-safe wired NIC DHCP fallback persistence (never clobbers live routes)
+#   • Deterministic SD/eMMC ext4 rootfs labeling (rvdk_sd_root / rvdk_emmc_root)
 #   • Sleep/suspend/hibernate systemd target masking
 #   • Persistent cpufreq performance governor (systemd + OpenWrt procd)
 #   • KASLR-safe hardware PMU counter exposure (kptr_restrict=1 default)
@@ -126,6 +127,131 @@ EOF
     fi
 }
 
+# Converge non-colliding ext4 rootfs labels (`rvdk_sd_root` vs `rvdk_emmc_root`)
+# and repair duplicate UUIDs across dual-populated SD + eMMC SBCs.
+rvdk_bsp_converge_mmc_root_labels() {
+    if [[ -f /etc/openwrt_release ]]; then
+        log_skip "OpenWrt rootfs; skipping ext4 SD/eMMC label convergence"
+        return 0
+    fi
+    if ! command -v e2label >/dev/null 2>&1 || ! command -v lsblk >/dev/null 2>&1 || ! command -v blkid >/dev/null 2>&1; then
+        log_skip "e2label/lsblk/blkid not present; skipping SD/eMMC label convergence"
+        return 0
+    fi
+
+    local live_root="" live_uuid=""
+    if command -v findmnt >/dev/null 2>&1; then
+        live_root="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+    fi
+    [[ -n "$live_root" && -b "$live_root" ]] && live_uuid="$(blkid -s UUID -o value "$live_root" 2>/dev/null || true)"
+
+    local sys_mmc mmc_name dev_type want_lbl mmc_kind
+    local found_any="false"
+    for sys_mmc in /sys/block/mmcblk*; do
+        [[ -e "$sys_mmc" ]] || continue
+        mmc_name="$(basename "$sys_mmc")"
+        [[ "$mmc_name" =~ ^mmcblk[0-9]+$ ]] || continue
+
+        dev_type=""
+        [[ -r "${sys_mmc}/device/type" ]] && dev_type="$(tr -d '[:space:]' < "${sys_mmc}/device/type" 2>/dev/null || true)"
+        case "$dev_type" in
+            SDIO) continue ;;
+            SD|SDcombo)
+                mmc_kind="SD"
+                want_lbl="rvdk_sd_root"
+                ;;
+            MMC)
+                mmc_kind="eMMC"
+                want_lbl="rvdk_emmc_root"
+                ;;
+            *)
+                case "$mmc_name" in
+                    mmcblk0) mmc_kind="SD";   want_lbl="rvdk_sd_root" ;;
+                    mmcblk2) mmc_kind="eMMC"; want_lbl="rvdk_emmc_root" ;;
+                    *)       continue ;;
+                esac
+                ;;
+        esac
+
+        local root_part=""
+        if [[ -n "$live_root" && "$live_root" == "/dev/${mmc_name}p"* ]]; then
+            local live_fstype=""
+            live_fstype="$(blkid -s TYPE -o value "$live_root" 2>/dev/null || true)"
+            [[ "$live_fstype" == "ext4" ]] && root_part="$live_root"
+        else
+            local best_pref="" best_size_dev="" best_size=0
+            local p_path p_type p_fs p_sz p_lbl p_lbl_lc
+            while IFS=' ' read -r p_path p_type p_fs p_sz p_lbl; do
+                [[ "$p_type" == "part" && "$p_fs" == "ext4" ]] || continue
+                [[ "$p_sz" =~ ^[0-9]+$ ]] || p_sz=0
+                (( p_sz >= 268435456 )) || continue
+                p_lbl_lc="$(tr '[:upper:]' '[:lower:]' <<< "${p_lbl:-}")"
+                case "$p_lbl_lc" in
+                    boot|bootfs|opi_boot|armbi_boot|efi) continue ;;
+                    opi_root|armbi_root|rootfs|cloudimg-rootfs|rvdk_*_root) best_pref="$p_path" ;;
+                esac
+                if (( p_sz > best_size )); then
+                    best_size="$p_sz"
+                    best_size_dev="$p_path"
+                fi
+            done < <(lsblk -ln -b -o PATH,TYPE,FSTYPE,SIZE,LABEL "/dev/${mmc_name}" 2>/dev/null || true)
+            root_part="${best_pref:-$best_size_dev}"
+        fi
+
+        [[ -n "$root_part" && -b "$root_part" ]] || continue
+        found_any="true"
+
+        local cur_lbl=""
+        cur_lbl="$(e2label "$root_part" 2>/dev/null | tr -d '[:space:]' || true)"
+
+        # Repair duplicate root UUID on unmounted peer MMC device if both SD & eMMC came from identical raw images
+        if [[ -n "$live_uuid" && "$root_part" != "$live_root" ]]; then
+            local peer_uuid="" peer_mnt=""
+            peer_uuid="$(blkid -s UUID -o value "$root_part" 2>/dev/null || true)"
+            if command -v findmnt >/dev/null 2>&1; then
+                peer_mnt="$(findmnt -rn -S "$root_part" -o TARGET 2>/dev/null | head -n1 || true)"
+            fi
+            if [[ -n "$peer_uuid" && "$peer_uuid" == "$live_uuid" && -z "$peer_mnt" ]] && command -v tune2fs >/dev/null 2>&1 && command -v e2fsck >/dev/null 2>&1; then
+                local fsck_rc=0
+                e2fsck -pf "$root_part" >/dev/null 2>&1 || fsck_rc=$?
+                if (( fsck_rc <= 1 )); then
+                    local new_uuid=""
+                    new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+                    tune2fs -U "$new_uuid" "$root_part" >/dev/null
+                    local tmp_mnt=""
+                    tmp_mnt="$(mktemp -d "/tmp/rvdk_mmc_uuid.XXXXXX")"
+                    if mount "$root_part" "$tmp_mnt" 2>/dev/null; then
+                        local rel_cfg
+                        for rel_cfg in etc/fstab boot/orangepiEnv.txt boot/armbianEnv.txt boot/env_k1-x.txt boot/spacemit/env_k1-x.txt boot/extlinux/extlinux.conf boot/efi/extlinux.conf; do
+                            if [[ -f "${tmp_mnt}/${rel_cfg}" ]] && grep -qF "$peer_uuid" "${tmp_mnt}/${rel_cfg}" 2>/dev/null; then
+                                sed -i "s|${peer_uuid}|${new_uuid}|g" "${tmp_mnt}/${rel_cfg}"
+                            fi
+                        done
+                        sync
+                        umount "$tmp_mnt" 2>/dev/null || true
+                    fi
+                    rmdir "$tmp_mnt" 2>/dev/null || true
+                    log_ok "De-collided duplicate ${mmc_kind} ext4 UUID on ${root_part} -> ${new_uuid}"
+                fi
+            fi
+        fi
+
+        if [[ "$cur_lbl" != "$want_lbl" ]]; then
+            if [[ "$root_part" == "$live_root" && -n "$cur_lbl" && -f /etc/fstab ]] && grep -qF "LABEL=${cur_lbl}" /etc/fstab 2>/dev/null; then
+                sed -i "s|LABEL=${cur_lbl}|LABEL=${want_lbl}|g" /etc/fstab
+            fi
+            e2label "$root_part" "$want_lbl"
+            log_ok "Labeled ${mmc_kind} ext4 rootfs: ${root_part} -> ${want_lbl}"
+        else
+            log_skip "${mmc_kind} ext4 rootfs label already converged (${root_part} = ${want_lbl})"
+        fi
+    done
+
+    if [[ "$found_any" != "true" ]]; then
+        log_skip "No ext4 SD/eMMC root partitions detected for label convergence"
+    fi
+}
+
 # Optional extra systemd units may be passed via "$@" (e.g., apt-daily timers)
 # shellcheck disable=SC2120
 rvdk_bsp_mask_sleep_targets() {
@@ -156,6 +282,16 @@ rvdk_bsp_lock_cpufreq_performance() {
     local unit_prefix="$1"
     local description="$2"
 
+    # Prevent Armbian/OrangePi cpufrequtils hooks from resetting cpu0 back to ondemand
+    if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq '^GOVERNOR="?performance"?$' /etc/default/cpufrequtils 2>/dev/null; then
+        if grep -Eq '^GOVERNOR=' /etc/default/cpufrequtils 2>/dev/null; then
+            sed -i 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils
+        else
+            printf '\nGOVERNOR="performance"\n' >> /etc/default/cpufrequtils
+        fi
+        log_ok "Pinned /etc/default/cpufrequtils GOVERNOR=\"performance\""
+    fi
+
     if command -v systemctl >/dev/null 2>&1; then
         if command -v powerprofilesctl >/dev/null 2>&1; then
             if [[ "$(powerprofilesctl get 2>/dev/null || true)" != "performance" ]]; then
@@ -166,7 +302,7 @@ rvdk_bsp_lock_cpufreq_performance() {
         local gov_unit="/etc/systemd/system/${unit_prefix}-cpufreq-performance.service"
         local want_unit="[Unit]
 Description=${description}
-After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service
+After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service orangepi-hardware-optimize.service armbian-hardware-optimize.service
 
 [Service]
 Type=oneshot

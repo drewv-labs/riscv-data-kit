@@ -5,6 +5,37 @@
   "name": "Orange Pi RV2 (Ky X1 / K1)",
   "soc": "spacemit/k1",
   "default_os": "ubuntu-24.04",
-  "media": {},
+  "media": {
+    "sd": {
+      "mode": "raw",
+      "script": "flash-sd.sh",
+      "description": "Raw block SD card flasher for Orange Pi RV2 (root labeled rvdk_sd_root)",
+      "image": "orangepi-rv2-ubuntu-24.04-server-riscv64.img.zst",
+      "fallback_url": "https://dl.romanrm.net/risc-v/Orangepirv2_1.0.0_debian_trixie_minimal_linux6.6.63-v3.img.bz2",
+      "fallback_sha256": "4dea04b64c19d109590938ee97a07a4b46426d083f43e5b666c1028a932700d0",
+      "root_part": "auto",
+      "root_label": "rvdk_sd_root",
+      "min_size_gib": 8,
+      "post_flash_notes": [
+        "Orange Pi RV2 SD card boot & on-board eMMC bootstrap:",
+        "  1. Insert SD card into Orange Pi RV2 (BootROM prioritizes MicroSD over onboard eMMC).",
+        "  2. Power on and SSH as factory account (orangepi / orangepi or root / orangepi).",
+        "  3. Run Day-0 bootstrap on SD: curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-rv2-sd --nopasswd",
+        "  4. Bootstrap onboard eMMC from the running SD card: sudo rvdk flash rv2 emmc [--hostname rv-rv2-emmc]"
+      ]
+    },
+    "emmc": {
+      "mode": "sd_bootstrap",
+      "script": "flash-emmc.sh",
+      "description": "On-board SD -> eMMC bootstrapper (full-disk ext4 rvdk_emmc_root + Ky/SpacemiT boot0/U-Boot SPL)",
+      "root_label": "rvdk_emmc_root",
+      "min_size_gib": 8,
+      "post_flash_notes": [
+        "Orange Pi RV2 eMMC bootstrapped from SD (labeled rvdk_emmc_root with unique UUID & boot0/U-Boot SPL):",
+        "  • Keep MicroSD inserted to boot SD role (rvdk_sd_root).",
+        "  • Power off and eject MicroSD to boot onboard eMMC role (rvdk_emmc_root)."
+      ]
+    }
+  },
   "quirks": []
 }

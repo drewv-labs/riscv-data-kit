@@ -42,6 +42,7 @@ Organizes silicon hooks by SoC die (`bsp/<vendor>/<soc>/`) and board specifics (
 * Protects vendor `extlinux` and `zz-u-boot-menu` hooks (`--force-confdef` / `--force-confold`)
 * Migrates stale factory APT snapshots onto signed HTTPS mirrors
 * Masks unstable sleep targets & persists active SSH/wired NICs safely
+* Enforces deterministic, non-colliding `ext4` root labels (`rvdk_sd_root` vs `rvdk_emmc_root`) & UUIDs across dual-media SBCs
 * Unlocks hardware PMU counters (`kernel.perf_event_paranoid = -1`, `kernel.kptr_restrict = 1`)
 * Toggles for board quirks (`hdmi`, `fusb`)
 * Chains `os -> bsp -> board` kernel/IRQ/VM tuning (`--tune data|ai`) with bounded persistent `journald`
@@ -147,12 +148,14 @@ curl -fsSL https://rvdk.drewv-labs.dev/postgresql/latest/forge.sh | sudo bash
 ```
 ---
 
-### 3. Host Recovery Media Flashers (macOS Zsh & Linux Bash supported)
+### 3. Host & On-Board Media Flashers (macOS Zsh & Linux Bash supported)
 
-Install `rvdk` on a macOS or Linux workstation to pull, `SHA-256` verify, cache (`/var/cache/rvdk/`), and flash vendor recovery media with hardware safety interlocks (blocking internal/OS drives, non-removable Linux disks, and drives `>256 GiB`):
+Install `rvdk` on a macOS/Linux workstation (or run directly on a booted SBC) to pull, `SHA-256` verify, cache (`/var/cache/rvdk/` or `~/Library/Caches/rvdk/`), and flash vendor OS media with hardware safety interlocks, deterministic `ext4` root labels (`rvdk_sd_root` / `rvdk_emmc_root`), and dual-media UUID/PARTUUID de-collision:
 
 ```bash
 rvdk flash list
+rvdk flash rv2 sd 4                                      # Flash Orange Pi RV2 SD card (/dev/disk4 -> rvdk_sd_root)
+sudo rvdk flash rv2 emmc                                 # Bootstrap onboard RV2 eMMC from booted SD (boot0/U-Boot SPL + rvdk_emmc_root)
 rvdk flash vf2 sd 4                                      # Flash StarFive VisionFive 2 SD card (/dev/disk4)
 rvdk flash p550 usb 4                                    # Stage U-Boot ext4 recovery USB for HiFive Premier P550
 rvdk flash p550 usb --device /dev/sdX --image /path/to/custom.img.zst --sha256 <hex64>
@@ -171,9 +174,9 @@ riscv-data-kit/
 ├── lib/
 │   ├── common.sh                         # Safe non-executing .env parser/writer, validators & logging
 │   ├── kit.sh                            # Hardware/OS Kit inference & <1ms /etc/rvdk/kit.env cache
-│   ├── bsp.sh                            # Shared Silicon BSP helpers (dpkg guard, NIC, PMU, cpufreq)
+│   ├── bsp.sh                            # Shared Silicon BSP helpers (dpkg guard, NIC, SD/eMMC labels, PMU, cpufreq)
 │   ├── storage_guard.sh                  # Destructive block device & OS/swap disk safety interlocks
-│   ├── flash.sh                          # Metadata-driven macOS/Linux removable media flasher
+│   ├── flash.sh                          # Metadata-driven macOS/Linux SD/eMMC/USB media flasher
 │   ├── apt.sh                            # Idempotent APT lock/stamp & single-pass update helper
 │   └── progbar.sh                        # Persistent VT100 bottom progress bar (standalone or stacked)
 ├── os/
@@ -182,12 +185,12 @@ riscv-data-kit/
 │   ├── bootstrap-ubuntu.sh               # Layer 1B: Headless Ubuntu Day-0 wrapper
 │   ├── bootstrap-bianbu.sh               # Layer 1C: Headless SpacemiT Bianbu OS Day-0 wrapper
 │   ├── bootstrap-openwrt.sh              # Layer 1D: OpenWrt UCI hostname & fw4/procd router guard
-│   └── deeptune.sh                       # Layer 1 DeepTune: Persistent journald, THP, VM & scheduler
+│   └── deeptune.sh                       # Layer 1 DeepTune: Persistent journald, zram/ramlog retire, THP & VM
 ├── bsp/
 │   ├── eswin/                            # Layer 2: EIC7700X DTB guard, end0 netplan, PWM fan, P550 PMU & DeepTune
 │   ├── sifive/                           # Layer 2: SiFive Freedom U740 (4x U74) BSP
 │   ├── starfive/                         # Layer 2: JH7110 U-Boot guard, signed HTTPS repo migration & U74 PMU
-│   ├── spacemit/                         # Layer 2: SpacemiT K1/M1 (RVA22) & K3 (RVA23) RVV 1.0 BSPs
+│   ├── spacemit/                         # Layer 2: SpacemiT K1/M1 (RVA22) & K3 (RVA23) RVV 1.0 BSPs & DeepTune
 │   ├── ultrarisc/                        # Layer 2: UltraRISC UR-DP1000 (8x CP100 OoO + PCIe Gen4 x16) BSP
 │   └── tenstorrent/                      # Layer 2: Tenstorrent Atlantis (8x Ascalon-X RVA23 OoO) BSP
 ├── boards/
@@ -195,7 +198,7 @@ riscv-data-kit/
 │   ├── starfive/                         # Media manifests & VF2 flash-sd.sh block image flasher
 │   ├── milkv/                            # Media manifests (Milk-V Jupiter 1/2, Mars, Megrez & Titan)
 │   ├── bananapi/                         # Media manifests (Banana Pi BPI-F3 & BPI-CM6)
-│   ├── orangepi/                         # Media manifests (Orange Pi RV, RV2 & R2S)
+│   ├── orangepi/                         # Media manifests & RV2 flash-sd.sh / flash-emmc.sh flashers
 │   ├── firefly/                          # Media manifest (Firefly AIBOX-K3 Edge Mini PC)
 │   └── tenstorrent/                      # Media manifest (Tenstorrent Atlantis)
 ├── postgresql/

@@ -183,8 +183,10 @@ def check_manifests(repo_root: Path) -> list[str]:
                 if script_rel and not (m_path.parent / script_rel).is_file():
                     errors.append(f"{rel}: media.{med_key}.script={script_rel!r} does not exist")
                 mode = spec.get("mode")
-                if mode is not None and mode not in ("raw", "uboot_ext4"):
-                    errors.append(f"{rel}: media.{med_key}.mode={mode!r} must be 'raw' or 'uboot_ext4'")
+                if mode is not None and mode not in ("raw", "uboot_ext4", "sd_bootstrap"):
+                    errors.append(f"{rel}: media.{med_key}.mode={mode!r} must be 'raw', 'uboot_ext4', or 'sd_bootstrap'")
+                if mode == "sd_bootstrap" and not script_rel:
+                    errors.append(f"{rel}: media.{med_key} with mode='sd_bootstrap' requires 'script'")
 
         quirks = data.get("quirks")
         if not isinstance(quirks, list):

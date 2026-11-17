@@ -237,6 +237,7 @@ main() {
                 rvdk-thp-tune.service \
                 eic7700x-thp-tune.service \
                 eic7700x-irq-affinity.service \
+                spacemit-k1-irq-affinity.service \
                 rvdk-p550-hdmi-off.service \
                 cve-2026-98432-guard.service \
                 eic7700x-cpufreq-performance.service \
@@ -250,6 +251,14 @@ main() {
                     stop_disable_systemd_unit "$unit_base"
                     systemd_dirty="true"
                 fi
+            done
+
+            local helper_sbin
+            for helper_sbin in \
+                /usr/local/sbin/rvdk-eic7700x-irq-tune \
+                /usr/local/sbin/rvdk-spacemit-k1-irq-tune \
+                /usr/local/sbin/rvdk-p550-hdmi-off; do
+                [[ -e "$helper_sbin" || -L "$helper_sbin" ]] && remove_path "$helper_sbin"
             done
 
             local init_script

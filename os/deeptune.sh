@@ -6,6 +6,8 @@
 # Description:
 #   Silicon- and board-agnostic headless Linux OS deep-tuning across Debian,
 #   Ubuntu, Bianbu, and OpenWrt RISC-V nodes:
+#     • Retires vendor Armbian/OrangePi ephemeral 50M `ramlog` & 50% RAM `zram`
+#       swap overlays so all Debian/Ubuntu SBCs share deterministic VM & log parity
 #     • Configures persistent bounded `systemd-journald` (`Storage=persistent`,
 #       `SystemMaxUse=256M`) BEFORE retiring `rsyslog` so boot/SSH logs survive reboot
 #     • Silences periodic background polling (`smartd` & `sysstat` timers) while
@@ -148,12 +150,84 @@ EOF
 fi
 
 # ==============================================================================
-# 0. ENSURE PERSISTENT SYSTEMD-JOURNALD BEFORE RETIRING RSYSLOG
+# 0. RETIRE ARMBIAN/ORANGEPI ZRAM SWAP & 50M RAMLOG BEFORE PERSISTENT JOURNALD
 # ==============================================================================
-rvdk_prog 8 "OS DeepTune: persisting bounded systemd-journald (256M)..."
+rvdk_prog 5 "OS DeepTune: normalizing vendor ramlog/zram overlays..."
+VENDOR_ZRAM_CHANGED="false"
+
+for rl_svc in orangepi-ramlog.service armbian-ramlog.service; do
+    if systemctl is-active --quiet "$rl_svc" 2>/dev/null; then
+        systemctl stop "$rl_svc" 2>/dev/null || true
+        VENDOR_ZRAM_CHANGED="true"
+    fi
+done
+
+if command -v findmnt >/dev/null 2>&1; then
+    VARLOG_SRC="$(findmnt -n -o SOURCE /var/log 2>/dev/null || true)"
+    if [[ "$VARLOG_SRC" == *zram* || "$VARLOG_SRC" == *ramlog* ]]; then
+        umount /var/log 2>/dev/null || umount -l /var/log 2>/dev/null || true
+        VENDOR_ZRAM_CHANGED="true"
+    fi
+fi
+
+if [[ -f /etc/logrotate.conf ]] && grep -qF "/var/log.hdd/" /etc/logrotate.conf 2>/dev/null; then
+    sed -i 's|/var/log\.hdd/|/var/log/|g' /etc/logrotate.conf
+    for lr_cfg in /etc/logrotate.d/*; do
+        [[ -f "$lr_cfg" ]] && sed -i 's|/var/log\.hdd/|/var/log/|g' "$lr_cfg"
+    done
+    VENDOR_ZRAM_CHANGED="true"
+fi
+
+for vz_cfg in \
+    /etc/default/orangepi-ramlog \
+    /etc/default/armbian-ramlog \
+    /etc/default/orangepi-zram-config \
+    /etc/default/armbian-zram-config; do
+    if [[ -f "$vz_cfg" ]] && grep -Eq '^ENABLED=true' "$vz_cfg" 2>/dev/null; then
+        sed -i 's/^ENABLED=true/ENABLED=false/' "$vz_cfg"
+        VENDOR_ZRAM_CHANGED="true"
+    fi
+done
+
+if [[ -r /proc/swaps ]] && command -v swapoff >/dev/null 2>&1; then
+    while IFS= read -r zswap_dev; do
+        [[ -n "$zswap_dev" ]] || continue
+        swapoff "$zswap_dev" 2>/dev/null || true
+        VENDOR_ZRAM_CHANGED="true"
+    done < <(awk 'NR>1 && $1 ~ /^\/dev\/zram/ {print $1}' /proc/swaps 2>/dev/null || true)
+fi
+
+for vz_unit in \
+    orangepi-ramlog.service \
+    armbian-ramlog.service \
+    orangepi-zram-config.service \
+    armbian-zram-config.service; do
+    if [[ -f "/lib/systemd/system/${vz_unit}" || -f "/usr/lib/systemd/system/${vz_unit}" ]]; then
+        vz_state="$(systemctl is-enabled "$vz_unit" 2>/dev/null || true)"
+        if [[ "$vz_state" != "masked" && "$vz_state" != "masked-runtime" ]]; then
+            systemctl disable --now "$vz_unit" >/dev/null 2>&1 || true
+            systemctl mask "$vz_unit" >/dev/null 2>&1 || true
+            VENDOR_ZRAM_CHANGED="true"
+        fi
+    fi
+done
+
+if [[ "$VENDOR_ZRAM_CHANGED" == "true" ]]; then
+    log_ok "Retired vendor ramlog/zram swap overlays for deterministic Debian/Ubuntu VM & journald parity"
+fi
+
+# ==============================================================================
+# 0b. ENSURE PERSISTENT SYSTEMD-JOURNALD BEFORE RETIRING RSYSLOG
+# ==============================================================================
+rvdk_prog 10 "OS DeepTune: persisting bounded systemd-journald (256M)..."
 mkdir -p /etc/systemd/journald.conf.d /var/log/journal
 chmod 0755 /etc/systemd/journald.conf.d
 systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+
+# Clear Armbian/OrangePi 20M SystemMaxUse override in /etc/systemd/journald.conf if present
+if [[ -f /etc/systemd/journald.conf ]] && grep -qx 'SystemMaxUse=20M' /etc/systemd/journald.conf 2>/dev/null; then
+    sed -i 's/^SystemMaxUse=20M$/#SystemMaxUse=/' /etc/systemd/journald.conf
+fi
 
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-rvdk-deeptune.conf"
 WANT_JOURNALD="[Journal]

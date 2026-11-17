@@ -5,8 +5,13 @@
 #
 # Reads board flash specifications from `boards/<vendor>/<board>/media.json` and
 # executes hardware-interlocked, cryptographically verified media preparation:
-#   • mode = "raw"        : Stream-decompresses (.zst/.xz/.bz2/.gz/raw) to block dev
-#   • mode = "uboot_ext4" : Builds U-Boot compatible ext4 stick (-O ^metadata_csum_seed,^orphan_file)
+#   • mode = "raw"        : Stream-decompresses (.zst/.xz/.bz2/.gz/raw) to block dev,
+#                           wipes stale backup GPT headers on reused cards, applies
+#                           deterministic ext4 rootfs labels (rvdk_sd_root /
+#                           rvdk_emmc_root), de-collides dual-media UUID + PARTUUID,
+#                           and provisions SpacemiT/Ky eMMC hardware boot0 SPL.
+#   • mode = "uboot_ext4"   : Builds U-Boot compatible ext4 stick (-O ^metadata_csum_seed,^orphan_file)
+#   • mode = "sd_bootstrap" : Delegates on-board SD -> eMMC bootstrap to board script
 #
 # Security & Safety Interlocks:
 #   • Fail-closed SHA-256 verification on all downloaded images (unless --insecure-skip-sha256)
@@ -30,13 +35,36 @@ _FLASH_REPO_ROOT="$(cd "${_FLASH_LIB_DIR}/.." && pwd)"
 source "${_FLASH_LIB_DIR}/common.sh"
 rvdk_log_init "RVDK:FLASH"
 
+_rvdk_run_priv() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+_rvdk_dev_priv() {
+    local dev="$1"
+    shift
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    elif [[ "$(uname -s)" == "Darwin" && -r "$dev" && -w "$dev" ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 _RVDK_FLASH_TMP_MNT=""
 _rvdk_flash_cleanup() {
     if [[ -n "${_RVDK_FLASH_TMP_MNT:-}" && -d "${_RVDK_FLASH_TMP_MNT}" ]]; then
+        if [[ -d "${_RVDK_FLASH_TMP_MNT}/boot" ]]; then
+            _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}/boot" 2>/dev/null || true
+        fi
         if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null; then
-            sudo umount "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || sudo umount -l "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
+            _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || _rvdk_run_priv umount -l "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
         else
-            sudo umount "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
+            _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
         fi
         rmdir "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
     fi
@@ -85,6 +113,15 @@ aliases = {
     "premier-p550": "sifive/p550",
     "visionfive2": "starfive/vf2",
     "visionfive2-lite": "starfive/vf2-lite",
+    "orangepi-rv2": "orangepi/rv2",
+    "opirv2": "orangepi/rv2",
+    "orangepi-r2s": "orangepi/r2s",
+    "opir2s": "orangepi/r2s",
+    "orangepi-rv": "orangepi/rv",
+    "bananapi-f3": "bananapi/f3",
+    "bpi-f3": "bananapi/f3",
+    "milkv-jupiter": "milkv/jupiter",
+    "milkv-jupiter2": "milkv/jupiter2",
 }
 target = aliases.get(q, q)
 for p in sorted(glob.glob(os.path.join(boards_root, "*", "*", "media.json"))):
@@ -149,6 +186,350 @@ _rvdk_flash_verify_sha256() {
     log_ok "Verified SHA-256   : ${actual}"
 }
 
+_rvdk_find_macos_e2fs_dir() {
+    local brew_e2fs=""
+    brew_e2fs="$(brew --prefix e2fsprogs 2>/dev/null || true)"
+    if [[ -n "$brew_e2fs" && -d "${brew_e2fs}/sbin" ]]; then
+        printf '%s\n' "${brew_e2fs}/sbin"
+        return 0
+    fi
+    if [[ -d /opt/homebrew/opt/e2fsprogs/sbin ]]; then
+        printf '%s\n' "/opt/homebrew/opt/e2fsprogs/sbin"
+        return 0
+    fi
+    if [[ -d /usr/local/opt/e2fsprogs/sbin ]]; then
+        printf '%s\n' "/usr/local/opt/e2fsprogs/sbin"
+        return 0
+    fi
+    return 1
+}
+
+# Inspect a candidate partition device with tune2fs -l and print "<vol_name>|<fs_bytes>" if valid ext4
+_rvdk_probe_ext4_superblock() {
+    local tune2fs_bin="$1"
+    local part_dev="$2"
+    local info=""
+    info="$(_rvdk_dev_priv "$part_dev" "$tune2fs_bin" -l "$part_dev" 2>/dev/null || true)"
+    [[ -z "$info" ]] && return 1
+    if ! grep -qiE 'Filesystem magic number:[[:space:]]*0xEF53' <<< "$info"; then
+        return 1
+    fi
+    local vol_name block_cnt block_sz fs_bytes
+    vol_name="$(awk -F': *' '/^Filesystem volume name:/ {print $2; exit}' <<< "$info" | xargs || true)"
+    [[ "$vol_name" == "<none>" ]] && vol_name=""
+    block_cnt="$(awk -F': *' '/^Block count:/ {print $2; exit}' <<< "$info" | tr -dc '0-9' || echo 0)"
+    block_sz="$(awk -F': *' '/^Block size:/ {print $2; exit}' <<< "$info" | tr -dc '0-9' || echo 4096)"
+    [[ -z "$block_cnt" ]] && block_cnt=0
+    [[ -z "$block_sz" ]] && block_sz=4096
+    fs_bytes=$(( block_cnt * block_sz ))
+    printf '%s|%s\n' "$vol_name" "$fs_bytes"
+    return 0
+}
+
+# Select the true ext4 rootfs partition across 1-part (p1 opi_root/armbi_root),
+# 2-part (p1 boot + p2 rootfs), 4-part (VF2 p4), or 6-part (SpacemiT p5 bootfs + p6 rootfs) layouts.
+_rvdk_select_ext4_root_slice() {
+    local tune2fs_bin="$1"
+    local preferred_idx="$2"
+    shift 2
+
+    local min_root_bytes=$(( 256 * 1024 * 1024 ))
+    local best_pref_dev=""
+    local best_size_dev=""
+    local best_size_bytes=0
+    local cand probe vol_lc fs_bytes
+
+    if [[ "$preferred_idx" =~ ^[0-9]+$ && "$preferred_idx" -gt 0 ]]; then
+        for cand in "$@"; do
+            if [[ "$cand" =~ (s|p)?${preferred_idx}$ ]]; then
+                if probe="$(_rvdk_probe_ext4_superblock "$tune2fs_bin" "$cand")"; then
+                    vol_lc="$(tr '[:upper:]' '[:lower:]' <<< "${probe%%|*}")"
+                    fs_bytes="${probe#*|}"
+                    case "$vol_lc" in
+                        boot|bootfs|opi_boot|armbi_boot|efi) ;;
+                        *)
+                            if (( fs_bytes >= min_root_bytes )); then
+                                printf '%s\n' "$cand"
+                                return 0
+                            fi
+                            ;;
+                    esac
+                fi
+            fi
+        done
+    fi
+
+    for cand in "$@"; do
+        [[ -e "$cand" ]] || continue
+        if ! probe="$(_rvdk_probe_ext4_superblock "$tune2fs_bin" "$cand")"; then
+            continue
+        fi
+        vol_lc="$(tr '[:upper:]' '[:lower:]' <<< "${probe%%|*}")"
+        fs_bytes="${probe#*|}"
+        case "$vol_lc" in
+            boot|bootfs|opi_boot|armbi_boot|efi)
+                continue
+                ;;
+            opi_root|armbi_root|rootfs|cloudimg-rootfs|rvdk_*_root)
+                if (( fs_bytes >= min_root_bytes )); then
+                    best_pref_dev="$cand"
+                fi
+                ;;
+        esac
+        if (( fs_bytes >= min_root_bytes && fs_bytes > best_size_bytes )); then
+            best_size_bytes="$fs_bytes"
+            best_size_dev="$cand"
+        fi
+    done
+
+    if [[ -n "$best_pref_dev" ]]; then
+        printf '%s\n' "$best_pref_dev"
+        return 0
+    fi
+    if [[ -n "$best_size_dev" ]]; then
+        printf '%s\n' "$best_size_dev"
+        return 0
+    fi
+    return 1
+}
+
+_rvdk_flash_postprocess_raw() {
+    local os_type="$1"
+    local block_dev="$2"
+    local root_part_hint="$3"
+    local root_label="$4"
+    local regen_uuid="$5"
+    local emmc_boot0="$6"
+
+    if [[ -z "$root_label" && "$regen_uuid" != "true" && "$emmc_boot0" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ -n "$root_label" && ! "$root_label" =~ ^[a-zA-Z0-9_.-]{1,16}$ ]]; then
+        log_fatal "Invalid ext4 root label '${root_label}' (max 16 chars: [a-zA-Z0-9_.-])."
+    fi
+
+    if [[ "$os_type" == "Darwin" ]]; then
+        [[ -z "$root_label" ]] && return 0
+
+        local e2fs_sbin="" e2label_bin="" tune2fs_bin=""
+        if e2fs_sbin="$(_rvdk_find_macos_e2fs_dir)"; then
+            e2label_bin="${e2fs_sbin}/e2label"
+            tune2fs_bin="${e2fs_sbin}/tune2fs"
+        else
+            e2label_bin="$(command -v e2label || true)"
+            tune2fs_bin="$(command -v tune2fs || true)"
+        fi
+
+        if [[ ! -x "$e2label_bin" || ! -x "$tune2fs_bin" ]]; then
+            log_warn "Homebrew e2fsprogs not found on macOS; skipping host e2label ('brew install e2fsprogs'). On-target 'sudo rvdk bsp' will apply '${root_label}'."
+            return 0
+        fi
+
+        local slices=()
+        local s_cand
+        for _ in 1 2 3 4 5 6; do
+            diskutil unmountDisk "$block_dev" >/dev/null 2>&1 || true
+            slices=()
+            for s_cand in "${block_dev}"s[0-9]*; do
+                [[ -e "$s_cand" ]] && slices+=("$s_cand")
+            done
+            (( ${#slices[@]} > 0 )) && break
+            sleep 1
+        done
+
+        if (( ${#slices[@]} == 0 )); then
+            log_warn "No partition slices detected on ${block_dev} after image stream; skipping host e2label."
+            return 0
+        fi
+
+        local root_slice=""
+        if ! root_slice="$(_rvdk_select_ext4_root_slice "$tune2fs_bin" "$root_part_hint" "${slices[@]}")"; then
+            log_warn "Could not locate an ext4 rootfs slice on ${block_dev}; skipping host e2label."
+            return 0
+        fi
+
+        diskutil unmountDisk "$block_dev" >/dev/null 2>&1 || true
+        _rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" "$root_label"
+        local verified_lbl=""
+        verified_lbl="$(_rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ "$verified_lbl" != "$root_label" ]]; then
+            log_fatal "Failed to verify ext4 label '${root_label}' on ${root_slice} (got '${verified_lbl}')."
+        fi
+        log_ok "Labeled ext4 rootfs : ${root_slice} -> ${verified_lbl}"
+        sync
+        return 0
+    fi
+
+    # Linux post-flash processing (partition re-read, UUID/PARTUUID de-collision, eMMC boot0 SPL, e2label)
+    _rvdk_run_priv partprobe "$block_dev" 2>/dev/null || _rvdk_run_priv blockdev --rereadpt "$block_dev" 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && _rvdk_run_priv udevadm settle 2>/dev/null || sleep 1
+
+    local p_node
+    for p_node in "${block_dev}"*; do
+        [[ "$p_node" == "$block_dev" ]] && continue
+        _rvdk_run_priv umount "$p_node" 2>/dev/null || true
+    done
+
+    # De-collide MBR 32-bit disk identifier when regenerating UUID so PARTUUID (`ubootpart=`) is unique across SD & eMMC
+    if [[ "$regen_uuid" == "true" ]] && command -v sfdisk >/dev/null 2>&1; then
+        local pt_type=""
+        pt_type="$(_rvdk_run_priv blkid -s PTTYPE -o value "$block_dev" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+        if [[ "$pt_type" == "dos" ]]; then
+            local new_mbr_id=""
+            new_mbr_id="0x$(od -An -N4 -tx4 /dev/urandom 2>/dev/null | tr -d '[:space:]' || printf '7276646b')"
+            if _rvdk_run_priv sfdisk --disk-id "$block_dev" "$new_mbr_id" >/dev/null 2>&1; then
+                _rvdk_run_priv partprobe "$block_dev" 2>/dev/null || _rvdk_run_priv blockdev --rereadpt "$block_dev" 2>/dev/null || true
+                command -v udevadm >/dev/null 2>&1 && _rvdk_run_priv udevadm settle 2>/dev/null || sleep 1
+                log_ok "Assigned unique MBR disk identifier on ${block_dev}: ${new_mbr_id} (de-colliding PARTUUID)"
+            fi
+        fi
+    fi
+
+    local e2label_bin tune2fs_bin e2fsck_bin
+    e2label_bin="$(command -v e2label || echo /sbin/e2label)"
+    tune2fs_bin="$(command -v tune2fs || echo /sbin/tune2fs)"
+    e2fsck_bin="$(command -v e2fsck || echo /sbin/e2fsck)"
+
+    local linux_parts=()
+    local lp_path lp_type
+    while IFS=' ' read -r lp_path lp_type; do
+        [[ "$lp_type" == "part" && -b "$lp_path" ]] && linux_parts+=("$lp_path")
+    done < <(lsblk -ln -o PATH,TYPE "$block_dev" 2>/dev/null || true)
+
+    if (( ${#linux_parts[@]} == 0 )); then
+        log_warn "No child partitions detected on ${block_dev}; skipping post-flash filesystem hygiene."
+        return 0
+    fi
+
+    local root_slice=""
+    if [[ -x "$tune2fs_bin" ]]; then
+        root_slice="$(_rvdk_select_ext4_root_slice "$tune2fs_bin" "$root_part_hint" "${linux_parts[@]}" || true)"
+    fi
+    if [[ -z "$root_slice" ]]; then
+        log_warn "Could not locate ext4 rootfs partition on ${block_dev}; skipping post-flash filesystem hygiene."
+        return 0
+    fi
+
+    local old_uuid="" old_label=""
+    old_uuid="$(_rvdk_run_priv blkid -s UUID -o value "$root_slice" 2>/dev/null || true)"
+    old_label="$(_rvdk_run_priv blkid -s LABEL -o value "$root_slice" 2>/dev/null || true)"
+
+    # Automatically trigger UUID regeneration if another block device on the host already shares old_uuid
+    local uuid_collision="false"
+    if [[ -n "$old_uuid" ]]; then
+        local other_dev
+        while IFS= read -r other_dev; do
+            [[ -z "$other_dev" || "$other_dev" == "$root_slice" || "$other_dev" == "${block_dev}"* ]] && continue
+            uuid_collision="true"
+            break
+        done < <(_rvdk_run_priv blkid -t "UUID=${old_uuid}" -o device 2>/dev/null || true)
+    fi
+
+    local need_mount="false"
+    [[ "$regen_uuid" == "true" || "$uuid_collision" == "true" ]] && need_mount="true"
+    [[ "$emmc_boot0" == "true" && -b "${block_dev}boot0" ]] && need_mount="true"
+
+    local new_uuid=""
+    if [[ "$regen_uuid" == "true" || "$uuid_collision" == "true" ]]; then
+        if [[ -x "$tune2fs_bin" && -x "$e2fsck_bin" ]]; then
+            local fsck_rc=0
+            _rvdk_run_priv "$e2fsck_bin" -pf "$root_slice" >/dev/null 2>&1 || fsck_rc=$?
+            if (( fsck_rc <= 1 )); then
+                new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+                _rvdk_run_priv "$tune2fs_bin" -U "$new_uuid" "$root_slice" >/dev/null
+                log_ok "Assigned unique ext4 UUID on ${root_slice}: ${new_uuid} (preventing SD/eMMC UUID collision)"
+            else
+                log_warn "e2fsck returned ${fsck_rc} on ${root_slice}; preserving existing UUID."
+                new_uuid=""
+            fi
+        fi
+    fi
+
+    if [[ "$need_mount" == "true" ]]; then
+        _RVDK_FLASH_TMP_MNT="$(mktemp -d "/tmp/rvdk_postflash.XXXXXX")"
+        _rvdk_run_priv mount "$root_slice" "$_RVDK_FLASH_TMP_MNT"
+
+        # Mount separate /boot partition if the image uses a 2-partition layout
+        local boot_slice="" cand_p cand_lbl
+        for cand_p in "${linux_parts[@]}"; do
+            [[ "$cand_p" == "$root_slice" ]] && continue
+            cand_lbl="$(_rvdk_run_priv blkid -s LABEL -o value "$cand_p" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+            case "$cand_lbl" in
+                boot|bootfs|opi_boot|armbi_boot)
+                    boot_slice="$cand_p"
+                    break
+                    ;;
+            esac
+        done
+        if [[ -n "$boot_slice" && -d "${_RVDK_FLASH_TMP_MNT}/boot" ]]; then
+            _rvdk_run_priv mount "$boot_slice" "${_RVDK_FLASH_TMP_MNT}/boot" 2>/dev/null || true
+        fi
+
+        local cfg_rel cfg_full
+        for cfg_rel in \
+            etc/fstab \
+            boot/orangepiEnv.txt \
+            boot/armbianEnv.txt \
+            boot/env_k1-x.txt \
+            boot/spacemit/env_k1-x.txt \
+            boot/extlinux/extlinux.conf \
+            boot/efi/extlinux.conf; do
+            cfg_full="${_RVDK_FLASH_TMP_MNT}/${cfg_rel}"
+            [[ -f "$cfg_full" ]] || continue
+            if [[ -n "$old_uuid" && -n "$new_uuid" ]] && _rvdk_run_priv grep -qF "$old_uuid" "$cfg_full" 2>/dev/null; then
+                _rvdk_run_priv sed -i "s|${old_uuid}|${new_uuid}|g" "$cfg_full"
+                log_ok "Updated root UUID in target /${cfg_rel}"
+            fi
+            if [[ -n "$old_label" && -n "$root_label" && "$old_label" != "$root_label" ]] && _rvdk_run_priv grep -qF "LABEL=${old_label}" "$cfg_full" 2>/dev/null; then
+                _rvdk_run_priv sed -i "s|LABEL=${old_label}|LABEL=${root_label}|g" "$cfg_full"
+                log_ok "Updated root LABEL in target /${cfg_rel} (${old_label} -> ${root_label})"
+            fi
+        done
+
+        # SpacemiT K1/M1/Ky X1 hardware eMMC boot0 SPL provisioning (bootinfo_emmc.bin @ LBA 0 + FSBL.bin @ LBA 1)
+        if [[ "$emmc_boot0" == "true" && -b "${block_dev}boot0" ]]; then
+            local uboot_dir="" cand_uboot
+            for cand_uboot in \
+                "${_RVDK_FLASH_TMP_MNT}"/usr/lib/linux-u-boot-* \
+                /usr/lib/linux-u-boot-*; do
+                if [[ -f "${cand_uboot}/bootinfo_emmc.bin" && -f "${cand_uboot}/FSBL.bin" ]]; then
+                    uboot_dir="$cand_uboot"
+                    break
+                fi
+            done
+
+            if [[ -n "$uboot_dir" ]]; then
+                local boot0_dev="${block_dev}boot0"
+                local boot0_sys
+                boot0_sys="/sys/block/$(basename "$boot0_dev")/force_ro"
+                [[ -f "$boot0_sys" ]] && printf '0\n' | _rvdk_run_priv tee "$boot0_sys" >/dev/null
+                _rvdk_run_priv dd if="${uboot_dir}/bootinfo_emmc.bin" of="$boot0_dev" bs=512 seek=0 conv=notrunc,fsync status=none
+                _rvdk_run_priv dd if="${uboot_dir}/FSBL.bin" of="$boot0_dev" bs=512 seek=1 conv=notrunc,fsync status=none
+                [[ -f "$boot0_sys" ]] && printf '1\n' | _rvdk_run_priv tee "$boot0_sys" >/dev/null
+                log_ok "Programmed SpacemiT/Ky eMMC BootROM SPL (${boot0_dev} <- bootinfo_emmc.bin + FSBL.bin)"
+            else
+                log_warn "Could not find bootinfo_emmc.bin + FSBL.bin for ${block_dev}boot0; verify eMMC SPL before rebooting."
+            fi
+        fi
+
+        sync
+        [[ -n "$boot_slice" ]] && _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}/boot" 2>/dev/null || true
+        _rvdk_run_priv umount "$_RVDK_FLASH_TMP_MNT"
+        rmdir "$_RVDK_FLASH_TMP_MNT"
+        _RVDK_FLASH_TMP_MNT=""
+    fi
+
+    if [[ -n "$root_label" && -x "$e2label_bin" ]]; then
+        _rvdk_run_priv "$e2label_bin" "$root_slice" "$root_label"
+        local linux_lbl=""
+        linux_lbl="$(_rvdk_run_priv "$e2label_bin" "$root_slice" 2>/dev/null | tr -d '[:space:]' || true)"
+        [[ "$linux_lbl" != "$root_label" ]] && log_fatal "Failed to verify ext4 label '${root_label}' on ${root_slice}."
+        log_ok "Labeled ext4 rootfs : ${root_slice} -> ${linux_lbl}"
+    fi
+    sync
+}
+
 rvdk_flash_usage() {
     cat << 'EOF'
 Usage:
@@ -156,11 +537,15 @@ Usage:
   rvdk flash <board_tag_or_vendor/board> <medium> <disk_number_or_path> [options]
 
 Options:
-  -d, --device <disk>          Target disk number (macOS: 4 or /dev/disk4) or block path (Linux: /dev/sdX)
+  -d, --device <disk>          Target disk number (macOS: 4 or /dev/disk4) or block path (Linux: /dev/sdX, /dev/mmcblk2)
   -i, --image <path>           Flash a local image file instead of cached/mirror image
       --sha256 <hex64>         Expected SHA-256 digest for custom or remote image
+      --root-label <label>     Override post-flash ext4 root filesystem label (max 16 chars)
+      --no-root-label          Skip post-flash ext4 root filesystem labeling
       --insecure-skip-sha256   Bypass mandatory SHA-256 verification (NOT recommended)
       --allow-non-removable    Allow targeting non-USB/MMC drives on Linux (still blocks OS/swap disks)
+      --hostname <name>        Optional target hostname override (sd_bootstrap media)
+  -n, --dry-run                Dry-run preflight check (sd_bootstrap media)
       --force                  Override the 256 GiB large-drive safety ceiling
   -y, --yes                    Skip interactive confirmation prompt
   -h, --help                   Show this help message
@@ -178,6 +563,11 @@ rvdk_flash_main() {
     local target_arg=""
     local image_path=""
     local cli_sha256=""
+    local cli_root_label=""
+    local bootstrap_hostname=""
+    local dry_run="false"
+    local want_help="false"
+    local skip_root_label="false"
     local skip_sha256="false"
     local allow_non_removable="false"
     local force_large_disk="false"
@@ -185,17 +575,21 @@ rvdk_flash_main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --board)               board_query="${2:-}"; shift 2 ;;
-            --medium)              medium="${2:-}"; shift 2 ;;
-            -d|--device)           target_arg="${2:-}"; shift 2 ;;
-            -i|--image)            image_path="${2:-}"; shift 2 ;;
-            --sha256)              cli_sha256="${2:-}"; shift 2 ;;
+            --board)                board_query="${2:-}"; shift 2 ;;
+            --medium)               medium="${2:-}"; shift 2 ;;
+            -d|--device)            target_arg="${2:-}"; shift 2 ;;
+            -i|--image)             image_path="${2:-}"; shift 2 ;;
+            --sha256)               cli_sha256="${2:-}"; shift 2 ;;
+            --root-label)           cli_root_label="${2:-}"; shift 2 ;;
+            --no-root-label)        skip_root_label="true"; shift ;;
+            --hostname)             bootstrap_hostname="${2:-}"; shift 2 ;;
+            -n|--dry-run)           dry_run="true"; shift ;;
             --insecure-skip-sha256) skip_sha256="true"; shift ;;
-            --allow-non-removable) allow_non_removable="true"; shift ;;
-            --force)               force_large_disk="true"; shift ;;
-            -y|--yes)              skip_confirm="true"; shift ;;
-            -h|--help)             rvdk_flash_usage; return 0 ;;
-            -*)                    log_fatal "Unknown flag: $1" ;;
+            --allow-non-removable)  allow_non_removable="true"; shift ;;
+            --force)                force_large_disk="true"; shift ;;
+            -y|--yes)               skip_confirm="true"; shift ;;
+            -h|--help)              want_help="true"; shift ;;
+            -*)                     log_fatal "Unknown flag: $1" ;;
             *)
                 if [[ -z "$board_query" ]]; then
                     board_query="$1"
@@ -211,6 +605,10 @@ rvdk_flash_main() {
         esac
     done
 
+    if [[ "$want_help" == "true" && ( -z "$board_query" || -z "$medium" ) ]]; then
+        rvdk_flash_usage
+        return 0
+    fi
     if [[ -z "$board_query" || -z "$medium" ]]; then
         rvdk_flash_usage
         exit 1
@@ -243,6 +641,7 @@ fields = [
     doc.get("tag", ""),
     doc.get("name", ""),
     mode,
+    m.get("script", ""),
     m.get("image", ""),
     m.get("sha256", ""),
     m.get("url", ""),
@@ -250,6 +649,10 @@ fields = [
     m.get("fallback_sha256", ""),
     m.get("uboot_payload", ""),
     m.get("fs_label", ""),
+    str(m.get("root_part", "auto")),
+    m.get("root_label", ""),
+    "true" if m.get("regenerate_root_uuid") else "false",
+    "true" if m.get("emmc_uboot_boot0") else "false",
     str(m.get("min_size_gib", 8)),
     "\n".join(m.get("post_flash_notes") or []),
 ]
@@ -263,12 +666,13 @@ PY
         log_fatal "Failed to resolve medium '${medium}' in ${manifest_path}."
     fi
 
-    local board_id board_tag board_name flash_mode default_img manifest_sha custom_url fallback_url fallback_sha uboot_payload fs_label min_size_gib
+    local board_id board_tag board_name flash_mode script_rel default_img manifest_sha custom_url fallback_url fallback_sha uboot_payload fs_label root_part manifest_root_label regen_root_uuid emmc_uboot_boot0 min_size_gib
     {
         IFS= read -r board_id
         IFS= read -r board_tag
         IFS= read -r board_name
         IFS= read -r flash_mode
+        IFS= read -r script_rel
         IFS= read -r default_img
         IFS= read -r manifest_sha
         IFS= read -r custom_url
@@ -276,10 +680,38 @@ PY
         IFS= read -r fallback_sha
         IFS= read -r uboot_payload
         IFS= read -r fs_label
+        IFS= read -r root_part
+        IFS= read -r manifest_root_label
+        IFS= read -r regen_root_uuid
+        IFS= read -r emmc_uboot_boot0
         IFS= read -r min_size_gib
     } <<< "$parsed_spec"
     local post_notes="${parsed_spec#*---NOTES---}"
     post_notes="${post_notes#$'\n'}"
+
+    local effective_root_label="${cli_root_label:-$manifest_root_label}"
+    [[ "$skip_root_label" == "true" ]] && effective_root_label=""
+
+    if [[ "$flash_mode" == "sd_bootstrap" ]]; then
+        local manifest_dir bootstrap_script
+        manifest_dir="$(cd "$(dirname "$manifest_path")" && pwd)"
+        bootstrap_script="${manifest_dir}/${script_rel}"
+        [[ -z "$script_rel" || ! -f "$bootstrap_script" ]] && log_fatal "sd_bootstrap mode requires an existing 'script' in ${manifest_path}."
+        local fwd_args=()
+        [[ "$want_help" == "true" ]] && fwd_args+=("--help")
+        [[ -n "$target_arg" ]] && fwd_args+=("--device" "$target_arg")
+        [[ -n "$effective_root_label" ]] && fwd_args+=("--root-label" "$effective_root_label")
+        [[ -n "$bootstrap_hostname" ]] && fwd_args+=("--hostname" "$bootstrap_hostname")
+        [[ "$dry_run" == "true" ]] && fwd_args+=("--dry-run")
+        [[ "$force_large_disk" == "true" ]] && fwd_args+=("--force")
+        [[ "$skip_confirm" == "true" ]] && fwd_args+=("--yes")
+        exec bash "$bootstrap_script" ${fwd_args[@]+"${fwd_args[@]}"}
+    fi
+
+    if [[ "$want_help" == "true" ]]; then
+        rvdk_flash_usage
+        return 0
+    fi
 
     if [[ -z "$target_arg" ]]; then
         log_fatal "Missing target disk identifier for ${board_name} (${medium}). Run 'diskutil list external physical' (macOS) or 'lsblk' (Linux), then pass <disk>."
@@ -306,10 +738,10 @@ PY
     # ==========================================================================
     # 1. PLATFORM-SPECIFIC DEVICE RESOLUTION & HARDWARE SAFETY INTERLOCKS
     # ==========================================================================
-    local block_dev="" raw_dev="" media_name="" disk_bytes=0 mkfs_ext4=""
+    local block_dev="" raw_dev="" media_name="" disk_bytes=0 mkfs_ext4="" disk_num=""
 
     if [[ "$os_type" == "Darwin" ]]; then
-        local disk_num="$target_arg"
+        disk_num="$target_arg"
         disk_num="${disk_num#/dev/}"
         disk_num="${disk_num#r}"
         disk_num="${disk_num#disk}"
@@ -329,29 +761,23 @@ PY
         disk_info="$(diskutil info "$block_dev" 2>/dev/null || true)"
         [[ -z "$disk_info" ]] && log_fatal "Device ${block_dev} does not exist. Check 'diskutil list external physical'."
 
-        local is_internal is_removable disk_size_line
+        local is_internal is_removable is_virtual disk_size_line
         is_internal="$(awk -F': *' '/Device Location:/ {print $2}' <<< "$disk_info" | xargs)"
         is_removable="$(awk -F': *' '/Removable Media:/ {print $2}' <<< "$disk_info" | xargs)"
+        is_virtual="$(awk -F': *' '/Virtual:/ {print $2}' <<< "$disk_info" | xargs)"
         media_name="$(awk -F': *' '/Device \/ Media Name:/ {print $2}' <<< "$disk_info" | xargs)"
         disk_size_line="$(awk -F': *' '/Disk Size:/ {print $2}' <<< "$disk_info" | xargs)"
         disk_bytes="$(grep -oE '\([0-9]+ Bytes\)' <<< "$disk_size_line" | tr -dc '0-9' || echo 0)"
         [[ -z "$disk_bytes" ]] && disk_bytes=0
 
-        if [[ "$is_internal" == "Internal" && "$is_removable" != "Removable" ]]; then
+        if [[ "$is_internal" == "Internal" && "$is_removable" != "Removable" && "$is_virtual" != "Yes" ]]; then
             log_fatal "Safety Interlock: ${block_dev} (${media_name}) is an INTERNAL non-removable drive! Aborting."
         fi
 
         if [[ "$flash_mode" == "uboot_ext4" ]]; then
-            local brew_e2fs=""
-            brew_e2fs="$(brew --prefix e2fsprogs 2>/dev/null || true)"
-            if [[ -z "$brew_e2fs" ]]; then
-                if [[ -x /opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4 ]]; then
-                    brew_e2fs="/opt/homebrew/opt/e2fsprogs"
-                elif [[ -x /usr/local/opt/e2fsprogs/sbin/mkfs.ext4 ]]; then
-                    brew_e2fs="/usr/local/opt/e2fsprogs"
-                fi
-            fi
-            mkfs_ext4="${brew_e2fs}/sbin/mkfs.ext4"
+            local e2fs_sbin=""
+            e2fs_sbin="$(_rvdk_find_macos_e2fs_dir || true)"
+            mkfs_ext4="${e2fs_sbin}/mkfs.ext4"
             [[ ! -x "$mkfs_ext4" ]] && log_fatal "macOS requires Homebrew e2fsprogs to build U-Boot ext4 media. Run: brew install e2fsprogs"
         fi
 
@@ -359,11 +785,23 @@ PY
     else
         case "$target_arg" in
             ""|*[!0-9]*) ;;
-            *) log_fatal "On Linux, specify the full block device path (e.g., /dev/sdX)." ;;
+            *) log_fatal "On Linux, specify the full block device path (e.g., /dev/sdX or /dev/mmcblk2)." ;;
         esac
         block_dev="$target_arg"
         raw_dev="$target_arg"
         [[ ! -b "$block_dev" ]] && log_fatal "Block device not found: ${block_dev}"
+
+        case "$block_dev" in
+            *boot[0-9]|*rpmb)
+                log_fatal "Specify the parent MMC block device (e.g., /dev/mmcblk2), not hardware sub-partition '${block_dev}'."
+                ;;
+        esac
+
+        local dev_type=""
+        dev_type="$(lsblk -dn -o TYPE "$block_dev" 2>/dev/null | head -n1 | xargs || true)"
+        if [[ "$dev_type" == "part" ]]; then
+            log_fatal "Specify a whole-disk block device, not partition '${block_dev}'."
+        fi
 
         local mnt
         while IFS= read -r mnt; do
@@ -376,11 +814,15 @@ PY
         done < <(lsblk -rn -o MOUNTPOINTS "$block_dev" 2>/dev/null || lsblk -rn -o MOUNTPOINT "$block_dev" 2>/dev/null || true)
 
         if [[ "$allow_non_removable" != "true" ]]; then
-            local rm_flag hotplug_flag tran_type
+            local rm_flag hotplug_flag tran_type dev_base is_mmc_target="false"
             rm_flag="$(lsblk -dn -o RM "$block_dev" 2>/dev/null | head -n1 | tr -dc '0-9' || echo 0)"
             hotplug_flag="$(lsblk -dn -o HOTPLUG "$block_dev" 2>/dev/null | head -n1 | tr -dc '0-9' || echo 0)"
             tran_type="$(lsblk -dn -o TRAN "$block_dev" 2>/dev/null | head -n1 | tr '[:upper:]' '[:lower:]' | xargs || true)"
-            if [[ "${rm_flag:-0}" != "1" && "${hotplug_flag:-0}" != "1" && "$tran_type" != "usb" && "$tran_type" != "mmc" ]]; then
+            dev_base="$(basename "$block_dev")"
+            if [[ "$dev_base" == mmcblk[0-9]* ]] && [[ "$medium" == "sd" || "$medium" == "emmc" ]]; then
+                is_mmc_target="true"
+            fi
+            if [[ "${rm_flag:-0}" != "1" && "${hotplug_flag:-0}" != "1" && "$tran_type" != "usb" && "$tran_type" != "mmc" && "$is_mmc_target" != "true" ]]; then
                 log_fatal "Safety Interlock: ${block_dev} is not flagged as removable/USB/MMC (RM=${rm_flag:-0}, HOTPLUG=${hotplug_flag:-0}, TRAN=${tran_type:-none}). Pass --allow-non-removable if intentional."
             fi
         fi
@@ -483,6 +925,13 @@ PY
     # ==========================================================================
     trap '_rvdk_flash_cleanup' EXIT INT TERM
 
+    local need_sudo="true"
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        need_sudo="false"
+    elif [[ "$os_type" == "Darwin" && -r "$raw_dev" && -w "$raw_dev" ]]; then
+        need_sudo="false"
+    fi
+
     if [[ "$flash_mode" == "uboot_ext4" ]]; then
         [[ -z "$uboot_payload" ]] && log_fatal "uboot_ext4 mode requires 'uboot_payload' in ${manifest_path}."
         if [[ -z "$fs_label" ]]; then
@@ -513,11 +962,11 @@ PY
             log_ok "Staged payload: ${staged_img}"
         fi
 
-        sudo -v
+        [[ "$need_sudo" == "true" ]] && sudo -v
         if [[ "$os_type" == "Darwin" ]]; then
             log_info "Unmounting ${block_dev} and building U-Boot ext4 filesystem (${fs_label})..."
             diskutil unmountDisk "$block_dev"
-            sudo "$mkfs_ext4" -F -b 4096 -L "$fs_label" \
+            _rvdk_dev_priv "$raw_dev" "$mkfs_ext4" -F -b 4096 -L "$fs_label" \
                 -O ^metadata_csum_seed,^orphan_file \
                 -d "$stage_dir" \
                 "$raw_dev"
@@ -527,21 +976,21 @@ PY
             log_info "Unmounting ${block_dev}, formatting U-Boot ext4 (${fs_label}), and staging payload..."
             local part
             for part in "${block_dev}"*; do
-                sudo umount "$part" 2>/dev/null || true
+                _rvdk_run_priv umount "$part" 2>/dev/null || true
             done
-            sudo wipefs -a "$block_dev"
-            sudo "$mkfs_ext4" -F -b 4096 -L "$fs_label" \
+            _rvdk_run_priv wipefs -a "$block_dev"
+            _rvdk_run_priv "$mkfs_ext4" -F -b 4096 -L "$fs_label" \
                 -O ^metadata_csum_seed,^orphan_file \
                 "$block_dev"
 
             _RVDK_FLASH_TMP_MNT="$(mktemp -d "/tmp/rvdk_${board_tag}_usb.XXXXXX")"
-            sudo mount "$block_dev" "$_RVDK_FLASH_TMP_MNT"
-            sudo cp -v "$staged_img" "${_RVDK_FLASH_TMP_MNT}/${uboot_payload}"
+            _rvdk_run_priv mount "$block_dev" "$_RVDK_FLASH_TMP_MNT"
+            _rvdk_run_priv cp -v "$staged_img" "${_RVDK_FLASH_TMP_MNT}/${uboot_payload}"
             sync
-            sudo umount "$_RVDK_FLASH_TMP_MNT"
+            _rvdk_run_priv umount "$_RVDK_FLASH_TMP_MNT"
             rmdir "$_RVDK_FLASH_TMP_MNT"
             _RVDK_FLASH_TMP_MNT=""
-            sudo eject "$block_dev" 2>/dev/null || true
+            _rvdk_run_priv eject "$block_dev" 2>/dev/null || true
         fi
     elif [[ "$flash_mode" == "raw" ]]; then
         if [[ "$os_type" == "Darwin" ]]; then
@@ -551,29 +1000,48 @@ PY
             log_info "Unmounting active partitions on ${block_dev}..."
             local part
             for part in "${block_dev}"*; do
-                sudo umount "$part" 2>/dev/null || true
+                _rvdk_run_priv umount "$part" 2>/dev/null || true
             done
+        fi
+
+        [[ "$need_sudo" == "true" ]] && sudo -v
+
+        # Clear stale backup GPT header at the tail of reused media so MBR first-boot resize expands cleanly
+        if [[ "$os_type" != "Darwin" ]] && command -v wipefs >/dev/null 2>&1; then
+            _rvdk_run_priv wipefs -af "$block_dev" >/dev/null 2>&1 || true
+        fi
+        if (( disk_bytes >= 4194304 && disk_bytes % 512 == 0 )); then
+            local tail_seek=$(( (disk_bytes / 512) - 2048 ))
+            _rvdk_dev_priv "$raw_dev" dd if=/dev/zero of="$raw_dev" bs=512 seek="$tail_seek" count=2048 status=none 2>/dev/null || true
         fi
 
         local dd_bs="4M"
         [[ "$os_type" == "Darwin" ]] && dd_bs="4m"
 
         log_info "Streaming image to ${raw_dev} (bs=${dd_bs})..."
-        sudo -v
         case "$image_path" in
-            *.zst) zstd -dc "$image_path" | sudo dd of="$raw_dev" bs="$dd_bs" status=progress ;;
-            *.bz2) bzip2 -dc "$image_path" | sudo dd of="$raw_dev" bs="$dd_bs" status=progress ;;
-            *.xz)  xz -dc "$image_path" | sudo dd of="$raw_dev" bs="$dd_bs" status=progress ;;
-            *.gz)  gzip -dc "$image_path" | sudo dd of="$raw_dev" bs="$dd_bs" status=progress ;;
-            *)     sudo dd if="$image_path" of="$raw_dev" bs="$dd_bs" status=progress ;;
+            *.zst) zstd -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
+            *.bz2) bzip2 -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
+            *.xz)  xz -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
+            *.gz)  gzip -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
+            *)     _rvdk_dev_priv "$raw_dev" dd if="$image_path" of="$raw_dev" bs="$dd_bs" status=progress ;;
         esac
 
         log_info "Flushing write buffers (sync)..."
         sync
+
+        _rvdk_flash_postprocess_raw \
+            "$os_type" \
+            "$block_dev" \
+            "$root_part" \
+            "$effective_root_label" \
+            "$regen_root_uuid" \
+            "$emmc_uboot_boot0"
+
         if [[ "$os_type" == "Darwin" ]]; then
             diskutil eject "$block_dev"
-        else
-            sudo eject "$block_dev" 2>/dev/null || true
+        elif [[ "$(basename "$block_dev")" != mmcblk* ]]; then
+            _rvdk_run_priv eject "$block_dev" 2>/dev/null || true
         fi
     else
         log_fatal "Unsupported flash mode '${flash_mode}' in ${manifest_path}."

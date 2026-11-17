@@ -51,50 +51,52 @@ _rvdk_kit_escape_val() {
 }
 
 # Map a Device Tree model string -> "SOC|BOARD|BOARD_TAG|FACTORY_USER"
+# Case-insensitive matching handles vendor DT strings such as "ky x1 orangepi-rv2 board".
 _rvdk_infer_from_dt_model() {
-    local dt_model="$1"
-    case "$dt_model" in
-        *"Premier P550"*)
+    local dt_lc
+    dt_lc="$(tr '[:upper:]' '[:lower:]' <<< "${1:-}")"
+    case "$dt_lc" in
+        *"premier p550"*)
             echo "eswin/eic7700x|sifive/p550|p550|" ;;
-        *"Megrez"*)
+        *"megrez"*)
             echo "eswin/eic7700x|milkv/megrez|megrez|" ;;
-        *"StarPro64"*)
+        *"starpro64"*)
             echo "eswin/eic7700x|pine64/starpro64|starpro64|" ;;
-        *"EIC7700"*)
+        *"eic7700"*)
             echo "eswin/eic7700x|eswin/eic7700x-evb|eic7700x|" ;;
-        *"Unmatched"*|*"FU740"*)
+        *"unmatched"*|*"fu740"*)
             echo "sifive/fu740|sifive/unmatched|unmatched|" ;;
-        *"VisionFive 2 Lite"*|*"VF2 Lite"*|*"JH7110S"*|*"JH-7110S"*)
+        *"visionfive 2 lite"*|*"vf2 lite"*|*"jh7110s"*|*"jh-7110s"*)
             echo "starfive/jh7110|starfive/vf2-lite|vf2lite|user" ;;
-        *"VisionFive 2"*|*"VF2"*)
+        *"visionfive 2"*|*"vf2"*)
             echo "starfive/jh7110|starfive/vf2|vf2|user" ;;
-        *"Mars"*)
+        *"mars"*)
             echo "starfive/jh7110|milkv/mars|mars|user" ;;
-        *"Star64"*)
+        *"star64"*)
             echo "starfive/jh7110|pine64/star64|star64|user" ;;
-        *"OrangePi RV2"*|*"Orange Pi RV2"*)
-            echo "spacemit/k1|orangepi/rv2|rv2|" ;;
-        *"OrangePi R2S"*|*"Orange Pi R2S"*)
-            echo "spacemit/k1|orangepi/r2s|r2s|" ;;
-        *"OrangePi RV"*|*"Orange Pi RV"*)
+        *"orangepi-rv2"*|*"orangepi rv2"*|*"orange pi rv2"*)
+            echo "spacemit/k1|orangepi/rv2|rv2|orangepi" ;;
+        *"orangepi-r2s"*|*"orangepi r2s"*|*"orange pi r2s"*)
+            echo "spacemit/k1|orangepi/r2s|r2s|orangepi" ;;
+        *"orangepi-rv"*|*"orangepi rv"*|*"orange pi rv"*)
             echo "starfive/jh7110|orangepi/rv|opirv|user" ;;
-        *"JH7110"*)
+        *"jh7110"*)
             echo "starfive/jh7110|starfive/vf2|vf2|user" ;;
-        *"AIBOX-K3"*|*"Firefly"*K3*)
+        *"aibox-k3"*|*"firefly"*k3*)
             echo "spacemit/k3|firefly/aibox-k3|aiboxk3|" ;;
-        *"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
+        *"jupiter 2"*|*"spacemit k3"*|*"k3"*)
             echo "spacemit/k3|milkv/jupiter2|jptr2|" ;;
-        *"BPI-F3"*|*"Banana Pi F3"*)
+        *"bpi-f3"*|*"banana pi f3"*)
             echo "spacemit/k1|bananapi/f3|bpif3|" ;;
-        *"BPI-CM6"*|*"Banana Pi CM6"*)
+        *"bpi-cm6"*|*"banana pi cm6"*)
             echo "spacemit/k1|bananapi/cm6|bpicm6|" ;;
-        *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*)
+        *"jupiter"*|*"spacemit"*|*"k1"*|*"m1"*|*"ky x1"*)
             echo "spacemit/k1|milkv/jupiter|jptr1|" ;;
-        *"Titan"*|*"DP1000"*)
+        *"titan"*|*"dp1000"*)
             echo "ultrarisc/dp1000|milkv/titan|titan|" ;;
-        *"Atlantis"*|*"Ascalon"*)
+        *"atlantis"*|*"ascalon"*)
             echo "tenstorrent/atlantis|tenstorrent/atlantis|atlantis|" ;;
-        *"Blackhole"*)
+        *"blackhole"*)
             echo "tenstorrent/blackhole|tenstorrent/blackhole|blackhole|" ;;
         *)
             echo "|||" ;;
@@ -231,15 +233,16 @@ rvdk_kit_resolve() {
     if [[ -n "$cli_board" ]]; then
         board="$(rvdk_normalize_board_id "$cli_board")"
         case "$board" in
-            starfive/vf2-lite) tag="vf2lite"; factory_user="${factory_user:-user}" ;;
+            starfive/vf2-lite)          tag="vf2lite"; factory_user="${factory_user:-user}" ;;
             starfive/vf2|milkv/mars|pine64/star64) tag="${board##*/}"; factory_user="${factory_user:-user}" ;;
-            orangepi/rv)       tag="opirv"; factory_user="${factory_user:-user}" ;;
-            milkv/jupiter)     tag="jptr1" ;;
-            milkv/jupiter2)    tag="jptr2" ;;
-            firefly/aibox-k3)  tag="aiboxk3" ;;
-            bananapi/f3)       tag="bpif3" ;;
-            bananapi/cm6)      tag="bpicm6" ;;
-            *)                 tag="${board##*/}" ;;
+            orangepi/rv)                tag="opirv"; factory_user="${factory_user:-user}" ;;
+            orangepi/rv2|orangepi/r2s)  tag="${board##*/}"; factory_user="${factory_user:-orangepi}" ;;
+            milkv/jupiter)              tag="jptr1" ;;
+            milkv/jupiter2)             tag="jptr2" ;;
+            firefly/aibox-k3)           tag="aiboxk3" ;;
+            bananapi/f3)                tag="bpif3" ;;
+            bananapi/cm6)               tag="bpicm6" ;;
+            *)                          tag="${board##*/}" ;;
         esac
     fi
     if [[ -n "$cli_soc" ]]; then
