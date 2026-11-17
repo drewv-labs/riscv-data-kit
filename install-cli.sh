@@ -239,6 +239,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    sudo rvdk mods/nvme-4kn        # Format 4Kn NVMe + LVM vg_rvdk + XFS/Btrfs
    sudo rvdk mods/btrfs-raid
    sudo rvdk mods/mosquitto
+   sudo rvdk mods/ntfy            # Install ntfy pub/sub broker (cache or --force-build)
    sudo rvdk mods/nfs-vault
    sudo rvdk mods/tailscale       # Install static riscv64 Tailscale VPN [--ssh|--up]
    sudo rvdk utils/purge-user.sh  # Migrate state & purge factory default user

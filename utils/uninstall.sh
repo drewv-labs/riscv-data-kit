@@ -22,7 +22,7 @@
 #       Provisioned POSIX users, SSH keys, `/etc/hostname`, primary NIC configs
 #       (`/etc/netplan`, `/etc/network`), formatted LVM/NVMe/Btrfs mounts
 #       (`/etc/fstab`, `/mnt/*`), and workload services/data (`postgresql`,
-#       `mosquitto`, `nfs-server`/`nfs-ganesha`, `tailscaled`).
+#       `mosquitto`, `ntfy`, `nfs-server`/`nfs-ganesha`, `tailscaled`).
 #
 # Usage:
 #   sudo rvdk uninstall [--purge] [--dry-run] [-y|--yes]
@@ -68,7 +68,7 @@ Options:
 Safety Boundary:
   User accounts, SSH keys, network interface configs, formatted storage volumes
   (/mnt/*, vg_rvdk, /etc/fstab), and workload services/databases (PostgreSQL,
-  Mosquitto, NFS, Tailscale) are NEVER modified or removed.
+  Mosquitto, ntfy, NFS, Tailscale) are NEVER modified or removed.
 EOF
 }
 

@@ -180,7 +180,7 @@ Core Commands:
   quirk <name|list> [...]  Toggle board-specific hardware quirks (`boards/<board>/quirks/`)
   flash <board> <medium>   Flash removable media on macOS/Linux (e.g. `rvdk flash p550 usb 4`)
   postgresql               Install or build PostgreSQL 18.6 (`--force-build` to compile)
-  mods/<mod>               Converge storage/network mod (`nvme-4kn`, `btrfs-raid`, `mosquitto`, `nfs-vault`, `tailscale`)
+  mods/<mod>               Converge storage/network mod (`nvme-4kn`, `btrfs-raid`, `mosquitto`, `ntfy`, `nfs-vault`, `tailscale`)
   utils/purge-user.sh      Migrate state & purge factory default user account
   update                   Pull latest RVDK engine from GitHub
   uninstall [--purge]      Remove RVDK CLI, engine & caches (`--purge` wipes /etc/rvdk & tuning drop-ins)
@@ -422,6 +422,10 @@ if [[ $# -gt 0 ]]; then
             MODULE="deeptune"
             shift
             ;;
+        ntfy)
+            MODULE="mods/ntfy"
+            shift
+            ;;
         tailscale)
             MODULE="mods/tailscale"
             shift
@@ -438,6 +442,7 @@ if [[ $# -gt 0 ]]; then
             MODULE="${2:-day0}"
             case "$MODULE" in
                 deeptune|deep-tune|bsp/deeptune|bsp/deep-tune) MODULE="deeptune" ;;
+                ntfy)                                          MODULE="mods/ntfy" ;;
                 tailscale)                                     MODULE="mods/tailscale" ;;
                 util/*)                                        MODULE="utils/${MODULE#util/}" ;;
             esac

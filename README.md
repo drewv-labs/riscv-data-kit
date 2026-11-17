@@ -53,6 +53,7 @@ Self-contained, opt-in modules for:
 * Native `4Kn` NVMe + Single/Dual-LVM (`vg_rvdk`) with OS/swap disk wipe guards
 * Kernel Btrfs RAID 10
 * Eclipse Mosquitto MQTT (loopback-safe by default; authenticated LAN bind)
+* `ntfy` HTTP & Unix socket pub/sub notification broker (SHA-256 verified prebuilt `.tar.zst` bundle by default, or `--force-build` cold compilation)
 * NFSv4 (explicit `--allow-cidr` / `--auto-subnet`, `root_squash` default, auto kernel `nfsd` -> userspace `nfs-ganesha`)
 * `riscv64` Tailscale mesh VPN
 <br>
@@ -134,6 +135,7 @@ sudo rvdk postgresql --force-build
 # Optional storage & network modules
 sudo rvdk mods/btrfs-raid --json '[...]'
 sudo rvdk mods/mosquitto --port 1883
+sudo rvdk mods/ntfy --port 2586
 sudo rvdk mods/nfs-vault --allow-cidr 192.168.1.0/24
 sudo rvdk mods/tailscale --up --ssh
 ```
@@ -203,6 +205,7 @@ riscv-data-kit/
 │   ├── nvme-4kn/                         # Module: Native 4Kn LBA format + Single/Dual-LVM (vg_rvdk) + XFS/Btrfs
 │   ├── btrfs-raid/                       # Module: Declarative native kernel Btrfs RAID 10 builder
 │   ├── mosquitto/                        # Module: Eclipse Mosquitto MQTT (:1883 + Unix domain socket)
+│   ├── ntfy/                             # Module: ntfy pub/sub broker (:2586 + Unix socket; prebuilt or --force-build)
 │   ├── nfs-vault/                        # Module: NFSv4 exporter (auto kernel nfsd -> userspace NFS-Ganesha)
 │   └── tailscale/                        # Module: Static riscv64 Tailscale mesh VPN + optional userspace netstack
 ├── utils/
@@ -243,6 +246,7 @@ riscv-data-kit/
 - [NFS-Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)
 - [MQTT](https://mqtt.org/)
 - [Eclipse Mosquitto](https://mosquitto.org/)
+- [ntfy](https://ntfy.sh/)
 - [BTRFS RAID](https://btrfs.readthedocs.io/en/latest/Volume-management.html)
 
 ---
