@@ -408,7 +408,7 @@ main() {
     local fstab_out="${_EMMC_TMP_MNT}/etc/fstab"
     {
         printf "# Managed by RVDK (boards/orangepi/rv2/flash-emmc.sh | root=%s)\n" "$root_label"
-        printf "UUID=%s\t/\text4\tdefaults,noatime,commit=600,errors=remount-ro\t0\t1\n" "$emmc_uuid"
+        printf "UUID=%s\t/\text4\tdefaults,noatime,errors=remount-ro\t0\t1\n" "$emmc_uuid"
         printf "tmpfs\t/tmp\ttmpfs\tdefaults,nosuid\t0\t0\n"
         if [[ -f /etc/fstab ]]; then
             awk '

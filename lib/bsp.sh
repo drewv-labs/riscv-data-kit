@@ -145,6 +145,28 @@ rvdk_bsp_converge_mmc_root_labels() {
     fi
     [[ -n "$live_root" && -b "$live_root" ]] && live_uuid="$(blkid -s UUID -o value "$live_root" 2>/dev/null || true)"
 
+    # Normalize unsafe vendor ext4 writeback journaling & 10-minute commit=600 windows on live root
+    if [[ -n "$live_root" && -b "$live_root" ]] && [[ "$(blkid -s TYPE -o value "$live_root" 2>/dev/null || true)" == "ext4" ]]; then
+        local live_durability=()
+        if command -v tune2fs >/dev/null 2>&1; then
+            local live_def_opts=""
+            live_def_opts="$(tune2fs -l "$live_root" 2>/dev/null | awk -F': *' '/^Default mount options:/ {print $2; exit}' || true)"
+            if [[ " $live_def_opts " == *" journal_data_writeback "* ]]; then
+                if tune2fs -o ^journal_data_writeback,journal_data_ordered "$live_root" >/dev/null 2>&1; then
+                    live_durability+=("data=ordered")
+                fi
+            fi
+        fi
+        if [[ -f /etc/fstab ]] && grep -Eq '^[[:space:]]*[^#].*[[:space:]]/[[:space:]]+ext4[[:space:]].*commit=[0-9]{2,}' /etc/fstab 2>/dev/null; then
+            sed -i -E '/^[[:space:]]*#/! s/,commit=[0-9]{2,}//g; /^[[:space:]]*#/! s/commit=[0-9]{2,},//g' /etc/fstab
+            mount -o remount,commit=5 / 2>/dev/null || true
+            live_durability+=("-commit=600")
+        fi
+        if (( ${#live_durability[@]} > 0 )); then
+            log_ok "Hardened live ext4 rootfs durability on ${live_root} (${live_durability[*]})"
+        fi
+    fi
+
     local sys_mmc mmc_name dev_type want_lbl mmc_kind
     local found_any="false"
     for sys_mmc in /sys/block/mmcblk*; do

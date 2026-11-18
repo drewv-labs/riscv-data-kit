@@ -504,22 +504,13 @@ if declare -F rvdk_apt_normalize_mirrors >/dev/null 2>&1; then
 fi
 converge_us_touch_plane
 
-rvdk_prog 5 "Normalizing US-first HTTPS mirrors, NTP & UTF-8 locale..."
-if declare -F rvdk_apt_normalize_mirrors >/dev/null 2>&1; then
-    rvdk_apt_normalize_mirrors
-    if ! rvdk_apt_has_lists; then
-        rvdk_apt_update
-    fi
-fi
-converge_us_touch_plane
-
 if ! command -v sudo >/dev/null 2>&1; then
     log_info "Installing missing 'sudo' package..."
     rvdk_apt_ensure sudo
     log_ok "Installed 'sudo'"
 fi
 
-# Ensure batteryless RISC-V SBCs run persistent NTP pointedpointed atat US-firstUS-first poolspools
+# Ensure batteryless RISC-V SBCs run persistent NTP pointed at US-first pools
 if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     TIMESYNCD_DROPIN_DIR="/etc/systemd/timesyncd.conf.d"
     TIMESYNCD_DROPIN_FILE="${TIMESYNCD_DROPIN_DIR}/10-rvdk-ntp.conf"
@@ -557,14 +548,6 @@ FallbackNTP=time.cloudflare.com time.nist.gov"
         fi
     done
     if [[ -n "$_ACTIVE_NTP" ]]; then
-        if [[ "$NTP_CONF_CHANGED" == "true" && "$_ACTIVE_NTP" == "systemd-timesyncd.service" ]]; then
-            systemctl restart systemd-timesyncd.service 2>/dev/null || true
-            log_ok "Configured US-first NTP pools (${TIMESYNCD_DROPIN_FILE}) and reloaded systemd-timesyncd"
-        elif [[ "$NTP_CONF_CHANGED" == "true" ]]; then
-            log_ok "Configured US-first NTP pools (${_ACTIVE_NTP})"
-        else
-            log_skip "US-first NTP time synchronization already active (${_ACTIVE_NTP})"
-        fi
         if [[ "$NTP_CONF_CHANGED" == "true" && "$_ACTIVE_NTP" == "systemd-timesyncd.service" ]]; then
             systemctl restart systemd-timesyncd.service 2>/dev/null || true
             log_ok "Configured US-first NTP pools (${TIMESYNCD_DROPIN_FILE}) and reloaded systemd-timesyncd"

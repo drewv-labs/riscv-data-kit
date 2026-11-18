@@ -294,6 +294,81 @@ _rvdk_select_ext4_root_slice() {
     return 1
 }
 
+# Harden vendor raw ext4 superblocks & fstab before first boot on reused media:
+#   1. Enables `uninit_bg` if both `metadata_csum` and `uninit_bg` were omitted by
+#      vendor image builders (e.g. Xunlong RV2), preventing online `resize2fs` +
+#      interrupted `ext4lazyinit` from tripping `fsck.ext4` ("Inode ... seems to
+#      contain garbage") over stale non-zero blocks on reused SD cards.
+#   2. Replaces unsafe `journal_data_writeback` default mount options with ordered
+#      journaling (`journal_data_ordered`).
+#   3. Strips 10-minute `commit=600` mount delays from `/etc/fstab` so unclean bench
+#      power cycles never lose 10 minutes of uncommitted metadata.
+_rvdk_harden_ext4_superblock() {
+    local tune2fs_bin="$1"
+    local e2fsck_bin="$2"
+    local debugfs_bin="$3"
+    local root_slice="$4"
+
+    [[ -n "$tune2fs_bin" && -x "$tune2fs_bin" ]] || return 0
+
+    local sb_info=""
+    sb_info="$(_rvdk_dev_priv "$root_slice" "$tune2fs_bin" -l "$root_slice" 2>/dev/null || true)"
+    [[ -z "$sb_info" ]] && return 0
+
+    local feats="" def_opts="" sb_changed="false" notes=()
+    feats="$(awk -F': *' '/^Filesystem features:/ {print $2; exit}' <<< "$sb_info" || true)"
+    def_opts="$(awk -F': *' '/^Default mount options:/ {print $2; exit}' <<< "$sb_info" || true)"
+
+    if [[ -n "$feats" && " $feats " != *" metadata_csum "* && " $feats " != *" uninit_bg "* ]]; then
+        if _rvdk_dev_priv "$root_slice" "$tune2fs_bin" -O uninit_bg "$root_slice" >/dev/null 2>&1; then
+            sb_changed="true"
+            notes+=("+uninit_bg")
+        fi
+    fi
+
+    if [[ " $def_opts " == *" journal_data_writeback "* ]]; then
+        if _rvdk_dev_priv "$root_slice" "$tune2fs_bin" -o ^journal_data_writeback,journal_data_ordered "$root_slice" >/dev/null 2>&1; then
+            sb_changed="true"
+            notes+=("data=ordered")
+        fi
+    fi
+
+    if [[ -n "$debugfs_bin" && -x "$debugfs_bin" ]]; then
+        local cur_fstab=""
+        cur_fstab="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "cat /etc/fstab" "$root_slice" 2>/dev/null || true)"
+        if grep -Eq '^[[:space:]]*[^#].*[[:space:]]/[[:space:]]+ext4[[:space:]].*commit=[0-9]{2,}' <<< "$cur_fstab"; then
+            local tmp_fstab tmp_fcmds
+            tmp_fstab="$(mktemp "/tmp/rvdk_fstab.XXXXXX")"
+            tmp_fcmds="$(mktemp "/tmp/rvdk_fcmds.XXXXXX")"
+            sed -E '/^[[:space:]]*#/! s/,commit=[0-9]{2,}//g; /^[[:space:]]*#/! s/commit=[0-9]{2,},//g' <<< "$cur_fstab" > "$tmp_fstab"
+            cat <<EOF > "$tmp_fcmds"
+rm /etc/fstab
+write ${tmp_fstab} /etc/fstab
+sif /etc/fstab uid 0
+sif /etc/fstab gid 0
+sif /etc/fstab mode 0100644
+EOF
+            chmod 0644 "$tmp_fstab" "$tmp_fcmds"
+            if _rvdk_dev_priv "$root_slice" "$debugfs_bin" -w -f "$tmp_fcmds" "$root_slice" >/dev/null 2>&1; then
+                sb_changed="true"
+                notes+=("-commit=600")
+            fi
+            rm -f "$tmp_fstab" "$tmp_fcmds"
+        fi
+    fi
+
+    if [[ "$sb_changed" == "true" ]]; then
+        if [[ -n "$e2fsck_bin" && -x "$e2fsck_bin" ]]; then
+            local fsck_rc=0
+            _rvdk_dev_priv "$root_slice" "$e2fsck_bin" -pf "$root_slice" >/dev/null 2>&1 || fsck_rc=$?
+            if (( fsck_rc > 1 )); then
+                log_warn "e2fsck returned ${fsck_rc} while hardening ${root_slice}; verify media health."
+            fi
+        fi
+        log_ok "Hardened ext4 rootfs : ${root_slice} (${notes[*]})"
+    fi
+}
+
 # Seed host UTC timestamp into unmounted ext4 `/etc/fake-hwclock.data`,
 # `/var/lib/systemd/timesync/clock`, and superblock check-time so batteryless
 # RISC-V SBCs boot inside the valid TLS certificate window on first power-on.
@@ -324,10 +399,22 @@ _rvdk_seed_ext4_rtc_floor() {
             : > "$tmp_empty"
             : > "$tmp_cmds"
             if grep -q "Inode:" <<< "$has_etc"; then
-                printf 'rm /etc/fake-hwclock.data\nwrite %s /etc/fake-hwclock.data\n' "$tmp_rtc" >> "$tmp_cmds"
+                cat <<EOF >> "$tmp_cmds"
+rm /etc/fake-hwclock.data
+write ${tmp_rtc} /etc/fake-hwclock.data
+sif /etc/fake-hwclock.data uid 0
+sif /etc/fake-hwclock.data gid 0
+sif /etc/fake-hwclock.data mode 0100644
+EOF
             fi
             if grep -q "Inode:" <<< "$has_timesync"; then
-                printf 'rm /var/lib/systemd/timesync/clock\nwrite %s /var/lib/systemd/timesync/clock\n' "$tmp_empty" >> "$tmp_cmds"
+                cat <<EOF >> "$tmp_cmds"
+rm /var/lib/systemd/timesync/clock
+write ${tmp_empty} /var/lib/systemd/timesync/clock
+sif /var/lib/systemd/timesync/clock uid 0
+sif /var/lib/systemd/timesync/clock gid 0
+sif /var/lib/systemd/timesync/clock mode 0100644
+EOF
             fi
             chmod 0644 "$tmp_rtc" "$tmp_empty" "$tmp_cmds"
             if _rvdk_dev_priv "$root_slice" "$debugfs_bin" -w -f "$tmp_cmds" "$root_slice" >/dev/null 2>&1; then
@@ -361,15 +448,17 @@ _rvdk_flash_postprocess_raw() {
     fi
 
     if [[ "$os_type" == "Darwin" ]]; then
-        local e2fs_sbin="" e2label_bin="" tune2fs_bin="" debugfs_bin=""
+        local e2fs_sbin="" e2label_bin="" tune2fs_bin="" debugfs_bin="" e2fsck_bin=""
         if e2fs_sbin="$(_rvdk_find_macos_e2fs_dir)"; then
             e2label_bin="${e2fs_sbin}/e2label"
             tune2fs_bin="${e2fs_sbin}/tune2fs"
             debugfs_bin="${e2fs_sbin}/debugfs"
+            e2fsck_bin="${e2fs_sbin}/e2fsck"
         else
             e2label_bin="$(command -v e2label || true)"
             tune2fs_bin="$(command -v tune2fs || true)"
             debugfs_bin="$(command -v debugfs || true)"
+            e2fsck_bin="$(command -v e2fsck || true)"
         fi
 
         if [[ ! -x "$tune2fs_bin" ]]; then
@@ -403,6 +492,8 @@ _rvdk_flash_postprocess_raw() {
         fi
 
         diskutil unmountDisk "$block_dev" >/dev/null 2>&1 || true
+        _rvdk_harden_ext4_superblock "$tune2fs_bin" "$e2fsck_bin" "$debugfs_bin" "$root_slice"
+
         if [[ -n "$root_label" && -x "$e2label_bin" ]]; then
             _rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" "$root_label"
             local verified_lbl=""
@@ -414,6 +505,9 @@ _rvdk_flash_postprocess_raw() {
         fi
 
         _rvdk_seed_ext4_rtc_floor "$debugfs_bin" "$tune2fs_bin" "$root_slice"
+        if [[ -n "$e2fsck_bin" && -x "$e2fsck_bin" ]]; then
+            _rvdk_dev_priv "$root_slice" "$e2fsck_bin" -pf "$root_slice" >/dev/null 2>&1 || true
+        fi
         sync
         return 0
     fi
@@ -578,6 +672,8 @@ _rvdk_flash_postprocess_raw() {
         _RVDK_FLASH_TMP_MNT=""
     fi
 
+    _rvdk_harden_ext4_superblock "$tune2fs_bin" "$e2fsck_bin" "$debugfs_bin" "$root_slice"
+
     if [[ -n "$root_label" && -x "$e2label_bin" ]]; then
         _rvdk_run_priv "$e2label_bin" "$root_slice" "$root_label"
         local linux_lbl=""
@@ -587,6 +683,9 @@ _rvdk_flash_postprocess_raw() {
     fi
 
     _rvdk_seed_ext4_rtc_floor "$debugfs_bin" "$tune2fs_bin" "$root_slice"
+    if [[ -x "$e2fsck_bin" ]]; then
+        _rvdk_run_priv "$e2fsck_bin" -pf "$root_slice" >/dev/null 2>&1 || true
+    fi
     sync
 }
 
