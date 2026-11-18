@@ -399,6 +399,7 @@ rvdk_kit_print_env() {
 
 rvdk_kit_print_summary() {
     local repo_root="$1"
+    local mode="${2:-full}"
     local cache_status="absent (run 'sudo rvdk kit --refresh' to persist)"
     if [[ -f "$RVDK_KIT_CACHE_FILE" ]]; then
         cache_status="${RVDK_KIT_CACHE_FILE} (${RVDK_KIT_SOURCE:-loaded})"
@@ -428,7 +429,9 @@ rvdk_kit_print_summary() {
     local quirks_str="none"
     [[ ${#quirks[@]} -gt 0 ]] && quirks_str="${quirks[*]}"
 
-    printf "\033[1;36m[RVDK:KIT]\033[0m Resolved Hardware & OS Kit\n"
+    if [[ "$mode" != "--motd" ]]; then
+        printf "\033[1;36m[RVDK:KIT]\033[0m Resolved Hardware & OS Kit\n"
+    fi
     printf "  • Device Tree Model : %s\n" "${RVDK_DT_MODEL:-Unknown}"
     printf "  • Board (boards/)   : %s (tag: %s)\n" "${RVDK_BOARD:-unrecognized}" "${RVDK_BOARD_TAG:--}"
     printf "  • SoC (bsp/)        : %s (slug: %s)\n" "${RVDK_SOC:-unrecognized}" "${RVDK_SOC_SLUG:--}"

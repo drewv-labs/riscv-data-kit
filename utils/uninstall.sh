@@ -8,7 +8,8 @@
 #   • Default (`sudo rvdk uninstall` / `remove`):
 #       Removes CLI symlinks (`/usr/bin/rvdk`, `/usr/local/bin/rvdk`), the
 #       system engine (`/usr/local/share/rvdk`), regenerable download/media
-#       caches (`/var/cache/rvdk`), and runtime stamps (`/run/rvdk-*`).
+#       caches (`/var/cache/rvdk`), and runtime stamps (`/run/rvdk-*`), and
+#       restores the default OS login MOTD/banner header.
 #       PRESERVES `/etc/rvdk/` (`kit.env`, `deeptune.env`, `config.env`),
 #       `/var/lib/rvdk/`, and active OS/BSP/DeepTune kernel drop-ins.
 #
@@ -45,10 +46,14 @@ fi
 _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
-# @RVDK_INLINE_LIBS: common
+# @RVDK_INLINE_LIBS: common motd
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
     # shellcheck source=lib/common.sh
     source "${_REPO_ROOT}/lib/common.sh"
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/motd.sh" ]]; then
+    # shellcheck source=lib/motd.sh
+    source "${_REPO_ROOT}/lib/motd.sh"
 fi
 
 print_uninstall_help() {
@@ -60,7 +65,8 @@ Usage:
 Options:
   --purge        Also remove /etc/rvdk (kit.env, deeptune.env, config.env),
                  /var/lib/rvdk, and all RVDK-managed sysctl/modprobe/systemd
-                 tuning & BSP drop-ins (`apt purge` semantics)
+                 tuning & BSP drop-ins (`apt purge` semantics). Note: default
+                 OS login MOTD/banner headers are restored in both modes.
   -n, --dry-run  Preview every path and unit that would be removed (no root needed)
   -y, --yes      Skip interactive confirmation prompt
   -h, --help     Show this help message
@@ -123,8 +129,8 @@ main() {
             ;;
     esac
 
-    local mode_desc="Standard Uninstall (preserving /etc/rvdk, /var/lib/rvdk & active tuning)"
-    [[ "$purge" == "true" ]] && mode_desc="Full Purge (removing engine, caches, /etc/rvdk, /var/lib/rvdk & RVDK drop-ins)"
+    local mode_desc="Standard Uninstall (restoring default login header; preserving /etc/rvdk, /var/lib/rvdk & active tuning)"
+    [[ "$purge" == "true" ]] && mode_desc="Full Purge (restoring default login header & removing engine, caches, /etc/rvdk, /var/lib/rvdk & RVDK drop-ins)"
 
     if [[ "$dry_run" == "true" ]]; then
         log_info "[DRY-RUN] Mode: ${mode_desc}"
@@ -132,7 +138,7 @@ main() {
         log_info "Mode: ${mode_desc}"
         if [[ "$skip_confirm" != "true" ]]; then
             if [[ -t 1 && -r /dev/tty ]]; then
-                local prompt_msg="Remove RVDK CLI, engine, and caches (keeping /etc/rvdk & tuning)?"
+                local prompt_msg="Remove RVDK CLI, engine, and caches, and restore default login header (keeping /etc/rvdk & tuning)?"
                 [[ "$purge" == "true" ]] && prompt_msg="PURGE RVDK CLI, engine, /etc/rvdk, /var/lib/rvdk, and all RVDK tuning drop-ins?"
                 printf "\033[1;33m[CONFIRM]\033[0m %s [y/N]: " "$prompt_msg"
                 local reply=""
@@ -194,7 +200,7 @@ main() {
     }
 
     # ==========================================================================
-    # TIER 1: CLI Symlinks, Engine Tree, Regenerable Caches & Runtime Stamps
+    # TIER 1: CLI Symlinks, Engine Tree, Regenerable Caches, Stamps & Login MOTD
     # ==========================================================================
     remove_path "/usr/bin/rvdk"
     remove_path "/usr/local/bin/rvdk"
@@ -223,6 +229,12 @@ main() {
         [[ -e "$stamp" || -L "$stamp" ]] || continue
         remove_path "$stamp"
     done
+
+    if [[ "$os_type" == "Linux" ]] && declare -F rvdk_restore_login_motd >/dev/null 2>&1; then
+        if rvdk_restore_login_motd "$dry_run"; then
+            removed_count=$(( removed_count + 1 ))
+        fi
+    fi
 
     # ==========================================================================
     # TIER 2: Full Purge (`--purge` only)

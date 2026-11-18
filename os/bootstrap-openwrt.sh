@@ -25,7 +25,7 @@ fi
 _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
-# @RVDK_INLINE_LIBS: common progbar
+# @RVDK_INLINE_LIBS: common motd progbar
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
     # shellcheck source=lib/common.sh
     source "${_REPO_ROOT}/lib/common.sh"
@@ -40,6 +40,10 @@ else
     rvdk_validate_username() { [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
     rvdk_validate_hostname() { [[ ${#1} -ge 1 && ${#1} -le 253 && "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; }
     rvdk_sync_cold_clock() { :; }
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/motd.sh" ]]; then
+    # shellcheck source=lib/motd.sh
+    source "${_REPO_ROOT}/lib/motd.sh"
 fi
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
     # shellcheck source=lib/progbar.sh
@@ -324,6 +328,12 @@ reload() {
     fi
 else
     log_warn "nft CLI not present; applied sysctl MPTCP lockdown only"
+fi
+
+# 4. Unified RVDK Login Header (`/etc/profile.d/10-rvdk-motd.sh` + empty `/etc/banner`)
+rvdk_prog 95 "Converging OpenWrt RVDK login header..."
+if declare -F rvdk_converge_openwrt_motd >/dev/null 2>&1; then
+    rvdk_converge_openwrt_motd
 fi
 
 rvdk_prog 100 "OpenWrt Day-0 router normalization complete"

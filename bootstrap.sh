@@ -342,6 +342,7 @@ if [[ "${1:-}" == "kit" ]]; then
     while [[ $# -gt 0 ]]; do
         case "$1" in
             status|--status|show) KIT_MODE="summary"; shift ;;
+            --motd|--body)        KIT_MODE="motd"; shift ;;
             --env|env)            KIT_MODE="env"; shift ;;
             --refresh|refresh)    KIT_ARGS+=("--refresh"); shift ;;
             --soc|--board|--os)   KIT_ARGS+=("$1" "${2:-}"); shift 2 ;;
@@ -360,6 +361,8 @@ EOF
     rvdk_kit_resolve ${KIT_ARGS[@]+"${KIT_ARGS[@]}"}
     if [[ "$KIT_MODE" == "env" ]]; then
         rvdk_kit_print_env
+    elif [[ "$KIT_MODE" == "motd" ]]; then
+        rvdk_kit_print_summary "$LOCAL_ROOT" --motd
     else
         rvdk_kit_print_summary "$LOCAL_ROOT"
     fi

@@ -43,7 +43,7 @@ fi
 _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
-# @RVDK_INLINE_LIBS: common apt progbar
+# @RVDK_INLINE_LIBS: common apt motd progbar
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
     # shellcheck source=lib/common.sh
     source "${_REPO_ROOT}/lib/common.sh"
@@ -64,6 +64,10 @@ fi
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
     # shellcheck source=lib/apt.sh
     source "${_REPO_ROOT}/lib/apt.sh"
+fi
+if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/motd.sh" ]]; then
+    # shellcheck source=lib/motd.sh
+    source "${_REPO_ROOT}/lib/motd.sh"
 fi
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
     # shellcheck source=lib/progbar.sh
@@ -487,6 +491,7 @@ EOF
 if [[ "$DEBLOAT_ONLY" == "true" ]]; then
     declare -F rvdk_apt_normalize_mirrors >/dev/null 2>&1 && rvdk_apt_normalize_mirrors --quiet-skip
     run_headless_debloat
+    declare -F rvdk_converge_apt_motd >/dev/null 2>&1 && rvdk_converge_apt_motd
     rvdk_prog 100 "${_DISTRO_TITLE} headless debloat complete"
     log_info "Day-0 ${_DISTRO_TITLE} --debloat-only complete."
     exit 0
@@ -803,6 +808,14 @@ if [[ "$CVE_CHANGED" == "true" ]] \
     log_ok "Configured persistent CVE-2026-98432 raw prerouting guard and MPTCP lockdown"
 else
     log_skip "CVE-2026-98432 TCP option filter & MPTCP lockdown already converged"
+fi
+
+# ==============================================================================
+# 5. UNIFIED RVDK LOGIN HEADER (`/etc/update-motd.d/10-rvdk-motd`)
+# ==============================================================================
+rvdk_prog 95 "Converging RVDK login MOTD header..."
+if declare -F rvdk_converge_apt_motd >/dev/null 2>&1; then
+    rvdk_converge_apt_motd
 fi
 
 rvdk_prog 100 "${_DISTRO_TITLE} Day-0 OS normalization complete"
