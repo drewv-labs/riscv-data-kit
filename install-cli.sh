@@ -150,6 +150,65 @@ sync_cold_rtc_clock() {
 }
 sync_cold_rtc_clock
 
+# 0b. Scrub factory CN mirrors onto US-first signed HTTPS endpoints BEFORE Day-0
+#     prerequisite installs (`git`, `curl`, `bash`) ever touch `apt-get` / `opkg` / `apk`.
+normalize_pkg_mirrors_early() {
+    [[ "$(uname -s)" == "Linux" ]] || return 0
+    if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" == "1" || "${RVDK_KEEP_VENDOR_MIRRORS:-false}" == "true" ]]; then
+        return 0
+    fi
+
+    local cn_hosts="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sohu\\.com|mirrors\\.zju\\.edu\\.cn|mirrors\\.nju\\.edu\\.cn|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirrors\\.shanghaitech\\.edu\\.cn|mirrors\\.hit\\.edu\\.cn|mirrors\\.lzu\\.edu\\.cn|mirrors\\.cqu\\.edu\\.cn|mirrors\\.neusoft\\.edu\\.cn|mirrors\\.xjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn|mirror\\.lzu\\.edu\\.cn|cn\\.archive\\.ubuntu\\.com|hk\\.archive\\.ubuntu\\.com|ftp\\.cn\\.debian\\.org|ftp\\.hk\\.debian\\.org"
+    local scheme="http"
+    [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/ssl/certs/ca-bundle.crt ]] && scheme="https"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        local changed="false" f tmp_f bname backup_dir="/var/lib/rvdk/backups/apt"
+        for f in /etc/apt/sources.list $(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null); do
+            [[ -f "$f" ]] || continue
+            tmp_f="$(mktemp)"
+            sed -E \
+                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g" \
+                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
+                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
+                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
+                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
+                -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
+                "$f" > "$tmp_f"
+            if ! cmp -s "$tmp_f" "$f" 2>/dev/null; then
+                mkdir -p "$backup_dir"
+                bname="$(printf '%s' "$f" | sed 's@^/@@; s@/@__@g')"
+                [[ -f "${backup_dir}/${bname}.orig" ]] || cp -a "$f" "${backup_dir}/${bname}.orig" 2>/dev/null || true
+                chmod 0644 "$tmp_f"
+                mv -f "$tmp_f" "$f"
+                changed="true"
+            else
+                rm -f "$tmp_f"
+            fi
+        done
+        if [[ "$changed" == "true" ]]; then
+            rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+            log_ok "Normalized factory APT mirrors onto US-first signed ${scheme} endpoints"
+        fi
+    fi
+
+    local owrt_f tmp_of
+    for owrt_f in /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf /etc/apk/repositories; do
+        [[ -f "$owrt_f" ]] || continue
+        tmp_of="$(mktemp)"
+        sed -E "/^[[:space:]]*#/! s@https?://(${cn_hosts})/openwrt([[:space:]/]|$)@${scheme}://downloads.openwrt.org\\2@g" "$owrt_f" > "$tmp_of"
+        if ! cmp -s "$tmp_of" "$owrt_f" 2>/dev/null; then
+            mkdir -p /var/lib/rvdk/backups/openwrt
+            cp -a "$owrt_f" "/var/lib/rvdk/backups/openwrt/$(basename "$owrt_f").orig" 2>/dev/null || true
+            chmod 0644 "$tmp_of"
+            mv -f "$tmp_of" "$owrt_f"
+            log_ok "Normalized OpenWrt package feeds onto ${scheme}://downloads.openwrt.org"
+        else
+            rm -f "$tmp_of"
+        fi
+    done
+}
+
 # 1. Ensure bash, git (+ HTTPS transport), and curl are installed across Debian/Ubuntu/Bianbu & OpenWrt
 NEED_GIT_HTTP="false"
 if [[ -f /etc/openwrt_release ]] && command -v git >/dev/null 2>&1 && [[ ! -x /usr/lib/git-core/git-remote-https ]]; then
@@ -157,6 +216,7 @@ if [[ -f /etc/openwrt_release ]] && command -v git >/dev/null 2>&1 && [[ ! -x /u
 fi
 
 if ! command -v bash >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || [[ "$NEED_GIT_HTTP" == "true" ]]; then
+    normalize_pkg_mirrors_early
     if command -v apt-get >/dev/null 2>&1; then
         log_info "Installing bash, git, and curl prerequisites (APT)..."
         export DEBIAN_FRONTEND=noninteractive

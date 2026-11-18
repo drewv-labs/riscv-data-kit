@@ -2,8 +2,9 @@
 # ==============================================================================
 # DREW-V Labs // Day-0 OpenWrt RISC-V Router Node Bootstrap Script
 # Path: riscv-data-kit/os/bootstrap-openwrt.sh
-# Description: Idempotent Layer 1D cold-RTC sync, UCI hostname, optional operator
-#              SSH/sudo account, and fw4-integrated nftables + MPTCP hardening for
+# Description: Idempotent Layer 1D cold-RTC sync, US-first opkg/apk feed & UCI
+#              NTP normalization, UCI hostname, optional operator SSH/sudo
+#              account, and fw4-integrated nftables + MPTCP hardening for
 #              OpenWrt RISC-V gateway/router nodes (e.g., Orange Pi R2S).
 #
 # Usage:
@@ -58,6 +59,7 @@ Options:
   -H, --hostname <hostname>   RFC-1123 system hostname to persist via OpenWrt UCI
   -u, --user <username>       Optional non-root operator account (requires shadow-useradd)
   -n, --nopasswd              Enable passwordless sudo if sudo is installed
+      --keep-mirrors          Preserve existing OpenWrt package & NTP mirror configs
       --no-apt-update         Ignored on OpenWrt (compatibility flag)
       --noprogbar             Suppress persistent bottom progress bar
   -h, --help                  Show this help message and exit
@@ -74,6 +76,8 @@ while [[ $# -gt 0 ]]; do
             TARGET_HOSTNAME="$2"; shift 2 ;;
         -n|--nopasswd|--passwordless-sudo)
             NOPASSWD_SUDO="true"; shift ;;
+        --keep-mirrors)
+            export RVDK_KEEP_VENDOR_MIRRORS="1"; shift ;;
         --debloat-only|--keep-gui|--skip-locale|--no-apt-update|--skip-apt-update)
             shift ;;
         --noprogbar|--no-progbar)
@@ -105,6 +109,46 @@ export LANG="C" LC_ALL="C"
 
 rvdk_prog_init "OpenWrt Day-0 router normalization..."
 rvdk_sync_cold_clock
+
+# 0. Normalize OpenWrt package feeds & UCI NTP servers onto US-first endpoints
+if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" != "1" && "${RVDK_KEEP_VENDOR_MIRRORS:-false}" != "true" ]]; then
+    OWRT_CN_HOSTS="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn"
+    OWRT_SCHEME="http"
+    [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/ssl/certs/ca-bundle.crt ]] && OWRT_SCHEME="https"
+    OWRT_FEED_CHANGED="false"
+    for _of in /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf /etc/apk/repositories; do
+        [[ -f "$_of" ]] || continue
+        _tmp_of="$(mktemp)"
+        sed -E "/^[[:space:]]*#/! s@https?://(${OWRT_CN_HOSTS})/openwrt([[:space:]/]|$)@${OWRT_SCHEME}://downloads.openwrt.org\\2@g" "$_of" > "$_tmp_of"
+        if ! cmp -s "$_tmp_of" "$_of" 2>/dev/null; then
+            mkdir -p /var/lib/rvdk/backups/openwrt
+            cp -a "$_of" "/var/lib/rvdk/backups/openwrt/$(basename "$_of").orig" 2>/dev/null || true
+            chmod 0644 "$_tmp_of"
+            mv -f "$_tmp_of" "$_of"
+            OWRT_FEED_CHANGED="true"
+        else
+            rm -f "$_tmp_of"
+        fi
+    done
+    [[ "$OWRT_FEED_CHANGED" == "true" ]] && log_ok "Normalized OpenWrt package feeds onto ${OWRT_SCHEME}://downloads.openwrt.org"
+
+    if command -v uci >/dev/null 2>&1; then
+        CUR_OWRT_NTP="$(uci -q get system.ntp.server || true)"
+        WANT_OWRT_NTP="0.us.pool.ntp.org 1.us.pool.ntp.org 2.us.pool.ntp.org 3.us.pool.ntp.org time.cloudflare.com"
+        if [[ "$CUR_OWRT_NTP" != "$WANT_OWRT_NTP" ]]; then
+            uci -q delete system.ntp.server || true
+            for _ns in 0.us.pool.ntp.org 1.us.pool.ntp.org 2.us.pool.ntp.org 3.us.pool.ntp.org time.cloudflare.com; do
+                uci add_list "system.ntp.server=${_ns}"
+            done
+            uci set system.ntp.enabled='1'
+            uci commit system
+            [[ -x /etc/init.d/sysntpd ]] && /etc/init.d/sysntpd reload 2>/dev/null || true
+            log_ok "Configured OpenWrt UCI NTP servers onto US-first pools"
+        else
+            log_skip "OpenWrt UCI NTP servers already converged on US-first pools"
+        fi
+    fi
+fi
 
 if [[ -x /etc/init.d/sysntpd ]]; then
     if ! /etc/init.d/sysntpd enabled 2>/dev/null; then

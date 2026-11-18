@@ -24,13 +24,14 @@ The `riscv-data-kit` (**RVDK**) transforms out-of-the-box `riscv64` single-board
 
 ## Architectural Overview
 
-Vendor RISC-V OS images frequently ship with desktop GUI bloat, background package timers, locked hardware performance counters, board-specific interrupt quirks, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard `apt` upgrades. 
+Vendor RISC-V OS images frequently ship with desktop GUI bloat, plain-HTTP regional package/registry mirrors, background package timers, locked hardware performance counters, board-specific interrupt quirks, and fragile U-Boot or Device Tree Blob (DTB) hooks that break during standard `apt` upgrades. 
 
 `RVDK` lives strictly in system space (`/usr/local/share/rvdk/engine`, `/etc/rvdk/`, `/var/cache/rvdk/`, `/var/lib/rvdk/`) with zero `~/.rvdk` user-home footprint, decoupling bare-metal bring-up and service provisioning into independent, strictly idempotent layers dispatched via `rvdk` (`/usr/bin/rvdk` & `/usr/local/bin/rvdk`) or standalone `curl | sudo bash` endpoints:
 
 ### **Layer 1 — OS Normalization (`os/`):** 
 Converges Debian, Ubuntu, Bianbu, and OpenWrt root filesystems into lean, headless server/router baselines. 
-* Cold-RTC clock skew recovery (HTTP `Date:` step) & persistent NTP (`systemd-timesyncd` / `sysntpd`) for batteryless SBCs
+* Canonical US-first signed HTTPS package mirror normalization (`deb.debian.org`, `security.debian.org`, `ports.ubuntu.com`, `downloads.openwrt.org`) & factory PyPI/npm/cargo/DNS touch-plane hygiene (`--keep-mirrors` opt-out)
+* Cold-RTC clock skew recovery (HTTP `Date:` step) & US-first persistent NTP (`systemd-timesyncd` / `chrony` / `sysntpd`) for batteryless SBCs
 * Non-interactive operator account provisioning with SSH `authorized_keys` inheritance
 * Optional `NOPASSWD` sudoers drop-in (`visudo -cf` verified)
 * UTF-8 locales & RFC-1123 hostnames (systemd & OpenWrt UCI)
@@ -181,14 +182,14 @@ riscv-data-kit/
 │   ├── bsp.sh                            # Shared Silicon BSP helpers (dpkg guard, NIC, SD/eMMC labels, PMU, cpufreq)
 │   ├── storage_guard.sh                  # Destructive block device & OS/swap disk safety interlocks
 │   ├── flash.sh                          # Metadata-driven macOS/Linux SD/eMMC/USB media flasher & RTC floor seeder
-│   ├── apt.sh                            # Idempotent APT lock/stamp & single-pass update helper
+│   ├── apt.sh                            # Idempotent APT lock/stamp & US-first signed HTTPS mirror normalizer
 │   └── progbar.sh                        # Persistent VT100 bottom progress bar (standalone or stacked)
 ├── os/
-│   ├── bootstrap-apt.sh                  # Unified Debian/Ubuntu/Bianbu Day-0 engine, NTP sync & nftables guard
+│   ├── bootstrap-apt.sh                  # Unified Debian/Ubuntu/Bianbu Day-0 engine, US NTP/mirror hygiene & nftables guard
 │   ├── bootstrap-debian.sh               # Layer 1A: Headless Debian Day-0 wrapper
 │   ├── bootstrap-ubuntu.sh               # Layer 1B: Headless Ubuntu Day-0 wrapper
 │   ├── bootstrap-bianbu.sh               # Layer 1C: Headless SpacemiT Bianbu OS Day-0 wrapper
-│   ├── bootstrap-openwrt.sh              # Layer 1D: OpenWrt UCI hostname, sysntpd & fw4/procd router guard
+│   ├── bootstrap-openwrt.sh              # Layer 1D: OpenWrt US feeds/NTP, UCI hostname & fw4/procd router guard
 │   └── deeptune.sh                       # Layer 1 DeepTune: Persistent journald, zram/ramlog retire, THP & VM
 ├── bsp/
 │   ├── eswin/                            # Layer 2: EIC7700X DTB guard, end0 netplan, PWM fan, P550 PMU & DeepTune

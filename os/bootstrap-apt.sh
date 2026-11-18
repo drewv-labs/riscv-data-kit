@@ -6,8 +6,11 @@
 # Description:
 #   Idempotent Day-0 OS normalization across Debian, Ubuntu, and SpacemiT Bianbu
 #   RISC-V nodes:
-#     • Cold-RTC clock skew recovery, persistent NTP (`systemd-timesyncd`),
-#       UTF-8 locale hygiene & non-interactive `sudo` availability
+#     • Canonical US-first signed HTTPS APT mirror normalization (`deb.debian.org`,
+#       `security.debian.org`, `ports.ubuntu.com`, `armbian.chi.auroradev.org`)
+#       plus vendor CN PyPI/npm/cargo/goproxy/DNS touch-plane hygiene
+#     • Cold-RTC clock skew recovery, US-first persistent NTP (`systemd-timesyncd`
+#       / `chrony`), UTF-8 locale hygiene & non-interactive `sudo` availability
 #     • Strict RFC-1123 hostname convergence with awk-safe `/etc/hosts` rewrite
 #     • Non-interactive POSIX user provisioning (safe under `curl | sudo bash`),
 #       automatic SSH `authorized_keys` inheritance, & `visudo`-verified sudoers
@@ -85,6 +88,7 @@ Options:
       --prompt-password       Interactively set a password via /dev/tty on user creation
       --debloat-only          Execute headless target, snapd & GUI purge, then exit
       --keep-gui              Preserve graphical target, snapd & desktop packages
+      --keep-mirrors          Preserve existing APT/NTP/registry mirror configs
       --skip-locale           Skip en_US.UTF-8 locale generation
       --no-apt-update         Skip redundant apt-get update calls
       --noprogbar             Suppress persistent bottom progress bar
@@ -127,6 +131,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --keep-gui)
             KEEP_GUI="true"
+            shift
+            ;;
+        --keep-mirrors)
+            export RVDK_KEEP_VENDOR_MIRRORS="1"
             shift
             ;;
         --skip-locale)
@@ -197,6 +205,104 @@ esac
 
 _DISTRO_TITLE="$(printf '%s' "${DISTRO_FLAVOR:0:1}" | tr '[:lower:]' '[:upper:]')${DISTRO_FLAVOR:1}"
 rvdk_prog_init "${_DISTRO_TITLE} Day-0 OS normalization..."
+
+# Helper: US-first DNS & developer/container registry CN touch-plane hygiene
+converge_us_touch_plane() {
+    if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" == "1" || "${RVDK_KEEP_VENDOR_MIRRORS:-false}" == "true" ]]; then
+        return 0
+    fi
+
+    # 1. Scrub hardcoded mainland CN public DNS resolvers (never touching LAN/DHCP/Tailscale/US IPs)
+    local cn_dns_re='(114\.114\.114\.114|114\.114\.115\.115|223\.5\.5\.5|223\.6\.6\.6|119\.29\.29\.29|182\.254\.116\.116|180\.76\.76\.76|1\.2\.4\.8|210\.2\.4\.8)'
+    local dns_changed="false" dns_f tmp_dns
+    if [[ ! -L /etc/resolv.conf && -f /etc/resolv.conf ]] && grep -Eq "^[[:space:]]*nameserver[[:space:]]+${cn_dns_re}([[:space:]]|$)" /etc/resolv.conf 2>/dev/null; then
+        mkdir -p /var/lib/rvdk/backups/dns
+        [[ -f /var/lib/rvdk/backups/dns/resolv.conf.orig ]] || cp -a /etc/resolv.conf /var/lib/rvdk/backups/dns/resolv.conf.orig 2>/dev/null || true
+        tmp_dns="$(mktemp)"
+        awk -v re="$cn_dns_re" '
+            /^[[:space:]]*nameserver[[:space:]]+/ && $2 ~ ("^" re "$") {
+                if (!seen_cf++) { print "nameserver 1.1.1.1"; next }
+                if (!seen_cf2++) { print "nameserver 1.0.0.1"; next }
+                next
+            }
+            { print }
+        ' /etc/resolv.conf > "$tmp_dns"
+        chmod 0644 "$tmp_dns"
+        mv -f "$tmp_dns" /etc/resolv.conf
+        dns_changed="true"
+    fi
+    for dns_f in /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d/*.conf; do
+        [[ -f "$dns_f" ]] || continue
+        if grep -Eq "^[[:space:]]*(Fallback)?DNS=.*${cn_dns_re}" "$dns_f" 2>/dev/null; then
+            mkdir -p /var/lib/rvdk/backups/dns
+            cp -a "$dns_f" "/var/lib/rvdk/backups/dns/$(basename "$dns_f").orig" 2>/dev/null || true
+            tmp_dns="$(mktemp)"
+            sed -E "/^[[:space:]]*#/! s/${cn_dns_re}/1.1.1.1/g" "$dns_f" > "$tmp_dns"
+            chmod 0644 "$tmp_dns"
+            mv -f "$tmp_dns" "$dns_f"
+            systemctl is-active --quiet systemd-resolved.service 2>/dev/null && systemctl restart systemd-resolved.service 2>/dev/null || true
+            dns_changed="true"
+        fi
+    done
+    [[ "$dns_changed" == "true" ]] && log_ok "Replaced hardcoded factory CN public DNS resolvers with US-anycast 1.1.1.1 / 1.0.0.1"
+
+    # 2. Scrub factory CN PyPI / npm / Cargo / Go / HuggingFace mirror overrides
+    local cn_reg_re='(pypi\.tuna\.tsinghua\.edu\.cn|mirrors\.(aliyun\.com|ustc\.edu\.cn|bfsu\.edu\.cn|cloud\.tencent\.com|zju\.edu\.cn|nju\.edu\.cn|sjtug\.sjtu\.edu\.cn|163\.com|sohu\.com)|repo\.huaweicloud\.com|pypi\.douban(io)?\.com|npmmirror\.com|registry\.npm\.taobao\.org|goproxy\.(cn|io)|rsproxy\.cn|hf-mirror\.com)'
+    local reg_changed="false" rf tmp_rf bname
+    local reg_candidates=(
+        /etc/pip.conf
+        /etc/xdg/pip/pip.conf
+        /root/.pip/pip.conf
+        /root/.config/pip/pip.conf
+        /etc/skel/.pip/pip.conf
+        /etc/skel/.config/pip.conf
+        /etc/npmrc
+        /root/.npmrc
+        /etc/skel/.npmrc
+        /root/.cargo/config
+        /root/.cargo/config.toml
+    )
+    local hp
+    for hp in /home/*/.pip/pip.conf /home/*/.config/pip/pip.conf /home/*/.npmrc; do
+        [[ -f "$hp" ]] && reg_candidates+=("$hp")
+    done
+
+    for rf in "${reg_candidates[@]}"; do
+        [[ -f "$rf" ]] || continue
+        if grep -Eq "$cn_reg_re" "$rf" 2>/dev/null; then
+            mkdir -p /var/lib/rvdk/backups/registries
+            bname="$(printf '%s' "$rf" | sed 's|^/||; s|/|__|g')"
+            [[ -f "/var/lib/rvdk/backups/registries/${bname}.orig" ]] || cp -a "$rf" "/var/lib/rvdk/backups/registries/${bname}.orig" 2>/dev/null || true
+            tmp_rf="$(mktemp)"
+            grep -Ev "$cn_reg_re" "$rf" > "$tmp_rf" || true
+            if awk '!/^[[:space:]]*(#|$|\[.*\][[:space:]]*$)/ { active=1 } END { exit !active }' "$tmp_rf" 2>/dev/null; then
+                chmod --reference="$rf" "$tmp_rf" 2>/dev/null || chmod 0644 "$tmp_rf"
+                chown --reference="$rf" "$tmp_rf" 2>/dev/null || true
+                mv -f "$tmp_rf" "$rf"
+            else
+                rm -f "$tmp_rf" "$rf"
+            fi
+            reg_changed="true"
+        fi
+    done
+
+    local env_f
+    for env_f in /etc/environment /etc/profile.d/*.sh; do
+        [[ -f "$env_f" ]] || continue
+        if grep -Eq "^[[:space:]]*(export[[:space:]]+)?(GOPROXY|RUSTUP_DIST_SERVER|RUSTUP_UPDATE_ROOT|PIP_INDEX_URL|UV_INDEX_URL|HF_ENDPOINT)=.*${cn_reg_re}" "$env_f" 2>/dev/null; then
+            mkdir -p /var/lib/rvdk/backups/registries
+            bname="$(printf '%s' "$env_f" | sed 's|^/||; s|/|__|g')"
+            [[ -f "/var/lib/rvdk/backups/registries/${bname}.orig" ]] || cp -a "$env_f" "/var/lib/rvdk/backups/registries/${bname}.orig" 2>/dev/null || true
+            tmp_rf="$(mktemp)"
+            grep -Ev "^[[:space:]]*(export[[:space:]]+)?(GOPROXY|RUSTUP_DIST_SERVER|RUSTUP_UPDATE_ROOT|PIP_INDEX_URL|UV_INDEX_URL|HF_ENDPOINT)=.*${cn_reg_re}" "$env_f" > "$tmp_rf" || true
+            chmod --reference="$env_f" "$tmp_rf" 2>/dev/null || chmod 0644 "$tmp_rf"
+            mv -f "$tmp_rf" "$env_f"
+            reg_changed="true"
+        fi
+    done
+    [[ "$reg_changed" == "true" ]] && log_ok "Scrubbed factory CN developer registry overrides (restored upstream TLS registries)"
+    return 0
+}
 
 # Helper: headless target, snapd & distro GUI debloat
 run_headless_debloat() {
@@ -289,6 +395,7 @@ EOF
 }
 
 if [[ "$DEBLOAT_ONLY" == "true" ]]; then
+    declare -F rvdk_apt_normalize_mirrors >/dev/null 2>&1 && rvdk_apt_normalize_mirrors --quiet-skip
     run_headless_debloat
     rvdk_prog 100 "${_DISTRO_TITLE} headless debloat complete"
     log_info "Day-0 ${_DISTRO_TITLE} --debloat-only complete."
@@ -296,18 +403,62 @@ if [[ "$DEBLOAT_ONLY" == "true" ]]; then
 fi
 
 # ==============================================================================
-# 0. SUDO, PERSISTENT NTP TIME-SYNC & UTF-8 LOCALE HYGIENE
+# 0. US-FIRST SIGNED HTTPS APT MIRRORS, SUDO, PERSISTENT NTP & UTF-8 LOCALE
 # ==============================================================================
-rvdk_prog 5 "Verifying sudo, NTP clock sync & UTF-8 locale..."
+rvdk_prog 5 "Normalizing US-first HTTPS mirrors, NTP & UTF-8 locale..."
+if declare -F rvdk_apt_normalize_mirrors >/dev/null 2>&1; then
+    rvdk_apt_normalize_mirrors
+    if ! rvdk_apt_has_lists; then
+        rvdk_apt_update
+    fi
+fi
+converge_us_touch_plane
+
+rvdk_prog 5 "Normalizing US-first HTTPS mirrors, NTP & UTF-8 locale..."
+if declare -F rvdk_apt_normalize_mirrors >/dev/null 2>&1; then
+    rvdk_apt_normalize_mirrors
+    if ! rvdk_apt_has_lists; then
+        rvdk_apt_update
+    fi
+fi
+converge_us_touch_plane
+
 if ! command -v sudo >/dev/null 2>&1; then
     log_info "Installing missing 'sudo' package..."
     rvdk_apt_ensure sudo
     log_ok "Installed 'sudo'"
 fi
 
-# Ensure batteryless RISC-V SBCs (e.g., Debian minimal images lacking systemd-timesyncd)
-# run a persistent NTP daemon across cold power cycles.
+# Ensure batteryless RISC-V SBCs run persistent NTP pointedpointed atat US-firstUS-first poolspools
 if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    TIMESYNCD_DROPIN_DIR="/etc/systemd/timesyncd.conf.d"
+    TIMESYNCD_DROPIN_FILE="${TIMESYNCD_DROPIN_DIR}/10-rvdk-ntp.conf"
+    WANT_TIMESYNCD_DROPIN="# Managed by RVDK (os/bootstrap-apt.sh)
+[Time]
+NTP=0.us.pool.ntp.org 1.us.pool.ntp.org 2.us.pool.ntp.org 3.us.pool.ntp.org
+FallbackNTP=time.cloudflare.com time.nist.gov"
+
+    NTP_CONF_CHANGED="false"
+    if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" != "1" && "${RVDK_KEEP_VENDOR_MIRRORS:-false}" != "true" ]]; then
+        mkdir -p "$TIMESYNCD_DROPIN_DIR"
+        if ! printf '%s\n' "$WANT_TIMESYNCD_DROPIN" | cmp -s - "$TIMESYNCD_DROPIN_FILE" 2>/dev/null; then
+            printf '%s\n' "$WANT_TIMESYNCD_DROPIN" > "$TIMESYNCD_DROPIN_FILE"
+            chmod 0644 "$TIMESYNCD_DROPIN_FILE"
+            NTP_CONF_CHANGED="true"
+        fi
+
+        for _chrony_cfg in /etc/chrony/chrony.conf /etc/chrony.conf; do
+            [[ -f "$_chrony_cfg" ]] || continue
+            if grep -Eq '^[[:space:]]*(pool|server)[[:space:]]+([^[:space:]]*\.cn\.pool\.ntp\.org|ntp[0-9]*\.aliyun\.com|ntp[0-9]*\.tencent\.com|time[0-9]*\.cloud\.tencent\.com|ntp\.ntsc\.ac\.cn|time\.ustc\.edu\.cn)' "$_chrony_cfg" 2>/dev/null; then
+                mkdir -p /var/lib/rvdk/backups/ntp
+                cp -a "$_chrony_cfg" "/var/lib/rvdk/backups/ntp/$(basename "$_chrony_cfg").orig" 2>/dev/null || true
+                sed -i -E 's@^([[:space:]]*(pool|server)[[:space:]]+)([^[:space:]]*\.cn\.pool\.ntp\.org|ntp[0-9]*\.aliyun\.com|ntp[0-9]*\.tencent\.com|time[0-9]*\.cloud\.tencent\.com|ntp\.ntsc\.ac\.cn|time\.ustc\.edu\.cn)@pool us.pool.ntp.org@' "$_chrony_cfg" 2>/dev/null || true
+                systemctl restart chrony.service 2>/dev/null || systemctl restart chronyd.service 2>/dev/null || true
+                NTP_CONF_CHANGED="true"
+            fi
+        done
+    fi
+
     _ACTIVE_NTP=""
     for _ntp_svc in systemd-timesyncd.service chrony.service chronyd.service ntpsec.service ntp.service ntpd.service; do
         if systemctl is-active --quiet "$_ntp_svc" 2>/dev/null; then
@@ -316,16 +467,31 @@ if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
         fi
     done
     if [[ -n "$_ACTIVE_NTP" ]]; then
-        log_skip "NTP time synchronization already active (${_ACTIVE_NTP})"
+        if [[ "$NTP_CONF_CHANGED" == "true" && "$_ACTIVE_NTP" == "systemd-timesyncd.service" ]]; then
+            systemctl restart systemd-timesyncd.service 2>/dev/null || true
+            log_ok "Configured US-first NTP pools (${TIMESYNCD_DROPIN_FILE}) and reloaded systemd-timesyncd"
+        elif [[ "$NTP_CONF_CHANGED" == "true" ]]; then
+            log_ok "Configured US-first NTP pools (${_ACTIVE_NTP})"
+        else
+            log_skip "US-first NTP time synchronization already active (${_ACTIVE_NTP})"
+        fi
+        if [[ "$NTP_CONF_CHANGED" == "true" && "$_ACTIVE_NTP" == "systemd-timesyncd.service" ]]; then
+            systemctl restart systemd-timesyncd.service 2>/dev/null || true
+            log_ok "Configured US-first NTP pools (${TIMESYNCD_DROPIN_FILE}) and reloaded systemd-timesyncd"
+        elif [[ "$NTP_CONF_CHANGED" == "true" ]]; then
+            log_ok "Configured US-first NTP pools (${_ACTIVE_NTP})"
+        else
+            log_skip "US-first NTP time synchronization already active (${_ACTIVE_NTP})"
+        fi
     else
-        log_info "Enabling persistent NTP synchronization (systemd-timesyncd)..."
+        log_info "Enabling persistent US-first NTP synchronization (systemd-timesyncd)..."
         if [[ ! -x /lib/systemd/systemd-timesyncd && ! -x /usr/lib/systemd/systemd-timesyncd ]]; then
             rvdk_apt_ensure systemd-timesyncd
         fi
         systemctl unmask systemd-timesyncd.service >/dev/null 2>&1 || true
         systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 || true
         command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1 || true
-        log_ok "Enabled persistent NTP synchronization (systemd-timesyncd.service)"
+        log_ok "Enabled persistent US-first NTP synchronization (systemd-timesyncd.service)"
     fi
 
     # Refresh fake-hwclock / timesync floor so clean & unclean reboots never regress to factory image build dates

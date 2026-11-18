@@ -5,14 +5,15 @@
 # Description: Idempotent Layer 2 BSP hardening for StarFive JH7110 / JH7110S
 #              (VisionFive 2, VisionFive 2 Lite, Milk-V Mars, Orange Pi RV) on Debian:
 #              - Protects vendor U-Boot & DTB hooks (/etc/kernel/postinst.d/zz-u-boot-menu)
-#              - Migrates legacy StarFive snapshot/debian-ports sources over HTTPS
-#                using signed Debian keyrings (never touches healthy DEB822 installs)
+#              - Migrates legacy StarFive snapshot/debian-ports & CN mirror sources
+#                onto signed US-first HTTPS Debian mirrors (`--with-vendor-repo`
+#                opt-in for StarFive's legacy vendor repository)
 #              - Purges Wayland/Weston/X11/GTK & unblocks t64 prior to full-upgrade
 #              - Persists primary wired NIC (eth0/end0) safely, masks sleep targets,
 #                locks U74 max OPP governor, and unlocks SiFive U74 PMU counters.
 #
 # Usage:
-#   sudo rvdk bsp [--skip-upgrade] [--debian-suite trixie|unstable] [--expose-kallsyms]
+#   sudo rvdk bsp [--skip-upgrade] [--debian-suite trixie|unstable] [--with-vendor-repo] [--expose-kallsyms]
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -21,6 +22,7 @@ ORIG_ARGS=("$@")
 SKIP_UPGRADE="false"
 DEBIAN_SUITE="trixie"
 EXPOSE_KALLSYMS="false"
+WITH_VENDOR_REPO="false"
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -61,7 +63,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-upgrade)                    SKIP_UPGRADE="true"; shift ;;
         --debian-suite)                    DEBIAN_SUITE="${2:-trixie}"; shift 2 ;;
+        --with-vendor-repo)                WITH_VENDOR_REPO="true"; shift ;;
         --expose-kallsyms)                 EXPOSE_KALLSYMS="true"; shift ;;
+        --keep-mirrors)                    export RVDK_KEEP_VENDOR_MIRRORS="1"; shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
         *)                                 shift ;;
@@ -87,7 +91,7 @@ rvdk_bsp_backup_boot_configs \
     /etc/default/u-boot \
     /etc/kernel/postinst.d/zz-u-boot-menu
 
-# 2. Migrate ONLY Legacy StarFive Snapshot / debian-ports Images Over Signed HTTPS
+# 2. Migrate Legacy StarFive Snapshot / debian-ports / CN Mirrors Over Signed US-First HTTPS
 rvdk_prog 28 "JH7110 BSP: checking APT sources & keyring..."
 SNAPSHOT_MIGRATION="false"
 if grep -rqE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
@@ -98,13 +102,20 @@ if grep -rqE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list
     fi
 
     log_info "Migrating legacy StarFive snapshot APT sources to signed HTTPS Debian (${DEBIAN_SUITE})..."
-    cp -a /etc/apt/sources.list "/etc/apt/sources.list.rvdk.bak" 2>/dev/null || true
+    mkdir -p /var/lib/rvdk/backups/apt
+    cp -a /etc/apt/sources.list "/var/lib/rvdk/backups/apt/etc__apt__sources.list.orig" 2>/dev/null || true
     rm -f /etc/apt/trusted.gpg.d/debian-ports* 2>/dev/null || true
 
     cat <<EOF > /etc/apt/sources.list
-deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE} main contrib non-free-firmware
+deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE} main contrib non-free non-free-firmware
 EOF
-    if [[ -f /etc/apt/trusted.gpg.d/starfive.gpg || -f /usr/share/keyrings/starfive-archive-keyring.gpg ]]; then
+    if [[ "$DEBIAN_SUITE" == "trixie" || "$DEBIAN_SUITE" == "testing" ]]; then
+        cat <<EOF >> /etc/apt/sources.list
+deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE}-updates main contrib non-free non-free-firmware
+deb [signed-by=${DEBIAN_KEYRING}] https://security.debian.org/debian-security ${DEBIAN_SUITE}-security main contrib non-free non-free-firmware
+EOF
+    fi
+    if [[ "$WITH_VENDOR_REPO" == "true" ]] && [[ -f /etc/apt/trusted.gpg.d/starfive.gpg || -f /usr/share/keyrings/starfive-archive-keyring.gpg ]]; then
         cat <<'EOF' >> /etc/apt/sources.list
 deb https://debianrepo-t.starfivetech.com starfive-debian main
 EOF
@@ -114,9 +125,9 @@ EOF
     apt-get clean
     RVDK_NO_APT_UPDATE="0" rvdk_apt_update
     rvdk_apt_ensure ca-certificates debian-archive-keyring
-    log_ok "Migrated legacy StarFive snapshot sources to signed HTTPS (${DEBIAN_SUITE})"
+    log_ok "Migrated legacy StarFive snapshot sources to signed US-first HTTPS (${DEBIAN_SUITE})"
 else
-    log_skip "APT sources are modern (non-snapshot); preserving existing Debian repository layout"
+    declare -F rvdk_apt_normalize_mirrors >/dev/null 2>&1 && rvdk_apt_normalize_mirrors
 fi
 
 if command -v systemctl >/dev/null 2>&1 && [[ "$(systemctl get-default 2>/dev/null || true)" != "multi-user.target" ]]; then

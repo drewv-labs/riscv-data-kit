@@ -287,6 +287,12 @@ main() {
                 systemd_dirty="true"
             fi
 
+            if [[ -f /etc/systemd/timesyncd.conf.d/10-rvdk-ntp.conf ]]; then
+                remove_path "/etc/systemd/timesyncd.conf.d/10-rvdk-ntp.conf"
+                [[ "$dry_run" != "true" ]] && rmdir /etc/systemd/timesyncd.conf.d 2>/dev/null || true
+                systemd_dirty="true"
+            fi
+
             remove_path "/etc/nftables.d/10-cve-2026-98432.nft"
             remove_path "/etc/nftables.d/cve-2026-98432.nft"
             remove_path "/etc/cve-2026-98432.nft"
