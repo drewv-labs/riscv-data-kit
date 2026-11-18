@@ -293,6 +293,12 @@ main() {
                 systemd_dirty="true"
             fi
 
+            if [[ -f /etc/systemd/resolved.conf.d/10-rvdk-dns.conf ]]; then
+                remove_path "/etc/systemd/resolved.conf.d/10-rvdk-dns.conf"
+                [[ "$dry_run" != "true" ]] && rmdir /etc/systemd/resolved.conf.d 2>/dev/null || true
+                systemd_dirty="true"
+            fi
+
             remove_path "/etc/nftables.d/10-cve-2026-98432.nft"
             remove_path "/etc/nftables.d/cve-2026-98432.nft"
             remove_path "/etc/cve-2026-98432.nft"

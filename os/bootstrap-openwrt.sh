@@ -148,6 +148,40 @@ if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" != "1" && "${RVDK_KEEP_VENDOR_MIRRORS:-fa
             log_skip "OpenWrt UCI NTP servers already converged on US-first pools"
         fi
     fi
+
+    OWRT_CN_DNS_RE='(114\.114\.114\.114|114\.114\.115\.115|223\.5\.5\.5|223\.6\.6\.6|119\.29\.29\.29|182\.254\.116\.116|180\.76\.76\.76|1\.2\.4\.8|210\.2\.4\.8)'
+    OWRT_DNS_CHANGED="false"
+    for _ocfg in /etc/config/network /etc/config/dhcp; do
+        [[ -f "$_ocfg" ]] || continue
+        if grep -Eq "$OWRT_CN_DNS_RE" "$_ocfg" 2>/dev/null; then
+            mkdir -p /var/lib/rvdk/backups/openwrt
+            [[ -f "/var/lib/rvdk/backups/openwrt/$(basename "$_ocfg").orig" ]] || cp -a "$_ocfg" "/var/lib/rvdk/backups/openwrt/$(basename "$_ocfg").orig" 2>/dev/null || true
+            _tmp_odns="$(mktemp)"
+            awk -v re="$OWRT_CN_DNS_RE" '
+                {
+                    if ($0 ~ re) {
+                        chg = 0
+                        for (i = 1; i <= NF; i++) {
+                            tok = $i; gsub(/['''"]/, "", tok)
+                            if (tok ~ ("^" re "$")) {
+                                rep = (!seen_p++) ? "1.1.1.1" : "8.8.8.8"
+                                sub(tok, rep, $i)
+                                chg = 1
+                            }
+                        }
+                    }
+                    print
+                }
+            ' "$_ocfg" > "$_tmp_odns"
+            chmod 0644 "$_tmp_odns"
+            mv -f "$_tmp_odns" "$_ocfg"
+            OWRT_DNS_CHANGED="true"
+        fi
+    done
+    if [[ "$OWRT_DNS_CHANGED" == "true" ]]; then
+        [[ -x /etc/init.d/dnsmasq ]] && /etc/init.d/dnsmasq reload 2>/dev/null || true
+        log_ok "Replaced OpenWrt factory CN DNS forwarders with 1.1.1.1 / 8.8.8.8"
+    fi
 fi
 
 if [[ -x /etc/init.d/sysntpd ]]; then
