@@ -2,8 +2,8 @@
 # ==============================================================================
 # DREW-V Labs // Day-0 OpenWrt RISC-V Router Node Bootstrap Script
 # Path: riscv-data-kit/os/bootstrap-openwrt.sh
-# Description: Idempotent Layer 1D UCI hostname, optional operator SSH/sudo
-#              account, and fw4-integrated nftables + MPTCP hardening for
+# Description: Idempotent Layer 1D cold-RTC sync, UCI hostname, optional operator
+#              SSH/sudo account, and fw4-integrated nftables + MPTCP hardening for
 #              OpenWrt RISC-V gateway/router nodes (e.g., Orange Pi R2S).
 #
 # Usage:
@@ -38,6 +38,7 @@ else
     rvdk_log_init() { :; }
     rvdk_validate_username() { [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
     rvdk_validate_hostname() { [[ ${#1} -ge 1 && ${#1} -le 253 && "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; }
+    rvdk_sync_cold_clock() { :; }
 fi
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
     # shellcheck source=lib/progbar.sh
@@ -103,6 +104,15 @@ fi
 export LANG="C" LC_ALL="C"
 
 rvdk_prog_init "OpenWrt Day-0 router normalization..."
+rvdk_sync_cold_clock
+
+if [[ -x /etc/init.d/sysntpd ]]; then
+    if ! /etc/init.d/sysntpd enabled 2>/dev/null; then
+        /etc/init.d/sysntpd enable 2>/dev/null || true
+        /etc/init.d/sysntpd start 2>/dev/null || true
+        log_ok "Enabled OpenWrt sysntpd NTP daemon"
+    fi
+fi
 
 # 1. Optional Operator User, SSH Keys & Sudoers (when shadow-useradd / sudo are installed)
 rvdk_prog 20 "Checking OpenWrt user & sudoers (${TARGET_USER:-root})..."

@@ -95,6 +95,61 @@ if [[ ! "$REPO_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
     log_fatal "Invalid RVDK_BRANCH name: '${REPO_BRANCH}'."
 fi
 
+# 0. Step skewed cold-RTC clocks on batteryless Linux SBCs via plain HTTP Date
+#    before APT InRelease validation or git HTTPS transport runs.
+sync_cold_rtc_clock() {
+    [[ "$(uname -s)" == "Linux" ]] || return 0
+    if command -v timedatectl >/dev/null 2>&1; then
+        if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]]; then
+            return 0
+        fi
+    fi
+
+    local hdr_date="" probe_url raw_hdr
+    for probe_url in \
+        "http://rvdk.drewv-labs.dev/" \
+        "http://deb.debian.org/" \
+        "http://connectivitycheck.gstatic.com/generate_204"; do
+        raw_hdr=""
+        if command -v curl >/dev/null 2>&1; then
+            raw_hdr="$(curl -fsSI --connect-timeout 3 --max-time 5 "$probe_url" 2>/dev/null || true)"
+        elif command -v wget >/dev/null 2>&1; then
+            raw_hdr="$(wget -qSO- --max-redirect=0 --timeout=4 "$probe_url" 2>&1 || true)"
+        else
+            return 0
+        fi
+        if [[ -n "$raw_hdr" ]]; then
+            hdr_date="$(printf '%s\n' "$raw_hdr" | awk 'tolower($1) == "date:" { sub(/^[[:space:]]*[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }')"
+            [[ -n "$hdr_date" ]] && break
+        fi
+    done
+    [[ -n "$hdr_date" ]] || return 0
+
+    local remote_epoch="" local_epoch=""
+    remote_epoch="$(date -u -d "$hdr_date" +%s 2>/dev/null || true)"
+    local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+
+    if [[ -n "$remote_epoch" && "$remote_epoch" =~ ^[0-9]+$ && "$local_epoch" =~ ^[0-9]+$ ]] && (( remote_epoch >= 1700000000 )); then
+        local skew=$(( remote_epoch - local_epoch ))
+        (( skew < 0 )) && skew=$(( -skew ))
+        if (( skew > 120 )); then
+            if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
+                if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
+                    date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true
+                fi
+                [[ -d /var/lib/systemd/timesync ]] && { : > /var/lib/systemd/timesync/clock 2>/dev/null || true; }
+                log_ok "Stepped cold-RTC system clock via HTTP Date (skew=${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+            fi
+        fi
+    elif (( local_epoch < 1700000000 )); then
+        if date -u -s "$hdr_date" >/dev/null 2>&1; then
+            log_ok "Stepped cold-RTC system clock via HTTP Date (-> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+        fi
+    fi
+    return 0
+}
+sync_cold_rtc_clock
+
 # 1. Ensure bash, git (+ HTTPS transport), and curl are installed across Debian/Ubuntu/Bianbu & OpenWrt
 NEED_GIT_HTTP="false"
 if [[ -f /etc/openwrt_release ]] && command -v git >/dev/null 2>&1 && [[ ! -x /usr/lib/git-core/git-remote-https ]]; then

@@ -130,6 +130,44 @@ RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
 log_rvdk()  { printf "\033[1;36m[RVDK]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
+# Step skewed system clocks on batteryless RISC-V SBCs via plain HTTP Date before HTTPS calls
+sync_cold_rtc_early() {
+    [[ "$(uname -s)" == "Linux" && $EUID -eq 0 ]] || return 0
+    if command -v timedatectl >/dev/null 2>&1; then
+        [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]] && return 0
+    fi
+    local hdr_date="" probe_url raw_hdr
+    for probe_url in "http://rvdk.drewv-labs.dev/" "http://deb.debian.org/"; do
+        raw_hdr=""
+        if command -v curl >/dev/null 2>&1; then
+            raw_hdr="$(curl -fsSI --connect-timeout 3 --max-time 5 "$probe_url" 2>/dev/null || true)"
+        elif command -v wget >/dev/null 2>&1; then
+            raw_hdr="$(wget -qSO- --max-redirect=0 --timeout=4 "$probe_url" 2>&1 || true)"
+        else
+            return 0
+        fi
+        if [[ -n "$raw_hdr" ]]; then
+            hdr_date="$(printf '%s\n' "$raw_hdr" | awk 'tolower($1) == "date:" { sub(/^[[:space:]]*[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }')"
+            [[ -n "$hdr_date" ]] && break
+        fi
+    done
+    [[ -n "$hdr_date" ]] || return 0
+    local remote_epoch="" local_epoch=""
+    remote_epoch="$(date -u -d "$hdr_date" +%s 2>/dev/null || true)"
+    local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+    if [[ -n "$remote_epoch" && "$remote_epoch" =~ ^[0-9]+$ && "$local_epoch" =~ ^[0-9]+$ ]] && (( remote_epoch >= 1700000000 )); then
+        local skew=$(( remote_epoch - local_epoch ))
+        (( skew < 0 )) && skew=$(( -skew ))
+        if (( skew > 120 )); then
+            if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
+                [[ -f /etc/fake-hwclock.data ]] && { date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true; }
+                log_rvdk "Stepped skewed cold-RTC clock via HTTP Date (skew=${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+            fi
+        fi
+    fi
+    return 0
+}
+
 resolve_script_path() {
     local src="$1" dir=""
     if readlink -f "$src" >/dev/null 2>&1; then
@@ -209,6 +247,7 @@ fi
 
 if [[ "${1:-}" == "update" || "${1:-}" == "self-update" ]]; then
     shift
+    sync_cold_rtc_early
     if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
         exec bash "${CANDIDATE_ROOT}/install-cli.sh" "$@"
     else
@@ -228,6 +267,7 @@ case "${1:-}" in
         elif [[ -f "${ENGINE_DIR}/utils/uninstall.sh" ]]; then
             exec bash "${ENGINE_DIR}/utils/uninstall.sh" ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
         else
+            sync_cold_rtc_early
             curl -fsSL "${RVDK_BASE_URL}/utils/uninstall.sh" | bash -s -- ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
             exit 0
         fi
@@ -246,6 +286,7 @@ elif [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]] && ! [[ "$CANDIDAT
         fi
     fi
 else
+    sync_cold_rtc_early
     if [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" ]]; then
         umask 022
         ENGINE_PARENT="$(dirname "$ENGINE_DIR")"
@@ -582,6 +623,12 @@ if [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
     [[ -f "${LOCAL_ROOT}/bsp/${SOC_PATH}/deeptune.sh" ]] && bash "${LOCAL_ROOT}/bsp/${SOC_PATH}/deeptune.sh" status
     [[ -n "$BOARD_PATH" && -f "${LOCAL_ROOT}/boards/${BOARD_PATH}/deeptune.sh" ]] && bash "${LOCAL_ROOT}/boards/${BOARD_PATH}/deeptune.sh" status
     exit 0
+fi
+
+if declare -F rvdk_sync_cold_clock >/dev/null 2>&1; then
+    rvdk_sync_cold_clock
+else
+    sync_cold_rtc_early
 fi
 
 export RVDK_APT_LIB="${LOCAL_ROOT}/lib/apt.sh"

@@ -20,8 +20,9 @@
         "Orange Pi RV2 SD card boot & on-board eMMC bootstrap:",
         "  1. Insert SD card into Orange Pi RV2 (BootROM prioritizes MicroSD over onboard eMMC).",
         "  2. Power on and SSH as factory account (orangepi / orangepi or root / orangepi).",
-        "  3. Run Day-0 bootstrap on SD: curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-rv2-sd --nopasswd",
-        "  4. Bootstrap onboard eMMC from the running SD card: sudo rvdk flash rv2 emmc [--hostname rv-rv2-emmc]"
+        "  3. (If cold RTC predates TLS cert) Sync clock: sudo date -u -s \"$(curl -fsSI http://rvdk.drewv-labs.dev/ | tr -d '\\r' | sed -n 's/^[Dd]ate: //p')\"",
+        "  4. Run Day-0 bootstrap on SD: curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-rv2-sd --nopasswd",
+        "  5. Bootstrap onboard eMMC from the running SD card: sudo rvdk flash rv2 emmc [--hostname rv-rv2-emmc]"
       ]
     },
     "emmc": {

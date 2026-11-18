@@ -5,11 +5,12 @@
 #
 # Reads board flash specifications from `boards/<vendor>/<board>/media.json` and
 # executes hardware-interlocked, cryptographically verified media preparation:
-#   • mode = "raw"        : Stream-decompresses (.zst/.xz/.bz2/.gz/raw) to block dev,
-#                           wipes stale backup GPT headers on reused cards, applies
-#                           deterministic ext4 rootfs labels (rvdk_sd_root /
-#                           rvdk_emmc_root), de-collides dual-media UUID + PARTUUID,
-#                           and provisions SpacemiT/Ky eMMC hardware boot0 SPL.
+#   • mode = "raw"          : Stream-decompresses (.zst/.xz/.bz2/.gz/raw) to block dev,
+#                             wipes stale backup GPT headers on reused cards, seeds
+#                             cold-RTC clock floor (/etc/fake-hwclock.data + timesync),
+#                             applies deterministic ext4 rootfs labels (rvdk_sd_root /
+#                             rvdk_emmc_root), de-collides dual-media UUID + PARTUUID,
+#                             and provisions SpacemiT/Ky eMMC hardware boot0 SPL.
 #   • mode = "uboot_ext4"   : Builds U-Boot compatible ext4 stick (-O ^metadata_csum_seed,^orphan_file)
 #   • mode = "sd_bootstrap" : Delegates on-board SD -> eMMC bootstrap to board script
 #
@@ -293,6 +294,60 @@ _rvdk_select_ext4_root_slice() {
     return 1
 }
 
+# Seed host UTC timestamp into unmounted ext4 `/etc/fake-hwclock.data`,
+# `/var/lib/systemd/timesync/clock`, and superblock check-time so batteryless
+# RISC-V SBCs boot inside the valid TLS certificate window on first power-on.
+_rvdk_seed_ext4_rtc_floor() {
+    local debugfs_bin="$1"
+    local tune2fs_bin="$2"
+    local root_slice="$3"
+
+    local now_epoch=""
+    now_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+    [[ "$now_epoch" =~ ^[0-9]+$ ]] && (( now_epoch >= 1700000000 )) || return 0
+
+    local utc_now
+    utc_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+    local seeded="false"
+
+    if [[ -n "$debugfs_bin" && -x "$debugfs_bin" ]]; then
+        local has_etc="" has_timesync=""
+        has_etc="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "stat /etc" "$root_slice" 2>/dev/null || true)"
+        has_timesync="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "stat /var/lib/systemd/timesync" "$root_slice" 2>/dev/null || true)"
+
+        if grep -q "Inode:" <<< "$has_etc" || grep -q "Inode:" <<< "$has_timesync"; then
+            local tmp_rtc tmp_empty tmp_cmds
+            tmp_rtc="$(mktemp "/tmp/rvdk_rtc.XXXXXX")"
+            tmp_empty="$(mktemp "/tmp/rvdk_ts.XXXXXX")"
+            tmp_cmds="$(mktemp "/tmp/rvdk_dbg.XXXXXX")"
+            printf '%s\n' "$utc_now" > "$tmp_rtc"
+            : > "$tmp_empty"
+            : > "$tmp_cmds"
+            if grep -q "Inode:" <<< "$has_etc"; then
+                printf 'rm /etc/fake-hwclock.data\nwrite %s /etc/fake-hwclock.data\n' "$tmp_rtc" >> "$tmp_cmds"
+            fi
+            if grep -q "Inode:" <<< "$has_timesync"; then
+                printf 'rm /var/lib/systemd/timesync/clock\nwrite %s /var/lib/systemd/timesync/clock\n' "$tmp_empty" >> "$tmp_cmds"
+            fi
+            chmod 0644 "$tmp_rtc" "$tmp_empty" "$tmp_cmds"
+            if _rvdk_dev_priv "$root_slice" "$debugfs_bin" -w -f "$tmp_cmds" "$root_slice" >/dev/null 2>&1; then
+                seeded="true"
+            fi
+            rm -f "$tmp_rtc" "$tmp_empty" "$tmp_cmds"
+        fi
+    fi
+
+    if [[ -n "$tune2fs_bin" && -x "$tune2fs_bin" ]]; then
+        if _rvdk_dev_priv "$root_slice" "$tune2fs_bin" -T now "$root_slice" >/dev/null 2>&1; then
+            seeded="true"
+        fi
+    fi
+
+    if [[ "$seeded" == "true" ]]; then
+        log_ok "Seeded cold-RTC floor: ${root_slice} -> ${utc_now} UTC"
+    fi
+}
+
 _rvdk_flash_postprocess_raw() {
     local os_type="$1"
     local block_dev="$2"
@@ -301,28 +356,26 @@ _rvdk_flash_postprocess_raw() {
     local regen_uuid="$5"
     local emmc_boot0="$6"
 
-    if [[ -z "$root_label" && "$regen_uuid" != "true" && "$emmc_boot0" != "true" ]]; then
-        return 0
-    fi
-
     if [[ -n "$root_label" && ! "$root_label" =~ ^[a-zA-Z0-9_.-]{1,16}$ ]]; then
         log_fatal "Invalid ext4 root label '${root_label}' (max 16 chars: [a-zA-Z0-9_.-])."
     fi
 
     if [[ "$os_type" == "Darwin" ]]; then
-        [[ -z "$root_label" ]] && return 0
-
-        local e2fs_sbin="" e2label_bin="" tune2fs_bin=""
+        local e2fs_sbin="" e2label_bin="" tune2fs_bin="" debugfs_bin=""
         if e2fs_sbin="$(_rvdk_find_macos_e2fs_dir)"; then
             e2label_bin="${e2fs_sbin}/e2label"
             tune2fs_bin="${e2fs_sbin}/tune2fs"
+            debugfs_bin="${e2fs_sbin}/debugfs"
         else
             e2label_bin="$(command -v e2label || true)"
             tune2fs_bin="$(command -v tune2fs || true)"
+            debugfs_bin="$(command -v debugfs || true)"
         fi
 
-        if [[ ! -x "$e2label_bin" || ! -x "$tune2fs_bin" ]]; then
-            log_warn "Homebrew e2fsprogs not found on macOS; skipping host e2label ('brew install e2fsprogs'). On-target 'sudo rvdk bsp' will apply '${root_label}'."
+        if [[ ! -x "$tune2fs_bin" ]]; then
+            if [[ -n "$root_label" ]]; then
+                log_warn "Homebrew e2fsprogs not found on macOS; skipping host e2label ('brew install e2fsprogs'). On-target 'sudo rvdk bsp' will apply '${root_label}'."
+            fi
             return 0
         fi
 
@@ -339,29 +392,33 @@ _rvdk_flash_postprocess_raw() {
         done
 
         if (( ${#slices[@]} == 0 )); then
-            log_warn "No partition slices detected on ${block_dev} after image stream; skipping host e2label."
+            [[ -n "$root_label" ]] && log_warn "No partition slices detected on ${block_dev} after image stream; skipping host ext4 hygiene."
             return 0
         fi
 
         local root_slice=""
         if ! root_slice="$(_rvdk_select_ext4_root_slice "$tune2fs_bin" "$root_part_hint" "${slices[@]}")"; then
-            log_warn "Could not locate an ext4 rootfs slice on ${block_dev}; skipping host e2label."
+            [[ -n "$root_label" ]] && log_warn "Could not locate an ext4 rootfs slice on ${block_dev}; skipping host ext4 hygiene."
             return 0
         fi
 
         diskutil unmountDisk "$block_dev" >/dev/null 2>&1 || true
-        _rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" "$root_label"
-        local verified_lbl=""
-        verified_lbl="$(_rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" 2>/dev/null | tr -d '[:space:]' || true)"
-        if [[ "$verified_lbl" != "$root_label" ]]; then
-            log_fatal "Failed to verify ext4 label '${root_label}' on ${root_slice} (got '${verified_lbl}')."
+        if [[ -n "$root_label" && -x "$e2label_bin" ]]; then
+            _rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" "$root_label"
+            local verified_lbl=""
+            verified_lbl="$(_rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ "$verified_lbl" != "$root_label" ]]; then
+                log_fatal "Failed to verify ext4 label '${root_label}' on ${root_slice} (got '${verified_lbl}')."
+            fi
+            log_ok "Labeled ext4 rootfs : ${root_slice} -> ${verified_lbl}"
         fi
-        log_ok "Labeled ext4 rootfs : ${root_slice} -> ${verified_lbl}"
+
+        _rvdk_seed_ext4_rtc_floor "$debugfs_bin" "$tune2fs_bin" "$root_slice"
         sync
         return 0
     fi
 
-    # Linux post-flash processing (partition re-read, UUID/PARTUUID de-collision, eMMC boot0 SPL, e2label)
+    # Linux post-flash processing (partition re-read, UUID/PARTUUID de-collision, eMMC boot0 SPL, RTC floor, e2label)
     _rvdk_run_priv partprobe "$block_dev" 2>/dev/null || _rvdk_run_priv blockdev --rereadpt "$block_dev" 2>/dev/null || true
     command -v udevadm >/dev/null 2>&1 && _rvdk_run_priv udevadm settle 2>/dev/null || sleep 1
 
@@ -386,10 +443,11 @@ _rvdk_flash_postprocess_raw() {
         fi
     fi
 
-    local e2label_bin tune2fs_bin e2fsck_bin
+    local e2label_bin tune2fs_bin e2fsck_bin debugfs_bin
     e2label_bin="$(command -v e2label || echo /sbin/e2label)"
     tune2fs_bin="$(command -v tune2fs || echo /sbin/tune2fs)"
     e2fsck_bin="$(command -v e2fsck || echo /sbin/e2fsck)"
+    debugfs_bin="$(command -v debugfs || echo /sbin/debugfs)"
 
     local linux_parts=()
     local lp_path lp_type
@@ -398,7 +456,7 @@ _rvdk_flash_postprocess_raw() {
     done < <(lsblk -ln -o PATH,TYPE "$block_dev" 2>/dev/null || true)
 
     if (( ${#linux_parts[@]} == 0 )); then
-        log_warn "No child partitions detected on ${block_dev}; skipping post-flash filesystem hygiene."
+        [[ -n "$root_label" ]] && log_warn "No child partitions detected on ${block_dev}; skipping post-flash filesystem hygiene."
         return 0
     fi
 
@@ -407,7 +465,7 @@ _rvdk_flash_postprocess_raw() {
         root_slice="$(_rvdk_select_ext4_root_slice "$tune2fs_bin" "$root_part_hint" "${linux_parts[@]}" || true)"
     fi
     if [[ -z "$root_slice" ]]; then
-        log_warn "Could not locate ext4 rootfs partition on ${block_dev}; skipping post-flash filesystem hygiene."
+        [[ -n "$root_label" ]] && log_warn "Could not locate ext4 rootfs partition on ${block_dev}; skipping post-flash filesystem hygiene."
         return 0
     fi
 
@@ -527,6 +585,8 @@ _rvdk_flash_postprocess_raw() {
         [[ "$linux_lbl" != "$root_label" ]] && log_fatal "Failed to verify ext4 label '${root_label}' on ${root_slice}."
         log_ok "Labeled ext4 rootfs : ${root_slice} -> ${linux_lbl}"
     fi
+
+    _rvdk_seed_ext4_rtc_floor "$debugfs_bin" "$tune2fs_bin" "$root_slice"
     sync
 }
 

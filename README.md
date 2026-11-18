@@ -30,6 +30,7 @@ Vendor RISC-V OS images frequently ship with desktop GUI bloat, background packa
 
 ### **Layer 1 — OS Normalization (`os/`):** 
 Converges Debian, Ubuntu, Bianbu, and OpenWrt root filesystems into lean, headless server/router baselines. 
+* Cold-RTC clock skew recovery (HTTP `Date:` step) & persistent NTP (`systemd-timesyncd` / `sysntpd`) for batteryless SBCs
 * Non-interactive operator account provisioning with SSH `authorized_keys` inheritance
 * Optional `NOPASSWD` sudoers drop-in (`visudo -cf` verified)
 * UTF-8 locales & RFC-1123 hostnames (systemd & OpenWrt UCI)
@@ -98,6 +99,9 @@ Self-contained, opt-in modules for:
 Boot a freshly flashed RISC-V board and run `bootstrap.sh` to install the `rvdk` CLI (`/usr/local/share/rvdk/engine` -> `/usr/bin/rvdk` & `/usr/local/bin/rvdk`), cache `/etc/rvdk/kit.env`, and converge both Layer 1 (`os/`) and Layer 2 (`bsp/`):
 
 ```bash
+# Optional on batteryless SBCs booted from stock images whose cold RTC predates TLS cert validity:
+sudo date -u -s "$(curl -fsSI http://rvdk.drewv-labs.dev/ | tr -d '\r' | sed -n 's/^[Dd]ate: //p')"
+
 curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-p550 --nopasswd
 ```
 
@@ -150,11 +154,11 @@ curl -fsSL https://rvdk.drewv-labs.dev/postgresql/latest/forge.sh | sudo bash
 
 ### 3. Host & On-Board Media Flashers (macOS Zsh & Linux Bash supported)
 
-Install `rvdk` on a macOS/Linux workstation (or run directly on a booted SBC) to pull, `SHA-256` verify, cache (`/var/cache/rvdk/` or `~/Library/Caches/rvdk/`), and flash vendor OS media with hardware safety interlocks, deterministic `ext4` root labels (`rvdk_sd_root` / `rvdk_emmc_root`), and dual-media UUID/PARTUUID de-collision:
+Install `rvdk` on a macOS/Linux workstation (or run directly on a booted SBC) to pull, `SHA-256` verify, cache (`/var/cache/rvdk/` or `~/Library/Caches/rvdk/`), and flash vendor OS media with hardware safety interlocks, cold-RTC clock floor seeding (`/etc/fake-hwclock.data`), deterministic `ext4` root labels (`rvdk_sd_root` / `rvdk_emmc_root`), and dual-media UUID/PARTUUID de-collision:
 
 ```bash
 rvdk flash list
-rvdk flash rv2 sd 4                                      # Flash Orange Pi RV2 SD card (/dev/disk4 -> rvdk_sd_root)
+rvdk flash rv2 sd 4                                      # Flash Orange Pi RV2 SD card (/dev/disk4 -> rvdk_sd_root + RTC floor)
 sudo rvdk flash rv2 emmc                                 # Bootstrap onboard RV2 eMMC from booted SD (boot0/U-Boot SPL + rvdk_emmc_root)
 rvdk flash vf2 sd 4                                      # Flash StarFive VisionFive 2 SD card (/dev/disk4)
 rvdk flash p550 usb 4                                    # Stage U-Boot ext4 recovery USB for HiFive Premier P550
@@ -172,19 +176,19 @@ riscv-data-kit/
 ├── bootstrap.sh                          # Universal dispatcher & `rvdk` CLI entrypoint
 ├── install-cli.sh                        # Stages /usr/local/share/rvdk/engine, /etc/rvdk, /var/cache/rvdk & links `rvdk`
 ├── lib/
-│   ├── common.sh                         # Safe non-executing .env parser/writer, validators & logging
+│   ├── common.sh                         # Safe non-executing .env parser/writer, cold-RTC sync, validators & logging
 │   ├── kit.sh                            # Hardware/OS Kit inference & <1ms /etc/rvdk/kit.env cache
 │   ├── bsp.sh                            # Shared Silicon BSP helpers (dpkg guard, NIC, SD/eMMC labels, PMU, cpufreq)
 │   ├── storage_guard.sh                  # Destructive block device & OS/swap disk safety interlocks
-│   ├── flash.sh                          # Metadata-driven macOS/Linux SD/eMMC/USB media flasher
+│   ├── flash.sh                          # Metadata-driven macOS/Linux SD/eMMC/USB media flasher & RTC floor seeder
 │   ├── apt.sh                            # Idempotent APT lock/stamp & single-pass update helper
 │   └── progbar.sh                        # Persistent VT100 bottom progress bar (standalone or stacked)
 ├── os/
-│   ├── bootstrap-apt.sh                  # Unified Debian/Ubuntu/Bianbu Day-0 engine & nftables guard
+│   ├── bootstrap-apt.sh                  # Unified Debian/Ubuntu/Bianbu Day-0 engine, NTP sync & nftables guard
 │   ├── bootstrap-debian.sh               # Layer 1A: Headless Debian Day-0 wrapper
 │   ├── bootstrap-ubuntu.sh               # Layer 1B: Headless Ubuntu Day-0 wrapper
 │   ├── bootstrap-bianbu.sh               # Layer 1C: Headless SpacemiT Bianbu OS Day-0 wrapper
-│   ├── bootstrap-openwrt.sh              # Layer 1D: OpenWrt UCI hostname & fw4/procd router guard
+│   ├── bootstrap-openwrt.sh              # Layer 1D: OpenWrt UCI hostname, sysntpd & fw4/procd router guard
 │   └── deeptune.sh                       # Layer 1 DeepTune: Persistent journald, zram/ramlog retire, THP & VM
 ├── bsp/
 │   ├── eswin/                            # Layer 2: EIC7700X DTB guard, end0 netplan, PWM fan, P550 PMU & DeepTune

@@ -10,6 +10,7 @@
 #   • Safe, non-executing key-value .env reader/writer (rvdk_kv_load, rvdk_load_config_env, rvdk_kv_write)
 #   • Strict RFC-1123, POSIX username, IPv4 CIDR, PG identifier & path validators
 #   • Dynamic primary NIC IPv4 subnet CIDR discovery (rvdk_detect_primary_cidr)
+#   • Batteryless SBC cold-RTC clock skew recovery via plain HTTP Date header (rvdk_sync_cold_clock)
 # ==============================================================================
 
 if [[ "${_RVDK_COMMON_SOURCED:-0}" == "1" ]]; then
@@ -292,4 +293,65 @@ rvdk_sha256_file() {
     else
         log_fatal "Neither sha256sum nor shasum is installed for cryptographic verification."
     fi
+}
+
+# Step skewed system clocks on batteryless RISC-V SBCs (e.g., RV2, VF2, R2S) via
+# plain HTTP `Date:` header before TLS/HTTPS or APT InRelease signature checks run.
+rvdk_sync_cold_clock() {
+    [[ "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 ]] || return 0
+    [[ "${_RVDK_CLOCK_CHECKED:-0}" == "1" ]] && return 0
+    _RVDK_CLOCK_CHECKED="1"
+
+    if command -v timedatectl >/dev/null 2>&1; then
+        if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]]; then
+            return 0
+        fi
+    fi
+
+    local hdr_date="" probe_url raw_hdr
+    for probe_url in \
+        "http://rvdk.drewv-labs.dev/" \
+        "http://deb.debian.org/" \
+        "http://connectivitycheck.gstatic.com/generate_204"; do
+        raw_hdr=""
+        if command -v curl >/dev/null 2>&1; then
+            raw_hdr="$(curl -fsSI --connect-timeout 3 --max-time 5 "$probe_url" 2>/dev/null || true)"
+        elif command -v wget >/dev/null 2>&1; then
+            raw_hdr="$(wget -qSO- --max-redirect=0 --timeout=4 "$probe_url" 2>&1 || true)"
+        else
+            return 0
+        fi
+        if [[ -n "$raw_hdr" ]]; then
+            hdr_date="$(awk 'tolower($1) == "date:" { sub(/^[[:space:]]*[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' <<< "$raw_hdr")"
+            [[ -n "$hdr_date" ]] && break
+        fi
+    done
+    [[ -n "$hdr_date" ]] || return 0
+
+    local remote_epoch="" local_epoch=""
+    remote_epoch="$(date -u -d "$hdr_date" +%s 2>/dev/null || true)"
+    local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+
+    if [[ -n "$remote_epoch" && "$remote_epoch" =~ ^[0-9]+$ && "$local_epoch" =~ ^[0-9]+$ ]] && (( remote_epoch >= 1700000000 )); then
+        local skew=$(( remote_epoch - local_epoch ))
+        (( skew < 0 )) && skew=$(( -skew ))
+        if (( skew > 120 )); then
+            if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
+                if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
+                    date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true
+                fi
+                if [[ -d /var/lib/systemd/timesync ]]; then
+                    : > /var/lib/systemd/timesync/clock 2>/dev/null || true
+                fi
+                hwclock --systohc --utc >/dev/null 2>&1 || true
+                log_ok "Stepped cold-RTC system clock via HTTP Date (skew=${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+            fi
+        fi
+    elif (( local_epoch < 1700000000 )); then
+        # BusyBox `date` without GNU `-d @epoch`: attempt direct RFC-2822 step only when local clock is clearly pre-2023
+        if date -u -s "$hdr_date" >/dev/null 2>&1; then
+            log_ok "Stepped cold-RTC system clock via HTTP Date (-> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+        fi
+    fi
+    return 0
 }

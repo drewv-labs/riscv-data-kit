@@ -6,7 +6,8 @@
 # Description:
 #   Idempotent Day-0 OS normalization across Debian, Ubuntu, and SpacemiT Bianbu
 #   RISC-V nodes:
-#     • UTF-8 locale hygiene & non-interactive `sudo` availability
+#     • Cold-RTC clock skew recovery, persistent NTP (`systemd-timesyncd`),
+#       UTF-8 locale hygiene & non-interactive `sudo` availability
 #     • Strict RFC-1123 hostname convergence with awk-safe `/etc/hosts` rewrite
 #     • Non-interactive POSIX user provisioning (safe under `curl | sudo bash`),
 #       automatic SSH `authorized_keys` inheritance, & `visudo`-verified sudoers
@@ -55,6 +56,7 @@ else
     rvdk_validate_hostname() { [[ ${#1} -ge 1 && ${#1} -le 253 && "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; }
     rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
     rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_HOME="/root"; }
+    rvdk_sync_cold_clock() { :; }
 fi
 if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
     # shellcheck source=lib/apt.sh
@@ -172,6 +174,7 @@ fi
 
 rvdk_sanitize_locale
 rvdk_resolve_caller
+rvdk_sync_cold_clock
 
 # Auto-detect APT distro flavor if set to auto
 if [[ "$DISTRO_FLAVOR" == "auto" ]]; then
@@ -293,13 +296,47 @@ if [[ "$DEBLOAT_ONLY" == "true" ]]; then
 fi
 
 # ==============================================================================
-# 0. SUDO & UTF-8 LOCALE HYGIENE
+# 0. SUDO, PERSISTENT NTP TIME-SYNC & UTF-8 LOCALE HYGIENE
 # ==============================================================================
-rvdk_prog 5 "Verifying sudo & UTF-8 locale..."
+rvdk_prog 5 "Verifying sudo, NTP clock sync & UTF-8 locale..."
 if ! command -v sudo >/dev/null 2>&1; then
     log_info "Installing missing 'sudo' package..."
     rvdk_apt_ensure sudo
     log_ok "Installed 'sudo'"
+fi
+
+# Ensure batteryless RISC-V SBCs (e.g., Debian minimal images lacking systemd-timesyncd)
+# run a persistent NTP daemon across cold power cycles.
+if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    _ACTIVE_NTP=""
+    for _ntp_svc in systemd-timesyncd.service chrony.service chronyd.service ntpsec.service ntp.service ntpd.service; do
+        if systemctl is-active --quiet "$_ntp_svc" 2>/dev/null; then
+            _ACTIVE_NTP="$_ntp_svc"
+            break
+        fi
+    done
+    if [[ -n "$_ACTIVE_NTP" ]]; then
+        log_skip "NTP time synchronization already active (${_ACTIVE_NTP})"
+    else
+        log_info "Enabling persistent NTP synchronization (systemd-timesyncd)..."
+        if [[ ! -x /lib/systemd/systemd-timesyncd && ! -x /usr/lib/systemd/systemd-timesyncd ]]; then
+            rvdk_apt_ensure systemd-timesyncd
+        fi
+        systemctl unmask systemd-timesyncd.service >/dev/null 2>&1 || true
+        systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+        command -v timedatectl >/dev/null 2>&1 && timedatectl set-ntp true >/dev/null 2>&1 || true
+        log_ok "Enabled persistent NTP synchronization (systemd-timesyncd.service)"
+    fi
+
+    # Refresh fake-hwclock / timesync floor so clean & unclean reboots never regress to factory image build dates
+    if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
+        if (( $(date -u +%s 2>/dev/null || echo 0) >= 1700000000 )); then
+            date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true
+        fi
+    fi
+    if [[ -d /var/lib/systemd/timesync ]] && (( $(date -u +%s 2>/dev/null || echo 0) >= 1700000000 )); then
+        : > /var/lib/systemd/timesync/clock 2>/dev/null || true
+    fi
 fi
 
 if [[ "$FIX_LOCALE" == "true" ]]; then
