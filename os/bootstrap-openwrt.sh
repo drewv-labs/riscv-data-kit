@@ -160,13 +160,11 @@ if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" != "1" && "${RVDK_KEEP_VENDOR_MIRRORS:-fa
             awk -v re="$OWRT_CN_DNS_RE" '
                 {
                     if ($0 ~ re) {
-                        chg = 0
                         for (i = 1; i <= NF; i++) {
-                            tok = $i; gsub(/['''"]/, "", tok)
+                            tok = $i; gsub(/["\047]/, "", tok)
                             if (tok ~ ("^" re "$")) {
                                 rep = (!seen_p++) ? "1.1.1.1" : "8.8.8.8"
                                 sub(tok, rep, $i)
-                                chg = 1
                             }
                         }
                     }
