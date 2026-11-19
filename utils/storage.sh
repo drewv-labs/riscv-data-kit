@@ -13,8 +13,8 @@
 # Usage:
 #   rvdk storage [status]
 #   sudo rvdk storage grow --lv lv_data --gb 100 [--dry-run]
-#   sudo rvdk storage shrink --lv lv_nfs --gb 50 [--dry-run]
-#   sudo rvdk storage autotune [--weights lv_data:1.5,lv_nfs:1.0] [--dry-run]
+#   sudo rvdk storage shrink --lv lv_secondary --gb 50 [--dry-run]
+#   sudo rvdk storage autotune [--weights lv_data:1.5,lv_secondary:1.0] [--dry-run]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -33,9 +33,23 @@ _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
 # @RVDK_INLINE_LIBS: common
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_REPO_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:STORAGE]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
+        rvdk_sanitize_locale() { export LANG=C LC_ALL=C; }
+        rvdk_resolve_caller() { :; }
+        rvdk_load_config_env() { :; }
+        rvdk_normalize_mount_path() { local p="${1:-}"; [[ -n "$p" && "$p" != "/" ]] && p="${p%/}"; printf '%s\n' "$p"; }
+    fi
 fi
 
 print_storage_help() {
@@ -57,9 +71,6 @@ Subcommands:
                             • Reclaims idle Btrfs slack (<30% used) if another LV needs extents
                             • Preserves --min-reserve-pct (default 5%) unless critical (>=88% full)
 
-Legacy Aliases (Deprecated):
-  grow-psql, grow-nfs, shrink-nfs
-
 Size & Tuning Options:
   --lv <lv_name>          Target Logical Volume name (required for 'grow' and 'shrink')
   --gb <N>                Size delta in GiB (supports decimals, e.g. --gb 100 or --gb 2.5)
@@ -67,7 +78,7 @@ Size & Tuning Options:
   --tb <N>                Size delta in TiB (e.g. --tb 1)
   --pct-free <1..100>     Percentage of unallocated VG elastic pool extents ('grow' only)
   --vg <vg_name>          Explicit LVM Volume Group override (auto-detected by default)
-  --weights <lv:w,...>    Comma-separated autotune weights (e.g. --weights lv_data:1.5,lv_vault:1.0)
+  --weights <lv:w,...>    Comma-separated autotune weights (e.g. --weights lv_data:1.5,lv_secondary:1.0)
   --dry-run, -n           Compute and print exact LVM/FS resize plan without mutating disks
   --distribute-pool       (autotune) Proportionally distribute elastic pool even below high-water
 EOF
@@ -110,8 +121,8 @@ main() {
     local vg_name="${VG_NAME:-}"
     local primary_lv="${LV_NAME:-lv_data}"
     local primary_mount="${MOUNT_POINT:-/mnt/nvme_data}"
-    local secondary_lv="${SECONDARY_LV_NAME:-${NFS_LV_NAME:-lv_nfsvault}}"
-    local secondary_mount="${SECONDARY_MOUNT_POINT:-${NFS_MOUNT_POINT:-/mnt/nfs_vault}}"
+    local secondary_lv="${SECONDARY_LV_NAME:-${NFS_LV_NAME:-lv_secondary}}"
+    local secondary_mount="${SECONDARY_MOUNT_POINT:-${NFS_MOUNT_POINT:-/mnt/nvme_secondary}}"
 
     local subcmd="status"
     if [[ $# -gt 0 && "$1" != -* ]]; then
@@ -176,7 +187,7 @@ main() {
                 weights_csv="${2:-}"; shift 2 ;;
             --weights=*)
                 weights_csv="${1#*=}"; shift ;;
-            --pg-mount|--mount-point)
+            --mount|--mount-point)
                 primary_mount="${2:-}"; shift 2 ;;
             --nfs-mount|--secondary-mount)
                 secondary_mount="${2:-}"; shift 2 ;;
@@ -197,6 +208,8 @@ main() {
         esac
     done
 
+    primary_mount="$(rvdk_normalize_mount_path "$primary_mount")"
+    secondary_mount="$(rvdk_normalize_mount_path "$secondary_mount")"
     [[ -n "$cli_vg" ]] && vg_name="$cli_vg"
 
     # Auto-discover active Volume Group if unspecified or absent
@@ -207,7 +220,7 @@ main() {
         fi
         if [[ -z "$detected_vg" ]]; then
             local m_cand m_src
-            for m_cand in "$primary_mount" "/mnt/nvme_pgdata" "$secondary_mount"; do
+            for m_cand in "$primary_mount" "$secondary_mount" "/mnt/nfs_vault"; do
                 [[ -n "$m_cand" ]] || continue
                 m_src="$(findmnt -n -o SOURCE "$m_cand" 2>/dev/null || true)"
                 if [[ -n "$m_src" ]]; then
@@ -217,7 +230,7 @@ main() {
             done
         fi
         if [[ -z "$detected_vg" ]]; then
-            detected_vg="$(lvs --noheadings -o vg_name,lv_name 2>/dev/null | awk -v p="$primary_lv" -v s="$secondary_lv" '$2==p || $2=="lv_pgdata" || $2=="lv_data" || $2==s {print $1; exit}' || true)"
+            detected_vg="$(lvs --noheadings -o vg_name,lv_name 2>/dev/null | awk -v p="$primary_lv" -v s="$secondary_lv" '$2==p || $2=="lv_data" || $2==s || $2=="lv_secondary" || $2=="lv_nfsvault" {print $1; exit}' || true)"
         fi
         if [[ -z "$detected_vg" ]]; then
             local vg_cnt
@@ -321,8 +334,8 @@ main() {
             IFS="$old_ifs"
         fi
         case "$lv_n" in
-            lv_data|lv_pgdata|"$primary_lv") echo "1.5" ;;
-            *)                               echo "1.0" ;;
+            lv_data|"$primary_lv") echo "1.5" ;;
+            *)                     echo "1.0" ;;
         esac
     }
 
@@ -509,15 +522,25 @@ main() {
         log_ok "Shrank ${LV_MNT} online -> $(human_bytes "$new_lv_b") (+$(human_bytes "$sub_bytes") returned to '${vg_name}' elastic pool)"
     }
 
-    resolve_legacy_primary_lv() {
+    resolve_primary_lv() {
         if lvs "${vg_name}/${primary_lv}" >/dev/null 2>&1; then
             echo "$primary_lv"
-        elif lvs "${vg_name}/lv_pgdata" >/dev/null 2>&1; then
-            echo "lv_pgdata"
         elif lvs "${vg_name}/lv_data" >/dev/null 2>&1; then
             echo "lv_data"
         else
             echo "$primary_lv"
+        fi
+    }
+
+    resolve_secondary_lv() {
+        if lvs "${vg_name}/${secondary_lv}" >/dev/null 2>&1; then
+            echo "$secondary_lv"
+        elif lvs "${vg_name}/lv_nfsvault" >/dev/null 2>&1; then
+            echo "lv_nfsvault"
+        elif lvs "${vg_name}/lv_secondary" >/dev/null 2>&1; then
+            echo "lv_secondary"
+        else
+            echo "$secondary_lv"
         fi
     }
 
@@ -733,31 +756,35 @@ main() {
             shrink_btrfs_lv_online "$target_lv" "" "$req_ext"
             print_status_report
             ;;
-        grow-psql|grow-pg|grow-postgres|extend-psql|add-psql|add-pg|add-postgres)
-            local resolved_pg_lv
-            resolved_pg_lv="$(resolve_legacy_primary_lv)"
-            log_warn "'${subcmd}' is deprecated; prefer 'sudo rvdk storage grow --lv ${resolved_pg_lv}'."
+        grow-primary|extend-primary|add-primary)
+            local resolved_pri_lv
+            resolved_pri_lv="$(resolve_primary_lv)"
+            log_warn "'${subcmd}' is deprecated; prefer 'sudo rvdk storage grow --lv ${resolved_pri_lv}'."
             read_vg_metrics
             local req_ext
             req_ext="$(parse_requested_extents "$vg_pe_b" "$vg_ext_free")"
-            extend_lv_online "$resolved_pg_lv" "$primary_mount" "$req_ext"
+            extend_lv_online "$resolved_pri_lv" "$primary_mount" "$req_ext"
             print_status_report
             ;;
-        grow-nfs|extend-nfs|add-nfs)
-            log_warn "'${subcmd}' is deprecated; prefer 'sudo rvdk storage grow --lv ${secondary_lv}'."
+        grow-nfs|extend-nfs|add-nfs|grow-secondary)
+            local resolved_sec_lv
+            resolved_sec_lv="$(resolve_secondary_lv)"
+            log_warn "'${subcmd}' is deprecated; prefer 'sudo rvdk storage grow --lv ${resolved_sec_lv}'."
             read_vg_metrics
             local req_ext
             req_ext="$(parse_requested_extents "$vg_pe_b" "$vg_ext_free")"
-            extend_lv_online "$secondary_lv" "$secondary_mount" "$req_ext"
+            extend_lv_online "$resolved_sec_lv" "$secondary_mount" "$req_ext"
             print_status_report
             ;;
-        shrink-nfs|reduce-nfs|reclaim-nfs)
-            log_warn "'${subcmd}' is deprecated; prefer 'sudo rvdk storage shrink --lv ${secondary_lv}'."
+        shrink-nfs|reduce-nfs|reclaim-nfs|shrink-secondary)
+            local resolved_sec_lv
+            resolved_sec_lv="$(resolve_secondary_lv)"
+            log_warn "'${subcmd}' is deprecated; prefer 'sudo rvdk storage shrink --lv ${resolved_sec_lv}'."
             [[ -n "$pct_free" ]] && log_fatal "--pct-free is only valid when growing from free VG extents (use --gb or --mb for shrink)."
             read_vg_metrics
             local req_ext
             req_ext="$(parse_requested_extents "$vg_pe_b" "$vg_ext_free")"
-            shrink_btrfs_lv_online "$secondary_lv" "$secondary_mount" "$req_ext"
+            shrink_btrfs_lv_online "$resolved_sec_lv" "$secondary_mount" "$req_ext"
             print_status_report
             ;;
         autotune|auto-tune|balance|autobalance)

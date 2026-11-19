@@ -8,17 +8,22 @@
 #   • Root privilege escalation helper (rvdk_require_root) & caller resolution (rvdk_resolve_caller)
 #   • SSH-forwarded locale hygiene (rvdk_sanitize_locale)
 #   • Safe, non-executing key-value .env reader/writer (rvdk_kv_load, rvdk_load_config_env, rvdk_kv_write)
+#   • Atomic same-directory file writer with signal-safe temp cleanup (rvdk_atomic_write)
+#   • Workload-neutral data mount resolver (rvdk_resolve_data_mount, rvdk_normalize_mount_path)
 #   • Strict RFC-1123, POSIX username, IPv4 CIDR, PG identifier & path validators
 #   • Dynamic primary NIC IPv4 subnet CIDR discovery (rvdk_detect_primary_cidr)
-#   • Batteryless SBC cold-RTC clock skew recovery via plain HTTP Date header (rvdk_sync_cold_clock)
+#   • Monotonic cold-RTC clock recovery with MITM rollback guard (rvdk_sync_cold_clock)
 # ==============================================================================
 
-if [[ "${_RVDK_COMMON_SOURCED:-0}" == "1" ]]; then
-    return 0 2>/dev/null || true
-fi
-_RVDK_COMMON_SOURCED="1"
+[[ -n "${_RVDK_COMMON_SH_LOADED:-}" ]] && return 0
+_RVDK_COMMON_SH_LOADED=1
 
 _RVDK_LOG_TAG="${_RVDK_LOG_TAG:-RVDK}"
+RVDK_MIN_VALID_EPOCH=1767225600
+
+if [[ -z "${_RVDK_TMPFILES+x}" ]]; then
+    _RVDK_TMPFILES=()
+fi
 
 rvdk_log_init() {
     _RVDK_LOG_TAG="${1:-RVDK}"
@@ -30,6 +35,46 @@ log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 log_err()   { printf "\033[1;31m[ERR!]\033[0m %s\n" "$1" >&2; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+
+_rvdk_cleanup_tmpfiles() {
+    local _tf
+    for _tf in ${_RVDK_TMPFILES[@]+"${_RVDK_TMPFILES[@]}"}; do
+        [[ -n "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
+    done
+    _RVDK_TMPFILES=()
+}
+
+# Atomically write stdin to <target_path> via same-directory temp file + mv -f.
+# Usage: rvdk_atomic_write <target_path> <octal_mode> [<owner:group>]
+rvdk_atomic_write() {
+    local target_path="$1"
+    local file_mode="${2:-0644}"
+    local owner_group="${3:-}"
+
+    local dir base tmp_file
+    dir="$(dirname "$target_path")"
+    base="$(basename "$target_path")"
+    mkdir -p "$dir"
+
+    if [[ "${_RVDK_TMP_TRAP_SET:-0}" != "1" ]]; then
+        _RVDK_TMP_TRAP_SET="1"
+        if [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+            trap '_rvdk_cleanup_tmpfiles' EXIT
+            trap '_rvdk_cleanup_tmpfiles; trap - INT; kill -INT $$' INT
+            trap '_rvdk_cleanup_tmpfiles; trap - TERM; kill -TERM $$' TERM
+        fi
+    fi
+
+    tmp_file="$(mktemp "${dir}/.${base}.rvdk.XXXXXX")"
+    _RVDK_TMPFILES+=("$tmp_file")
+
+    cat > "$tmp_file"
+    chmod "$file_mode" "$tmp_file"
+    if [[ -n "$owner_group" ]]; then
+        chown "$owner_group" "$tmp_file"
+    fi
+    mv -f "$tmp_file" "$target_path"
+}
 
 # Escalate to root via sudo if EUID != 0 (while allowing unprivileged -h/--help inspection)
 rvdk_require_root() {
@@ -104,6 +149,33 @@ rvdk_resolve_caller() {
     export REAL_USER REAL_GRP REAL_HOME
 }
 
+# Normalize trailing slashes on mountpoint paths while preserving root "/"
+rvdk_normalize_mount_path() {
+    local p="${1:-}"
+    while [[ "$p" != "/" && "$p" == */ ]]; do
+        p="${p%/}"
+    done
+    printf '%s' "$p"
+}
+
+# Resolve target data mountpoint without legacy appliance bleed:
+#   1. Explicit argument (or $MOUNT_POINT) normalized if non-empty
+#   2. /mnt/nvme_data ONLY when actively mounted (`mountpoint -q /mnt/nvme_data`)
+#   3. Empty string "" otherwise (caller falls back to OS service path)
+rvdk_resolve_data_mount() {
+    local explicit="${1:-${MOUNT_POINT:-}}"
+    if [[ -n "$explicit" ]]; then
+        rvdk_normalize_mount_path "$explicit"
+        printf '\n'
+        return 0
+    fi
+    if command -v mountpoint >/dev/null 2>&1 && mountpoint -q /mnt/nvme_data 2>/dev/null; then
+        printf '/mnt/nvme_data\n'
+        return 0
+    fi
+    printf '\n'
+}
+
 # Safe non-executing key-value loader. Never invokes `source` or command expansion.
 # Usage: rvdk_kv_load <env_file> [--preserve-existing] <ALLOWED_KEY_1> [ALLOWED_KEY_2 ...]
 rvdk_kv_load() {
@@ -119,6 +191,7 @@ rvdk_kv_load() {
     [[ $# -eq 0 ]] && return 0
 
     local allowed_list=" $* "
+    local _bs=$'\x01'
     local raw_line line key val first_ch last_ch
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
         line="${raw_line%$'\r'}"
@@ -137,8 +210,12 @@ rvdk_kv_load() {
         [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
         [[ "$allowed_list" == *" ${key} "* ]] || continue
 
-        if [[ "$preserve" == "true" && -n "${!key+x}" && -n "${!key}" ]]; then
-            continue
+        if [[ "$preserve" == "true" ]]; then
+            local _cur_set=""
+            eval "_cur_set=\"\${${key}:-}\""
+            if [[ -n "$_cur_set" ]]; then
+                continue
+            fi
         fi
 
         # Strip unquoted inline comments and surrounding whitespace
@@ -149,8 +226,11 @@ rvdk_kv_load() {
             last_ch="${val:$(( ${#val} - 1 )):1}"
             if [[ "$first_ch" == '"' && "$last_ch" == '"' ]]; then
                 val="${val:1:$(( ${#val} - 2 ))}"
+                val="${val//\\\\/${_bs}}"
                 val="${val//\\\"/\"}"
-                val="${val//\\\\/\\}"
+                val="${val//\\\$/\$}"
+                val="${val//\\\`/\`}"
+                val="${val//${_bs}/\\}"
             elif [[ "$first_ch" == "'" && "$last_ch" == "'" ]]; then
                 val="${val:1:$(( ${#val} - 2 ))}"
             else
@@ -159,9 +239,8 @@ rvdk_kv_load() {
             fi
         fi
 
-        # Reject shell command-substitution tokens or control characters in untrusted env files
-        if [[ "$val" == *'$('* || "$val" == *'`'* || "$val" == *$'\n'* ]]; then
-            log_warn "Ignored unsafe value for '${key}' in ${env_file}"
+        if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+            log_warn "Ignored multiline value for '${key}' in ${env_file}"
             continue
         fi
 
@@ -197,7 +276,6 @@ rvdk_kv_write() {
     chmod 0755 "$parent_dir" 2>/dev/null || true
 
     local nl=$'\n' cr=$'\r'
-    local tmp_file="${target_file}.tmp.$$"
     {
         printf "# %s\n" "$header"
         local pair k v esc
@@ -212,9 +290,7 @@ rvdk_kv_write() {
             esc="${esc//\`/\\\`}"
             printf '%s="%s"\n' "$k" "$esc"
         done
-    } > "$tmp_file"
-    chmod "$file_mode" "$tmp_file"
-    mv -f "$tmp_file" "$target_file"
+    } | rvdk_atomic_write "$target_file" "$file_mode"
 }
 
 # Strict Validators
@@ -295,18 +371,74 @@ rvdk_sha256_file() {
     fi
 }
 
-# Step skewed system clocks on batteryless RISC-V SBCs (e.g., RV2, VF2, R2S) via
-# plain HTTP `Date:` header before TLS/HTTPS or APT InRelease signature checks run.
-rvdk_sync_cold_clock() {
-    [[ "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 ]] || return 0
-    [[ "${_RVDK_CLOCK_CHECKED:-0}" == "1" ]] && return 0
-    _RVDK_CLOCK_CHECKED="1"
+# Parse RFC-7231 / RFC-2822 UTC HTTP Date header ("Wed, 18 Nov 2026 23:24:37 GMT") into Unix epoch
+_rvdk_parse_http_date_epoch() {
+    local hdr="$1"
+    local parsed=""
+    parsed="$(date -u -d "$hdr" +%s 2>/dev/null || true)"
+    if [[ "$parsed" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$parsed"
+        return 0
+    fi
+    awk '
+    BEGIN {
+        split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " ")
+        for (i = 1; i <= 12; i++) mon[m[i]] = i
+    }
+    {
+        # Match: [Day,] DD Mon YYYY HH:MM:SS GMT
+        for (i = 1; i <= NF; i++) {
+            if ($i in mon && i >= 2 && (i + 2) <= NF) {
+                d = $(i - 1) + 0
+                mo = mon[$i]
+                y = $(i + 1) + 0
+                split($(i + 2), t, ":")
+                hh = t[1] + 0; mm = t[2] + 0; ss = t[3] + 0
+                if (y < 1970 || d < 1 || d > 31) exit 1
+                y_adj = y - (mo <= 2 ? 1 : 0)
+                era = int((y_adj >= 0 ? y_adj : y_adj - 399) / 400)
+                yoe = y_adj - era * 400
+                mp = mo + (mo > 2 ? -3 : 9)
+                doy = int((153 * mp + 2) / 5) + d - 1
+                doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+                days = era * 146097 + doe - 719468
+                printf "%d\n", days * 86400 + hh * 3600 + mm * 60 + ss
+                exit 0
+            }
+        }
+        exit 1
+    }' <<< "$hdr"
+}
 
+# Step cold-reset system clocks on batteryless RISC-V SBCs ONLY when local time
+# predates RVDK_MIN_VALID_EPOCH (2026-01-01T00:00:00Z) and no NTP daemon is synced.
+# Strictly monotonic: never touches plain HTTP once valid/synced and never steps backward.
+rvdk_sync_cold_clock() {
+    local local_epoch=""
+    local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+    [[ "$local_epoch" =~ ^[0-9]+$ ]] || local_epoch=0
+
+    # Fast-return without any plain HTTP request if clock is valid or NTP-synchronized
+    if (( local_epoch >= RVDK_MIN_VALID_EPOCH )); then
+        return 0
+    fi
     if command -v timedatectl >/dev/null 2>&1; then
         if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]]; then
             return 0
         fi
     fi
+    if [[ -e /run/systemd/timesync/synchronized ]]; then
+        return 0
+    fi
+    if command -v chronyc >/dev/null 2>&1; then
+        if chronyc tracking 2>/dev/null | grep -qE '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+            return 0
+        fi
+    fi
+
+    [[ "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 ]] || return 0
+    [[ "${_RVDK_CLOCK_CHECKED:-0}" == "1" ]] && return 0
+    _RVDK_CLOCK_CHECKED="1"
 
     local hdr_date="" probe_url raw_hdr
     for probe_url in \
@@ -328,29 +460,22 @@ rvdk_sync_cold_clock() {
     done
     [[ -n "$hdr_date" ]] || return 0
 
-    local remote_epoch="" local_epoch=""
-    remote_epoch="$(date -u -d "$hdr_date" +%s 2>/dev/null || true)"
-    local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+    local remote_epoch=""
+    remote_epoch="$(_rvdk_parse_http_date_epoch "$hdr_date" 2>/dev/null || true)"
+    [[ "$remote_epoch" =~ ^[0-9]+$ ]] || return 0
 
-    if [[ -n "$remote_epoch" && "$remote_epoch" =~ ^[0-9]+$ && "$local_epoch" =~ ^[0-9]+$ ]] && (( remote_epoch >= 1700000000 )); then
+    # Strictly monotonic forward step past RVDK_MIN_VALID_EPOCH only
+    if (( remote_epoch >= RVDK_MIN_VALID_EPOCH && remote_epoch > local_epoch )); then
         local skew=$(( remote_epoch - local_epoch ))
-        (( skew < 0 )) && skew=$(( -skew ))
-        if (( skew > 120 )); then
-            if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
-                if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
-                    date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true
-                fi
-                if [[ -d /var/lib/systemd/timesync ]]; then
-                    : > /var/lib/systemd/timesync/clock 2>/dev/null || true
-                fi
-                hwclock --systohc --utc >/dev/null 2>&1 || true
-                log_ok "Stepped cold-RTC system clock via HTTP Date (skew=${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+        if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
+            if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
+                date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true
             fi
-        fi
-    elif (( local_epoch < 1700000000 )); then
-        # BusyBox `date` without GNU `-d @epoch`: attempt direct RFC-2822 step only when local clock is clearly pre-2023
-        if date -u -s "$hdr_date" >/dev/null 2>&1; then
-            log_ok "Stepped cold-RTC system clock via HTTP Date (-> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+            if [[ -d /var/lib/systemd/timesync ]]; then
+                : > /var/lib/systemd/timesync/clock 2>/dev/null || true
+            fi
+            hwclock --systohc --utc >/dev/null 2>&1 || true
+            log_ok "Stepped cold-RTC system clock via HTTP Date (+${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
         fi
     fi
     return 0

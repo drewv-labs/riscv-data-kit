@@ -78,7 +78,7 @@ done
 
 if [[ "$ACTION" != "status" && $EUID -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "${ORIG_ARGS[@]}"
+        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
         echo "[RVDK:FATAL] Root privileges required for '${ACTION}'." >&2
         exit 1
@@ -202,8 +202,12 @@ disable_hdmi() {
     unbind_drv_matching "es-dc"
 
     if [[ "$PERSIST" == "true" ]]; then
-        local self_path
-        self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "/usr/local/bin/rvdk quirk hdmi")"
+        local exec_cmd="/usr/local/bin/rvdk quirk hdmi off"
+        if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+            local self_path=""
+            self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+            exec_cmd="/bin/bash ${self_path} off"
+        fi
         cat <<EOF > "$PERSIST_UNIT"
 [Unit]
 Description=RVDK SiFive P550 Headless Display/HDMI Suppression
@@ -211,12 +215,13 @@ After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash ${self_path} off
+ExecStart=${exec_cmd}
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+        chmod 0644 "$PERSIST_UNIT"
         systemctl daemon-reload
         systemctl enable rvdk-p550-hdmi-off.service >/dev/null
         log_ok "Persisted HDMI suppression across reboots (${PERSIST_UNIT})"

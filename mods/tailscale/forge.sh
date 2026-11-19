@@ -28,23 +28,80 @@ _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../.." && pwd)"
 
 # @RVDK_INLINE_LIBS: common apt progbar
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_REPO_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:TAILSCALE]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
+        rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _own="${3:-}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            [[ -n "$_own" ]] && chown "$_own" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
-    # shellcheck source=lib/apt.sh
-    source "${_REPO_ROOT}/lib/apt.sh"
+if [[ -z "${_RVDK_APT_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
+        # shellcheck source=lib/apt.sh
+        source "${_REPO_ROOT}/lib/apt.sh"
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
-    # shellcheck source=lib/progbar.sh
-    source "${_REPO_ROOT}/lib/progbar.sh"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
+if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
+        # shellcheck source=lib/progbar.sh
+        source "${_REPO_ROOT}/lib/progbar.sh"
+    else
+        rvdk_prog_init() { :; }
+        rvdk_prog()      { :; }
+    fi
 fi
 
 rvdk_log_init "RVDK:TAILSCALE"
+
+usage() {
+    cat <<'EOF'
+Usage: sudo rvdk mods/tailscale [options]
+
+Options:
+  --up                         Run `tailscale up` after daemon convergence
+  --ssh                        Enable Tailscale SSH (`--ssh`)
+  --qr                         Display QR login code during `tailscale up`
+  --authkey <tskey-...>        Authenticate non-interactively via ephemeral file
+  --advertise-routes <CIDRs>   Comma-separated IPv4/IPv6 subnet routes to advertise
+  --exit-node                  Advertise node as a Tailnet exit node
+  --accept-routes              Accept subnet routes advertised by peers
+  --hostname <name>            Custom RFC-1123 Tailnet node hostname
+  --operator <user>            Grant non-root POSIX user Tailscale operator control
+  --kernel-tun | --userspace   Force kernel /dev/net/tun or userspace networking
+  --track <stable|unstable>    Tailscale release track (default: stable)
+  --port <1..65535>            UDP WireGuard port (default: 41641)
+  --force                      Reinstall binaries even if version matches
+  --no-apt-update              Skip redundant apt-get update calls
+  --noprogbar                  Disable persistent bottom progress bar
+  -h, --help                   Show this help message and exit
+EOF
+}
+
+for _arg in "$@"; do
+    if [[ "$_arg" == "-h" || "$_arg" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+done
+
 rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
 rvdk_sanitize_locale
 rvdk_resolve_caller
@@ -53,6 +110,7 @@ _TS_TMP_EXTRACT=""
 _TS_TMP_TGZ=""
 _TS_KEY_FILE=""
 _rvdk_ts_cleanup() {
+    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
     [[ -n "$_TS_KEY_FILE" ]] && rm -f "$_TS_KEY_FILE" 2>/dev/null || true
     [[ -n "$_TS_TMP_TGZ" ]] && rm -f "$_TS_TMP_TGZ" 2>/dev/null || true
     [[ -n "$_TS_TMP_EXTRACT" && -d "$_TS_TMP_EXTRACT" ]] && rm -rf "$_TS_TMP_EXTRACT" 2>/dev/null || true
@@ -73,50 +131,35 @@ TS_ADVERTISE_ROUTES=""
 TS_HOSTNAME=""
 TS_OPERATOR=""
 
+_require_arg() {
+    [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."
+    return 0
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --track)                        TRACK="${2:-stable}"; shift 2 ;;
+        --track)                        _require_arg "$1" "${2:-}"; TRACK="$2"; shift 2 ;;
         --unstable)                     TRACK="unstable"; shift ;;
-        --port)                         TS_PORT="${2:-41641}"; shift 2 ;;
+        --port)                         _require_arg "$1" "${2:-}"; TS_PORT="$2"; shift 2 ;;
         --auto)                         REQUESTED_TUN="auto"; shift ;;
         --kernel-tun|--kernel)          REQUESTED_TUN="kernel"; shift ;;
         --userspace|--userspace-net)    REQUESTED_TUN="userspace"; shift ;;
         --force|--upgrade|--reinstall)  FORCE_REINSTALL="true"; shift ;;
         --up|--login)                   WANT_UP="true"; shift ;;
-        --authkey|--auth-key)           TS_AUTHKEY_VAL="${2:-}"; WANT_UP="true"; shift 2 ;;
+        --authkey|--auth-key)           _require_arg "$1" "${2:-}"; TS_AUTHKEY_VAL="$2"; WANT_UP="true"; shift 2 ;;
         --ssh)                          TS_SSH="true"; WANT_UP="true"; shift ;;
         --qr)                           TS_QR="true"; WANT_UP="true"; shift ;;
         --accept-routes)                TS_ACCEPT_ROUTES="true"; WANT_UP="true"; shift ;;
-        --advertise-routes|--routes)    TS_ADVERTISE_ROUTES="${2:-}"; WANT_UP="true"; shift 2 ;;
+        --advertise-routes|--routes)    _require_arg "$1" "${2:-}"; TS_ADVERTISE_ROUTES="$2"; WANT_UP="true"; shift 2 ;;
         --exit-node|--advertise-exit-node)
                                         TS_EXIT_NODE="true"; WANT_UP="true"; shift ;;
-        --hostname)                     TS_HOSTNAME="${2:-}"; shift 2 ;;
-        --operator)                     TS_OPERATOR="${2:-}"; WANT_UP="true"; shift 2 ;;
+        --hostname)                     _require_arg "$1" "${2:-}"; TS_HOSTNAME="$2"; shift 2 ;;
+        --operator)                     _require_arg "$1" "${2:-}"; TS_OPERATOR="$2"; WANT_UP="true"; shift 2 ;;
         --no-apt-update|--skip-apt-update)
                                         export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)       export RVDK_NO_PROGBAR="1"; shift ;;
-        -h|--help)
-            cat <<'EOF'
-Usage: sudo rvdk mods/tailscale [options]
-
-Options:
-  --up                         Run `tailscale up` after daemon convergence
-  --ssh                        Enable Tailscale SSH (`--ssh`)
-  --qr                         Display QR login code during `tailscale up`
-  --authkey <tskey-...>        Authenticate non-interactively via ephemeral file
-  --advertise-routes <CIDRs>   Comma-separated IPv4/IPv6 subnet routes to advertise
-  --exit-node                  Advertise node as a Tailnet exit node
-  --accept-routes              Accept subnet routes advertised by peers
-  --hostname <name>            Custom RFC-1123 Tailnet node hostname
-  --operator <user>            Grant non-root POSIX user Tailscale operator control
-  --kernel-tun | --userspace   Force kernel /dev/net/tun or userspace networking
-  --track <stable|unstable>    Tailscale release track (default: stable)
-  --port <1..65535>            UDP WireGuard port (default: 41641)
-  --force                      Reinstall binaries even if version matches
-EOF
-            exit 0
-            ;;
-        *)                              shift ;;
+        -h|--help)                      usage; exit 0 ;;
+        *)                              log_fatal "Unknown argument: $1 (try --help)" ;;
     esac
 done
 
@@ -295,19 +338,19 @@ FLAGS=\"${WANT_FLAGS}\"
 "
 DEFAULTS_CHANGED="false"
 if ! printf '%s' "$WANT_DEFAULTS" | cmp -s - "$DEFAULTS_FILE" 2>/dev/null; then
-    printf '%s' "$WANT_DEFAULTS" > "$DEFAULTS_FILE"
-    chmod 0644 "$DEFAULTS_FILE"
+    printf '%s' "$WANT_DEFAULTS" | rvdk_atomic_write "$DEFAULTS_FILE" 0644
     DEFAULTS_CHANGED="true"
 fi
 
 if [[ -n "$TS_ADVERTISE_ROUTES" || "$TS_EXIT_NODE" == "true" ]]; then
     FWD_SYSCTL="/etc/sysctl.d/90-rvdk-tailscale-forwarding.conf"
-    cat << 'EOF' > "$FWD_SYSCTL"
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-EOF
-    sysctl -p "$FWD_SYSCTL" >/dev/null 2>&1 || true
-    log_ok "Enabled IPv4/IPv6 packet forwarding (${FWD_SYSCTL})"
+    WANT_FWD="net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1"
+    if ! printf '%s\n' "$WANT_FWD" | cmp -s - "$FWD_SYSCTL" 2>/dev/null; then
+        printf '%s\n' "$WANT_FWD" | rvdk_atomic_write "$FWD_SYSCTL" 0644
+        sysctl -p "$FWD_SYSCTL" >/dev/null 2>&1 || true
+        log_ok "Enabled IPv4/IPv6 packet forwarding (${FWD_SYSCTL})"
+    fi
 fi
 
 PRIMARY_NIC="$(ip -o route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' || true)"

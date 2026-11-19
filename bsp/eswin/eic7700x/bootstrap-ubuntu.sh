@@ -12,7 +12,6 @@ set -Eeuo pipefail
 ORIG_ARGS=("$@")
 EXPOSE_KALLSYMS="false"
 export DEBIAN_FRONTEND=noninteractive
-APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 _SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -22,38 +21,76 @@ _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 
 # @RVDK_INLINE_LIBS: common apt bsp progbar
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_REPO_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:EIC7700X]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
+        rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
-    # shellcheck source=lib/apt.sh
-    source "${_REPO_ROOT}/lib/apt.sh"
+if [[ -z "${_RVDK_APT_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
+        # shellcheck source=lib/apt.sh
+        source "${_REPO_ROOT}/lib/apt.sh"
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/bsp.sh" ]]; then
-    # shellcheck source=lib/bsp.sh
-    source "${_REPO_ROOT}/lib/bsp.sh"
+if [[ -z "${_RVDK_BSP_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/bsp.sh" ]]; then
+        # shellcheck source=lib/bsp.sh
+        source "${_REPO_ROOT}/lib/bsp.sh"
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
-    # shellcheck source=lib/progbar.sh
-    source "${_REPO_ROOT}/lib/progbar.sh"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
+if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
+        # shellcheck source=lib/progbar.sh
+        source "${_REPO_ROOT}/lib/progbar.sh"
+    else
+        rvdk_prog_init() { :; }
+        rvdk_prog()      { :; }
+    fi
 fi
 
 rvdk_log_init "RVDK:EIC7700X"
-rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
-rvdk_sanitize_locale
+
+usage() {
+    cat <<'EOF'
+Usage: sudo rvdk bsp [--expose-kallsyms] [--no-apt-update] [--noprogbar]
+Layer 2 BSP script: bsp/eswin/eic7700x/bootstrap-ubuntu.sh
+
+Options:
+  --expose-kallsyms    Set kernel.kptr_restrict=1 for perf symbol profiling
+  --no-apt-update      Skip apt-get update calls
+  --noprogbar          Disable persistent bottom progress bar
+  -h, --help           Show this help message and exit
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --expose-kallsyms)                 EXPOSE_KALLSYMS="true"; shift ;;
+        --skip-upgrade|--full-upgrade|--with-vendor-repo)
+                                           shift ;;
+        --debian-suite)
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."
+            shift 2 ;;
+        --keep-mirrors)                    export RVDK_KEEP_VENDOR_MIRRORS="1"; shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
-        *)                                 shift ;;
+        -h|--help)                         usage; exit 0 ;;
+        *)                                 log_fatal "Unknown argument: $1 (try --help)" ;;
     esac
 done
+
+rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+rvdk_sanitize_locale
 
 rvdk_prog_init "EIC7700X BSP: inspecting device tree..."
 log_info "Detected Device-Tree Model: $(rvdk_bsp_read_dt_model)"

@@ -15,6 +15,9 @@ Modes:
       5. Scans repository files for downstream project bleed, PII/hostnames,
          and security anti-patterns (untrusted `.env` sourcing, `kptr_restrict=0`,
          unsigned HTTP APT repos, hardcoded `10.0.10.0/24`, etc.).
+      6. Stages a dry-run standalone bundle in a temporary directory and validates
+         all rendered `.sh` endpoints (`bash -n`, `shellcheck`, and stub-clobber
+         invariants).
 
   python3 tools/rvdk_ci.py --bundle-dist <out_dir>
       1. Stages static GitHub Pages tree (`rvdk.drewv-labs.dev`), dereferencing
@@ -22,8 +25,8 @@ Modes:
       2. Expands `# @RVDK_WRAPPER_DISTRO:`, `# @RVDK_WRAPPER_FILE:`, and
          `# @RVDK_INLINE_LIBS:` directives so every `.sh` endpoint works 100%
          standalone via `curl -fsSL https://rvdk.drewv-labs.dev/<path>.sh | sudo bash`.
-      3. Verifies `bash -n` and `shellcheck -S warning` on every bundled `.sh`
-         artifact in `<out_dir>`.
+      3. Verifies `bash -n`, `shellcheck -S warning`, and stub-clobber absence
+         on every bundled `.sh` artifact in `<out_dir>`.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -49,7 +53,6 @@ IGNORED_DIRS = {
 }
 
 IGNORED_FILES = {
-    "GEMINI.md",
     ".DS_Store",
 }
 
@@ -92,6 +95,12 @@ FORBIDDEN_BLEED_PATTERNS: Sequence[tuple[str, re.Pattern[str], bool]] = (
     ("Personal workstation hostname (ZedBook)", re.compile(r"\bzedbook\b", re.IGNORECASE), False),
     ("Personal shipping note", re.compile(r"stuck in chicago", re.IGNORECASE), False),
     ("Downstream ADMIN_USER env bleed", re.compile(r"\bADMIN_USER\b"), False),
+    ("Legacy LAB_SUBNET env bleed", re.compile(r"\bLAB_SUBNET\b"), False),
+    ("Legacy nvme_pgdata mountpoint bleed", re.compile(r"nvme_pgdata"), False),
+    ("Legacy PGDATA_NVME label bleed", re.compile(r"PGDATA_NVME"), False),
+    ("Legacy lv_pgdata LV bleed", re.compile(r"\blv_pgdata\b"), False),
+    ("Legacy DUAL_PG_PCT env bleed", re.compile(r"\bDUAL_PG_PCT\b"), False),
+    ("Legacy .nfs_dirs JSON schema bleed", re.compile(r"\.nfs_dirs\b"), False),
     ("Hardcoded private subnet 10.0.10.0/24", re.compile(r"\b10\.0\.10\.0/24\b"), False),
     ("Legacy local PGDG path (drewv-pgdg-riscv64)", re.compile(r"drewv-pgdg-riscv64"), False),
     ("Legacy local PGDG list (drewv-local-pgdg)", re.compile(r"drewv-local-pgdg"), False),
@@ -215,9 +224,7 @@ def check_symlinks(repo_root: Path) -> list[str]:
                 if not p.exists():
                     errors.append(f"{rel}: broken symlink (-> {os.readlink(p)})")
                     continue
-                try:
-                    target.relative_to(root_real)
-                except ValueError:
+                if not target.is_relative_to(root_real):
                     errors.append(f"{rel}: symlink escapes repository root (-> {target})")
 
     return errors
@@ -334,12 +341,16 @@ def render_standalone_script(script_text: str, repo_root: Path) -> str:
     if m_wrap:
         target_rel = m_wrap.group(1)
         target_file = (repo_root / target_rel).resolve()
-        target_file.relative_to(repo_root.resolve())
+        if not target_file.is_relative_to(repo_root.resolve()):
+            raise ValueError(f"Wrapper target escapes repository root: {target_rel}")
         script_text = target_file.read_text(encoding="utf-8")
+
+    inlined_libs: list[str] = []
 
     # 3. Expand `# @RVDK_INLINE_LIBS: lib1 lib2 ...`
     def _replace_libs(match: re.Match[str]) -> str:
         libs = match.group(1).split()
+        inlined_libs.extend(libs)
         chunks: list[str] = [f"# @RVDK_BUNDLED_LIBS: {' '.join(libs)}"]
         for lib_name in libs:
             lib_file = repo_root / "lib" / f"{lib_name}.sh"
@@ -349,43 +360,102 @@ def render_standalone_script(script_text: str, repo_root: Path) -> str:
             chunks.append(f"# --- BEGIN INLINED lib/{lib_name}.sh ---\n{body}# --- END INLINED lib/{lib_name}.sh ---")
         return "\n".join(chunks)
 
-    return re.sub(r"^#\s*@RVDK_INLINE_LIBS:\s*(.+)$", _replace_libs, script_text, flags=re.MULTILINE)
+    rendered = re.sub(r"^#\s*@RVDK_INLINE_LIBS:\s*(.+)$", _replace_libs, script_text, flags=re.MULTILINE)
+
+    # 4. Strip dead guarded fallback loader/stub blocks for libraries already inlined above
+    for lib_name in inlined_libs:
+        guard_var = f"_RVDK_{lib_name.upper()}_SH_LOADED"
+        guard_re = re.compile(
+            rf'^if \[\[ -z "\$\{{{guard_var}:-\}}" \]\]; then\n(?:^(?!fi[ \t]*$).*$\n)*^fi[ \t]*\n?',
+            flags=re.MULTILINE,
+        )
+        rendered = guard_re.sub("", rendered)
+
+    return rendered
 
 
-def bundle_dist(repo_root: Path, out_dir: Path, skip_shellcheck: bool = False) -> list[str]:
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def check_bundled_invariants(out_dir: Path) -> list[str]:
+    errors: list[str] = []
+    marker = "# --- BEGIN INLINED lib/common.sh ---"
+    stub_sig = "rvdk_sync_cold_clock() { :; }"
+    for sh in collect_sh_files(out_dir):
+        text = sh.read_text(encoding="utf-8")
+        if marker in text:
+            tail = text.split(marker, 1)[1]
+            if stub_sig in tail:
+                rel = sh.relative_to(out_dir)
+                errors.append(
+                    f"{rel}: standalone bundle still defines stub `{stub_sig}` after `{marker}`"
+                )
+    return errors
+
+
+def bundle_dist(
+    repo_root: Path,
+    out_dir: Path,
+    skip_shellcheck: bool = False,
+    quiet: bool = False,
+) -> list[str]:
+    out_abs = Path(os.path.abspath(os.path.expanduser(str(out_dir))))
+    repo_real = repo_root.resolve()
+    out_real = out_abs.resolve()
+    home_real = Path.home().resolve()
+    forbidden_roots = {
+        Path("/private/tmp"),
+        Path("/private/var"),
+        Path("/private/etc"),
+        Path("/var/tmp"),
+        Path(tempfile.gettempdir()).resolve(),
+    }
+
+    if (
+        out_real == repo_real
+        or repo_real.is_relative_to(out_real)
+        or out_real == home_real
+        or len(out_abs.parts) <= 2
+        or len(out_real.parts) <= 2
+        or out_real in forbidden_roots
+    ):
+        raise ValueError(
+            f"Unsafe bundle output directory '{out_real}': refuses repository root, "
+            "parent of repository root, $HOME, or top-level/shared system directories."
+        )
+
+    if out_real.exists():
+        shutil.rmtree(out_real)
+    out_real.mkdir(parents=True, exist_ok=True)
 
     for item in STAGE_ITEMS:
-        src = repo_root / item
+        src = repo_real / item
         if not src.exists():
             continue
-        dst = out_dir / item
+        dst = out_real / item
         if src.is_dir():
             shutil.copytree(src, dst, symlinks=False)
         else:
             shutil.copy2(src, dst, follow_symlinks=True)
 
-    (out_dir / "CNAME").write_text("rvdk.drewv-labs.dev\n", encoding="utf-8")
-    (out_dir / ".nojekyll").write_text("", encoding="utf-8")
+    (out_real / "CNAME").write_text("rvdk.drewv-labs.dev\n", encoding="utf-8")
+    (out_real / ".nojekyll").write_text("", encoding="utf-8")
 
     bundled_count = 0
-    for dirpath, _, filenames in os.walk(out_dir):
+    for dirpath, _, filenames in os.walk(out_real):
         for fn in sorted(filenames):
             if not fn.endswith(".sh"):
                 continue
             sh_path = Path(dirpath) / fn
             orig = sh_path.read_text(encoding="utf-8")
-            rendered = render_standalone_script(orig, repo_root)
+            rendered = render_standalone_script(orig, repo_real)
             if rendered != orig:
                 sh_path.write_text(rendered, encoding="utf-8")
                 bundled_count += 1
 
-    print(f"[RVDK:BUNDLE] Staged static site in {out_dir} ({bundled_count} standalone scripts inlined).")
-    errors = check_bash_syntax(out_dir, out_dir)
+    if not quiet:
+        print(f"[RVDK:BUNDLE] Staged static site in {out_real} ({bundled_count} standalone scripts inlined).")
+    errors = check_bundled_invariants(out_real)
+    errors.extend(check_bash_syntax(out_real, out_real))
     if not skip_shellcheck:
-        errors.extend(check_shellcheck(out_dir, out_dir, external_sources=False))
+        errors.extend(check_shellcheck(out_real, out_real, external_sources=False))
     return errors
 
 
@@ -398,6 +468,15 @@ def run_checks(repo_root: Path, skip_shellcheck: bool = False) -> int:
         all_errors.extend(check_shellcheck(repo_root, repo_root, external_sources=True))
     all_errors.extend(check_forbidden_patterns(repo_root))
 
+    with tempfile.TemporaryDirectory(prefix="rvdk_ci_bundle_") as tmp_dir:
+        bundle_errs = bundle_dist(
+            repo_root,
+            Path(tmp_dir) / "dist",
+            skip_shellcheck=skip_shellcheck,
+            quiet=True,
+        )
+        all_errors.extend(f"[bundle] {e}" for e in bundle_errs)
+
     if all_errors:
         print(f"[RVDK:CI] FAILED with {len(all_errors)} issue(s):", file=sys.stderr)
         for err in all_errors:
@@ -406,7 +485,10 @@ def run_checks(repo_root: Path, skip_shellcheck: bool = False) -> int:
 
     manifest_cnt = len(glob.glob(str(repo_root / "boards" / "*" / "*" / "media.json")))
     sc_note = " (ShellCheck skipped)" if skip_shellcheck else ", ShellCheck"
-    print(f"[RVDK:CI] OK — {manifest_cnt} board manifests, symlinks, bash syntax{sc_note}, and security/agnosticism checks passed.")
+    print(
+        f"[RVDK:CI] OK — {manifest_cnt} board manifests, symlinks, source & bundled bash syntax{sc_note}, "
+        "and security/agnosticism checks passed."
+    )
     return 0
 
 

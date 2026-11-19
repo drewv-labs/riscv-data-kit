@@ -38,9 +38,32 @@ _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
 
 # @RVDK_INLINE_LIBS: common
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_REPO_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:PURGE]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
+        rvdk_sanitize_locale() { export LANG=C LC_ALL=C; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; }
+        rvdk_validate_username() { [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+        rvdk_kv_load() { :; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _owner="${3:-}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            [[ -n "$_owner" ]] && chown "$_owner" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
 fi
 
 print_purge_help() {
@@ -96,11 +119,13 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --target)
-                target_user="${2:-}"
+                [[ -z "${2:-}" || "${2:-}" == --* ]] && log_fatal "Option '$1' requires a username."
+                target_user="$2"
                 shift 2
                 ;;
             --to-user|--dest-user)
-                dest_user="${2:-}"
+                [[ -z "${2:-}" || "${2:-}" == --* ]] && log_fatal "Option '$1' requires a username."
+                dest_user="$2"
                 shift 2
                 ;;
             --overwrite-env)
@@ -108,19 +133,22 @@ main() {
                 shift
                 ;;
             --extra-dotdir|--migrate-dotdir)
-                [[ -n "${2:-}" ]] && extra_dotdirs+=("${2#/}")
+                [[ -z "${2:-}" || "${2:-}" == --* ]] && log_fatal "Option '$1' requires a relative directory."
+                extra_dotdirs+=("${2#/}")
                 shift 2
                 ;;
             --relink-bin)
-                [[ -n "${2:-}" ]] && relink_bins+=("$2")
+                [[ -z "${2:-}" || "${2:-}" == --* ]] && log_fatal "Option '$1' requires <bin_path>:<rel_path>."
+                relink_bins+=("$2")
                 shift 2
                 ;;
-            --reown-path|--mount-point|--nfs-mount)
-                [[ -n "${2:-}" ]] && reown_paths+=("$2")
+            --reown-path|--mount|--mount-point|--nfs-mount|--secondary-mount)
+                [[ -z "${2:-}" || "${2:-}" == --* ]] && log_fatal "Option '$1' requires a path."
+                reown_paths+=("$2")
                 shift 2
                 ;;
             -*)
-                log_fatal "Unknown option: $1"
+                log_fatal "Unknown option: $1 (try --help)"
                 ;;
             *)
                 if [[ -z "$target_user" ]]; then
@@ -138,7 +166,7 @@ main() {
 
     # Safety Interlocks
     case "$target_user" in
-        root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|nobody|systemd-*|postgres|mosquitto|_*)
+        root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|nobody|systemd-*|postgres|mosquitto|ntfy|_* )
             log_fatal "Safety Interlock: Refusing to purge protected system user '${target_user}'."
             ;;
     esac
@@ -194,9 +222,7 @@ main() {
     if [[ -d "${src_home}/.rvdk" ]]; then
         if [[ -f "${src_home}/.rvdk/config.env" ]] && [[ ! -f /etc/rvdk/config.env || "$overwrite_env" == "true" ]]; then
             install -d -m 0755 -o root -g root /etc/rvdk
-            cp -a "${src_home}/.rvdk/config.env" /etc/rvdk/config.env
-            chown 0:0 /etc/rvdk/config.env
-            chmod 0640 /etc/rvdk/config.env
+            rvdk_atomic_write /etc/rvdk/config.env 0640 "0:0" < "${src_home}/.rvdk/config.env"
             log_ok "Promoted legacy config.env -> /etc/rvdk/config.env"
         fi
 
@@ -253,9 +279,7 @@ main() {
             ebase="$(basename "$entry")"
             if [[ -f "$entry" && "$ebase" == *.env ]]; then
                 if [[ ! -f "${d_dir}/${ebase}" || "$overwrite_env" == "true" ]]; then
-                    cp -a "$entry" "${d_dir}/${ebase}"
-                    chown "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
-                    chmod 0640 "${d_dir}/${ebase}"
+                    rvdk_atomic_write "${d_dir}/${ebase}" 0640 "${dest_user}:${dest_grp}" < "$entry"
                     log_ok "Migrated ${ddir}/${ebase} -> ${d_dir}/${ebase}"
                 else
                     log_skip "Preserved existing ${d_dir}/${ebase}"

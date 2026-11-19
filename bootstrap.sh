@@ -31,14 +31,20 @@ else
     SCRIPT_SELF=""
 fi
 
-# Determine whether root privileges are required before escalating.
-# Host flashers (`rvdk flash ...`), Kit inspection (`rvdk kit`), help, and
-# read-only status/list/dry-run subcommands run unprivileged first.
+ORIG_ALL_ARGS=("$@")
+
+# Determine whether root privileges are required before executing privileged stages.
+# CLI flag validation, help, host flashers (`rvdk flash ...`), Kit inspection
+# (`rvdk kit`), and read-only status/list/dry-run subcommands run unprivileged first.
 NEED_ROOT="true"
+WANT_SUB_HELP="false"
 if [[ $# -gt 0 ]]; then
     for _arg in "$@"; do
         case "$_arg" in
-            -h|--help|help) NEED_ROOT="false" ;;
+            -h|--help|help)
+                NEED_ROOT="false"
+                WANT_SUB_HELP="true"
+                ;;
         esac
     done
     if [[ "$NEED_ROOT" == "true" ]]; then
@@ -82,90 +88,15 @@ if [[ $# -gt 0 ]]; then
     fi
 fi
 
-if [[ "$NEED_ROOT" == "true" && $EUID -ne 0 ]]; then
-    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
-        exec sudo -E bash "$SCRIPT_SELF" "$@"
-    else
-        echo "[RVDK:FATAL] Run as root or pipe into 'sudo bash' / 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
-        exit 1
-    fi
-fi
-
-# Sanitize SSH-forwarded LC_* environment variables before target locales are generated
-if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
-    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
-elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
-    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
-else
-    export LANG="C" LC_ALL="C"
-fi
-
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
-if [[ ! "$REAL_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-    REAL_USER="root"
-fi
-REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
-REAL_HOME=""
-if command -v getent >/dev/null 2>&1; then
-    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
-elif command -v dscl >/dev/null 2>&1; then
-    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
-fi
-if [[ -z "$REAL_HOME" ]]; then
-    if [[ "$REAL_USER" == "root" ]]; then
-        REAL_HOME="/root"
-    elif [[ -d "/Users/${REAL_USER}" ]]; then
-        REAL_HOME="/Users/${REAL_USER}"
-    elif [[ -d "/home/${REAL_USER}" ]]; then
-        REAL_HOME="/home/${REAL_USER}"
-    else
-        REAL_HOME="/root"
-    fi
-fi
-export REAL_USER REAL_GRP REAL_HOME
-
-ENGINE_DIR="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
-RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
-
-log_rvdk()  { printf "\033[1;36m[RVDK]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
-
-# Step skewed system clocks on batteryless RISC-V SBCs via plain HTTP Date before HTTPS calls
-sync_cold_rtc_early() {
-    [[ "$(uname -s)" == "Linux" && $EUID -eq 0 ]] || return 0
-    if command -v timedatectl >/dev/null 2>&1; then
-        [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]] && return 0
-    fi
-    local hdr_date="" probe_url raw_hdr
-    for probe_url in "http://rvdk.drewv-labs.dev/" "http://deb.debian.org/"; do
-        raw_hdr=""
-        if command -v curl >/dev/null 2>&1; then
-            raw_hdr="$(curl -fsSI --connect-timeout 3 --max-time 5 "$probe_url" 2>/dev/null || true)"
-        elif command -v wget >/dev/null 2>&1; then
-            raw_hdr="$(wget -qSO- --max-redirect=0 --timeout=4 "$probe_url" 2>&1 || true)"
+_escalate_root_if_needed() {
+    if [[ "$NEED_ROOT" == "true" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+        if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
+            exec sudo -E bash "$SCRIPT_SELF" ${ORIG_ALL_ARGS[@]+"${ORIG_ALL_ARGS[@]}"}
         else
-            return 0
-        fi
-        if [[ -n "$raw_hdr" ]]; then
-            hdr_date="$(printf '%s\n' "$raw_hdr" | awk 'tolower($1) == "date:" { sub(/^[[:space:]]*[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }')"
-            [[ -n "$hdr_date" ]] && break
-        fi
-    done
-    [[ -n "$hdr_date" ]] || return 0
-    local remote_epoch="" local_epoch=""
-    remote_epoch="$(date -u -d "$hdr_date" +%s 2>/dev/null || true)"
-    local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
-    if [[ -n "$remote_epoch" && "$remote_epoch" =~ ^[0-9]+$ && "$local_epoch" =~ ^[0-9]+$ ]] && (( remote_epoch >= 1700000000 )); then
-        local skew=$(( remote_epoch - local_epoch ))
-        (( skew < 0 )) && skew=$(( -skew ))
-        if (( skew > 120 )); then
-            if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
-                [[ -f /etc/fake-hwclock.data ]] && { date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true; }
-                log_rvdk "Stepped skewed cold-RTC clock via HTTP Date (skew=${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
-            fi
+            echo "[RVDK:FATAL] Run as root or pipe into 'sudo bash' / 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
+            exit 1
         fi
     fi
-    return 0
 }
 
 resolve_script_path() {
@@ -185,6 +116,41 @@ resolve_script_path() {
     dir="$(cd -P "$(dirname "$src")" && pwd)"
     printf '%s/%s\n' "$dir" "$(basename "$src")"
 }
+
+ENGINE_DIR="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
+RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
+
+if [[ -n "$SCRIPT_SELF" && -e "$SCRIPT_SELF" ]]; then
+    SCRIPT_REAL="$(resolve_script_path "$SCRIPT_SELF")"
+    CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
+else
+    CANDIDATE_ROOT=""
+fi
+_REPO_ROOT="${CANDIDATE_ROOT:-$ENGINE_DIR}"
+
+# @RVDK_INLINE_LIBS: common
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_sanitize_locale() { export LANG="C" LC_ALL="C"; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; REAL_HOME="/root"; export REAL_USER REAL_GRP REAL_HOME; }
+        rvdk_sync_cold_clock() { :; }
+    fi
+fi
+
+rvdk_log_init "RVDK"
+rvdk_sanitize_locale
+rvdk_resolve_caller
+
+log_rvdk() { printf "\033[1;36m[RVDK]\033[0m %s\n" "$1"; }
 
 link_rvdk_cli() {
     local target_script="$1"
@@ -210,7 +176,7 @@ Usage:
 Core Commands:
   day0                     Run full Day-0 (OS normalization + Silicon BSP) forge (default)
   bsp                      Run Silicon BSP hardening (`bsp/<vendor>/<soc>/`)
-  os                       Run OS normalization & Kernel CVE-2026-98432 / MPTCP guard (`os/`)
+  os                       Run OS normalization & IPv4 IP-Options Prerouting Drop Guard (`ip hdrlength > 20B`) & MPTCP Lockdown (`os/`)
   deeptune [--tune <t>]    Run multi-layer headless DeepTune (`os` -> `bsp` -> `boards`)
                            Tunes: `data` (default) | `ai`, or `rvdk deeptune status`
   kit [status|--refresh]   Inspect or refresh cached hardware/OS Kit (`/etc/rvdk/kit.env`)
@@ -222,6 +188,22 @@ Core Commands:
   utils/purge-user.sh      Migrate state & purge factory default user account
   update                   Pull latest RVDK engine from GitHub
   uninstall [--purge]      Remove RVDK CLI, engine & caches (`--purge` wipes /etc/rvdk & tuning drop-ins)
+
+Day-0 / OS / BSP Stage Flags:
+  -u, --user <username>    POSIX operator username (OS stage)
+  -H, --hostname <name>    RFC-1123 system hostname (OS stage)
+  -n, --nopasswd           Passwordless sudo for --user (OS stage)
+      --prompt-password    Prompt for password on user creation (OS stage)
+      --debloat-only       Execute headless target, snapd & GUI purge only (OS stage)
+      --keep-gui           Preserve graphical target & desktop packages (OS stage)
+      --keep-mirrors       Preserve existing APT/NTP/registry mirror configs (OS/BSP stage)
+      --skip-locale        Skip en_US.UTF-8 locale generation (OS stage)
+      --skip-net-guard     Skip rvdk-net-guard IPv4 IP-options & MPTCP lockdown (OS stage)
+      --distro <flavor>    Override APT OS flavor (debian|ubuntu|bianbu|auto) (OS stage)
+      --expose-kallsyms    Set kernel.kptr_restrict=1 for perf symbol profiling (BSP stage)
+      --skip-upgrade       Skip initial full-upgrade on JH7110 Debian (BSP stage)
+      --full-upgrade       Force apt-get full-upgrade re-run on JH7110 Debian (BSP stage)
+      --debian-suite <s>   Target Debian suite on JH7110 (trixie|unstable) (BSP stage)
 
 Global Add-On Flags:
   --deeptune               Append multi-layer DeepTune to any Day-0 / BSP / Mod run
@@ -237,17 +219,10 @@ if [[ $# -gt 0 ]] && [[ "$1" == "help" || "$1" == "-h" || "$1" == "--help" ]]; t
     exit 0
 fi
 
-# 1. Resolve RVDK Engine Root (`LOCAL_ROOT`)
-if [[ -n "$SCRIPT_SELF" && -e "$SCRIPT_SELF" ]]; then
-    SCRIPT_REAL="$(resolve_script_path "$SCRIPT_SELF")"
-    CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
-else
-    CANDIDATE_ROOT=""
-fi
-
 if [[ "${1:-}" == "update" || "${1:-}" == "self-update" ]]; then
+    _escalate_root_if_needed
     shift
-    sync_cold_rtc_early
+    rvdk_sync_cold_clock
     if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
         exec bash "${CANDIDATE_ROOT}/install-cli.sh" "$@"
     else
@@ -258,6 +233,7 @@ fi
 
 case "${1:-}" in
     uninstall|remove|purge|utils/uninstall|utils/uninstall.sh|util/uninstall|util/uninstall.sh)
+        _escalate_root_if_needed
         _UNINSTALL_SUB="$1"
         shift
         _UNINSTALL_ARGS=()
@@ -267,18 +243,18 @@ case "${1:-}" in
         elif [[ -f "${ENGINE_DIR}/utils/uninstall.sh" ]]; then
             exec bash "${ENGINE_DIR}/utils/uninstall.sh" ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
         else
-            sync_cold_rtc_early
+            rvdk_sync_cold_clock
             curl -fsSL "${RVDK_BASE_URL}/utils/uninstall.sh" | bash -s -- ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
             exit 0
         fi
         ;;
 esac
 
-if [[ $EUID -ne 0 && -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
+if [[ "${EUID:-$(id -u)}" -ne 0 && -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
 elif [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]] && ! [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
-    if [[ $EUID -eq 0 ]]; then
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
         if [[ ! -L /usr/local/bin/rvdk ]]; then
             link_rvdk_cli "${LOCAL_ROOT}/bootstrap.sh"
         elif [[ "$LOCAL_ROOT" == "$ENGINE_DIR" && "$(uname -s)" == "Linux" && -d /usr/bin && ! -L /usr/bin/rvdk ]]; then
@@ -286,7 +262,8 @@ elif [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/bsp" ]] && ! [[ "$CANDIDAT
         fi
     fi
 else
-    sync_cold_rtc_early
+    _escalate_root_if_needed
+    rvdk_sync_cold_clock
     if [[ "$CANDIDATE_ROOT" == */.rvdk/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" ]]; then
         umask 022
         ENGINE_PARENT="$(dirname "$ENGINE_DIR")"
@@ -308,15 +285,19 @@ else
 fi
 
 # Load Core Runtime & Kit Inference Libraries
-if [[ -f "${LOCAL_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${LOCAL_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -f "${LOCAL_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${LOCAL_ROOT}/lib/common.sh"
+    fi
 fi
-if [[ -f "${LOCAL_ROOT}/lib/kit.sh" ]]; then
-    # shellcheck source=lib/kit.sh
-    source "${LOCAL_ROOT}/lib/kit.sh"
-else
-    log_fatal "Missing RVDK Kit library: ${LOCAL_ROOT}/lib/kit.sh"
+if [[ -z "${_RVDK_KIT_SH_LOADED:-}" ]]; then
+    if [[ -f "${LOCAL_ROOT}/lib/kit.sh" ]]; then
+        # shellcheck source=lib/kit.sh
+        source "${LOCAL_ROOT}/lib/kit.sh"
+    else
+        log_fatal "Missing RVDK Kit library: ${LOCAL_ROOT}/lib/kit.sh"
+    fi
 fi
 
 # ==============================================================================
@@ -336,6 +317,7 @@ fi
 
 # 2.2 `rvdk kit [status|--refresh|--env]`
 if [[ "${1:-}" == "kit" ]]; then
+    _escalate_root_if_needed
     shift
     KIT_MODE="summary"
     KIT_ARGS=()
@@ -345,6 +327,7 @@ if [[ "${1:-}" == "kit" ]]; then
             --motd|--body)        KIT_MODE="motd"; shift ;;
             --env|env)            KIT_MODE="env"; shift ;;
             --refresh|refresh)    KIT_ARGS+=("--refresh"); shift ;;
+            --no-cache)           KIT_ARGS+=("--no-cache"); shift ;;
             --soc|--board|--os)   KIT_ARGS+=("$1" "${2:-}"); shift 2 ;;
             -h|--help)
                 cat <<'EOF'
@@ -379,6 +362,7 @@ fi
 
 # 2.4 `rvdk quirk <name|list> [args...]`
 if [[ "${1:-}" == "quirk" || "${1:-}" == "quirks" ]]; then
+    _escalate_root_if_needed
     shift
     QUIRK_BOARD_OVERRIDE=""
     QUIRK_REST=()
@@ -457,7 +441,7 @@ EOF
 fi
 
 # ==============================================================================
-# 3. Parse Standard Provisioning Subcommand & Flags
+# 3. Parse Standard Provisioning Subcommand & Stage-Classified Flags
 # ==============================================================================
 MODULE="day0"
 if [[ $# -gt 0 ]]; then
@@ -495,6 +479,11 @@ if [[ $# -gt 0 ]]; then
     esac
 fi
 
+IS_CORE_STAGE="false"
+case "$MODULE" in
+    day0|os|bsp|deeptune) IS_CORE_STAGE="true" ;;
+esac
+
 CLI_SOC=""
 CLI_BOARD=""
 CLI_OS=""
@@ -504,24 +493,53 @@ DEEPTUNE_STATUS_ONLY="false"
 WITH_TAILSCALE="false"
 TS_AUTHKEY_CLI=""
 TS_EXTRA_ARGS=()
+
+COMMON_STAGE_ARGS=()
+OS_STAGE_ARGS=()
+BSP_STAGE_ARGS=()
+DEEPTUNE_STAGE_ARGS=()
 FORWARD_ARGS=()
+
+_require_opt_arg() {
+    local opt="$1"
+    local val="${2:-}"
+    if [[ -z "$val" || "$val" == --* ]]; then
+        log_fatal "Option '${opt}' requires an argument (try --help)"
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --soc)
-            CLI_SOC="${2:-}"; shift 2 ;;
+            _require_opt_arg "$1" "${2:-}"
+            CLI_SOC="$2"; shift 2 ;;
         --board)
-            CLI_BOARD="${2:-}"; shift 2 ;;
+            _require_opt_arg "$1" "${2:-}"
+            CLI_BOARD="$2"; shift 2 ;;
         --os)
-            CLI_OS="${2:-}"; shift 2 ;;
+            _require_opt_arg "$1" "${2:-}"
+            CLI_OS="$2"; shift 2 ;;
         --no-apt-update|--skip-apt-update)
             export RVDK_NO_APT_UPDATE="1"
+            COMMON_STAGE_ARGS+=("--no-apt-update")
             FORWARD_ARGS+=("--no-apt-update")
+            shift ;;
+        --noprogbar|--no-progbar)
+            export RVDK_NO_PROGBAR="1"
+            COMMON_STAGE_ARGS+=("--noprogbar")
+            FORWARD_ARGS+=("--noprogbar")
+            shift ;;
+        -h|--help)
+            WANT_SUB_HELP="true"
+            NEED_ROOT="false"
+            COMMON_STAGE_ARGS+=("--help")
+            FORWARD_ARGS+=("--help")
             shift ;;
         --deeptune|--deep-tune|--with-deeptune)
             WITH_DEEPTUNE="true"; shift ;;
         -t|--tune)
-            DEEPTUNE_TUNE="${2:-}"
+            _require_opt_arg "$1" "${2:-}"
+            DEEPTUNE_TUNE="$2"
             [[ "$MODULE" != "deeptune" ]] && WITH_DEEPTUNE="true"
             shift 2 ;;
         --tune=*)
@@ -531,6 +549,8 @@ while [[ $# -gt 0 ]]; do
         data|ai)
             if [[ "$MODULE" == "deeptune" ]]; then
                 DEEPTUNE_TUNE="$1"
+            elif [[ "$IS_CORE_STAGE" == "true" ]]; then
+                log_fatal "Unknown argument: $1 (did you mean --tune $1?)"
             else
                 FORWARD_ARGS+=("$1")
             fi
@@ -538,6 +558,9 @@ while [[ $# -gt 0 ]]; do
         status|--status)
             if [[ "$MODULE" == "deeptune" ]]; then
                 DEEPTUNE_STATUS_ONLY="true"
+                NEED_ROOT="false"
+            elif [[ "$IS_CORE_STAGE" == "true" ]]; then
+                log_fatal "Unknown argument: $1 (try --help)"
             else
                 FORWARD_ARGS+=("$1")
             fi
@@ -549,15 +572,120 @@ while [[ $# -gt 0 ]]; do
         --tailscale-ssh|--ts-ssh)
             WITH_TAILSCALE="true"; TS_EXTRA_ARGS+=("--ssh"); shift ;;
         --tailscale-authkey|--ts-authkey)
-            WITH_TAILSCALE="true"; TS_AUTHKEY_CLI="${2:-}"; shift 2 ;;
+            _require_opt_arg "$1" "${2:-}"
+            WITH_TAILSCALE="true"; TS_AUTHKEY_CLI="$2"; shift 2 ;;
         --tailscale-routes)
-            WITH_TAILSCALE="true"; TS_EXTRA_ARGS+=("--advertise-routes" "${2:-}"); shift 2 ;;
-        --noprogbar|--no-progbar)
-            export RVDK_NO_PROGBAR="1"; shift ;;
+            _require_opt_arg "$1" "${2:-}"
+            WITH_TAILSCALE="true"; TS_EXTRA_ARGS+=("--advertise-routes" "$2"); shift 2 ;;
+
+        # --- OS Stage Flags ---
+        -u|--user)
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                _require_opt_arg "$1" "${2:-}"
+                OS_STAGE_ARGS+=("--user" "$2")
+            else
+                _require_opt_arg "$1" "${2:-}"
+                FORWARD_ARGS+=("$1" "$2")
+            fi
+            shift 2 ;;
+        -H|--hostname)
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                _require_opt_arg "$1" "${2:-}"
+                OS_STAGE_ARGS+=("--hostname" "$2")
+            else
+                _require_opt_arg "$1" "${2:-}"
+                FORWARD_ARGS+=("$1" "$2")
+            fi
+            shift 2 ;;
+        -n|--nopasswd|--passwordless-sudo)
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                OS_STAGE_ARGS+=("--nopasswd")
+            else
+                FORWARD_ARGS+=("$1")
+            fi
+            shift ;;
+        --prompt-password|--debloat-only|--keep-gui|--skip-locale)
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                OS_STAGE_ARGS+=("$1")
+            else
+                FORWARD_ARGS+=("$1")
+            fi
+            shift ;;
+        --keep-mirrors)
+            export RVDK_KEEP_VENDOR_MIRRORS="1"
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                OS_STAGE_ARGS+=("--keep-mirrors")
+            else
+                FORWARD_ARGS+=("--keep-mirrors")
+            fi
+            shift ;;
+        --skip-net-guard)
+            export RVDK_SKIP_NET_GUARD="1"
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                OS_STAGE_ARGS+=("--skip-net-guard")
+            else
+                FORWARD_ARGS+=("--skip-net-guard")
+            fi
+            shift ;;
+        --distro)
+            _require_opt_arg "$1" "${2:-}"
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                OS_STAGE_ARGS+=("--distro" "$2")
+            else
+                FORWARD_ARGS+=("--distro" "$2")
+            fi
+            shift 2 ;;
+
+        # --- BSP Stage Flags ---
+        --expose-kallsyms|--skip-upgrade|--full-upgrade|--with-vendor-repo)
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                BSP_STAGE_ARGS+=("$1")
+            else
+                FORWARD_ARGS+=("$1")
+            fi
+            shift ;;
+        --debian-suite)
+            _require_opt_arg "$1" "${2:-}"
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                BSP_STAGE_ARGS+=("--debian-suite" "$2")
+            else
+                FORWARD_ARGS+=("--debian-suite" "$2")
+            fi
+            shift 2 ;;
+
+        # --- DeepTune Flags ---
+        --force)
+            if [[ "$MODULE" == "deeptune" || "$WITH_DEEPTUNE" == "true" ]]; then
+                DEEPTUNE_STAGE_ARGS+=("--force")
+            elif [[ "$IS_CORE_STAGE" == "true" ]]; then
+                log_fatal "Unknown argument: $1 (try --help)"
+            else
+                FORWARD_ARGS+=("--force")
+            fi
+            shift ;;
+
         *)
-            FORWARD_ARGS+=("$1"); shift ;;
+            if [[ "$IS_CORE_STAGE" == "true" ]]; then
+                log_fatal "Unknown argument: $1 (try --help)"
+            fi
+            FORWARD_ARGS+=("$1")
+            shift ;;
     esac
 done
+
+# Reject stage-mismatched flags on single-stage invocations (`rvdk os` vs `rvdk bsp` vs `rvdk deeptune`)
+if [[ "$WANT_SUB_HELP" != "true" ]]; then
+    if [[ "$MODULE" == "os" && ${#BSP_STAGE_ARGS[@]} -gt 0 ]]; then
+        log_fatal "BSP flag '${BSP_STAGE_ARGS[0]}' is not valid for 'rvdk os' (use 'rvdk bsp' or 'rvdk day0')"
+    fi
+    if [[ "$MODULE" == "bsp" && ${#OS_STAGE_ARGS[@]} -gt 0 ]]; then
+        log_fatal "OS flag '${OS_STAGE_ARGS[0]}' is not valid for 'rvdk bsp' (use 'rvdk os' or 'rvdk day0')"
+    fi
+    if [[ "$MODULE" == "deeptune" && ( ${#OS_STAGE_ARGS[@]} -gt 0 || ${#BSP_STAGE_ARGS[@]} -gt 0 ) ]]; then
+        _bad_dt_flag="${OS_STAGE_ARGS[0]:-${BSP_STAGE_ARGS[0]}}"
+        log_fatal "Flag '${_bad_dt_flag}' is not valid for 'rvdk deeptune' (try --help)"
+    fi
+fi
 
 # Dispatch `utils/*` early (e.g. `sudo rvdk utils/purge-user.sh <user>`)
 if [[ "$MODULE" == utils/* ]]; then
@@ -567,6 +695,38 @@ if [[ "$MODULE" == utils/* ]]; then
     TARGET_UTIL="${LOCAL_ROOT}/${MODULE%.sh}.sh"
     [[ ! -f "$TARGET_UTIL" ]] && log_fatal "Utility script not found: ${TARGET_UTIL}"
     exec bash "$TARGET_UTIL" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+fi
+
+if [[ "$WANT_SUB_HELP" == "true" ]]; then
+    case "$MODULE" in
+        day0)
+            print_cli_help
+            exit 0
+            ;;
+        os)
+            exec bash "${LOCAL_ROOT}/os/bootstrap-apt.sh" --help
+            ;;
+        deeptune)
+            if [[ -f "${LOCAL_ROOT}/bsp/eswin/eic7700x/deeptune.sh" ]]; then
+                exec bash "${LOCAL_ROOT}/bsp/eswin/eic7700x/deeptune.sh" --help
+            fi
+            print_cli_help
+            exit 0
+            ;;
+        postgresql)
+            exec bash "${LOCAL_ROOT}/postgresql/latest/forge.sh" --help
+            ;;
+        mods/*|postgresql/*)
+            if [[ "$MODULE" == *".."* ]]; then
+                log_fatal "Invalid module path: ${MODULE}"
+            fi
+            exec bash "${LOCAL_ROOT}/${MODULE}/forge.sh" --help
+            ;;
+    esac
+fi
+
+if [[ "$WANT_SUB_HELP" != "true" ]] && ! [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
+    _escalate_root_if_needed
 fi
 
 # 4. Resolve Hardware & OS Kit (loads /etc/rvdk/kit.env fast-path or probes & caches)
@@ -628,38 +788,6 @@ if [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
     exit 0
 fi
 
-if declare -F rvdk_sync_cold_clock >/dev/null 2>&1; then
-    rvdk_sync_cold_clock
-else
-    sync_cold_rtc_early
-fi
-
-export RVDK_APT_LIB="${LOCAL_ROOT}/lib/apt.sh"
-_RVDK_OWN_APT_STAMP=""
-if [[ -z "${RVDK_APT_STAMP_FILE:-}" ]]; then
-    _RVDK_OWN_APT_STAMP="/run/rvdk-apt-$$.stamp"
-    rm -f "$_RVDK_OWN_APT_STAMP" 2>/dev/null || true
-    export RVDK_APT_STAMP_FILE="$_RVDK_OWN_APT_STAMP"
-fi
-
-sync_apt_stamp() {
-    if [[ -n "${RVDK_APT_STAMP_FILE:-}" && -f "$RVDK_APT_STAMP_FILE" ]]; then
-        export RVDK_NO_APT_UPDATE="1"
-    fi
-}
-
-export RVDK_PROGBAR_LIB="${LOCAL_ROOT}/lib/progbar.sh"
-if [[ -f "$RVDK_PROGBAR_LIB" ]]; then
-    # shellcheck disable=SC1090
-    source "$RVDK_PROGBAR_LIB"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
-fi
-
-rvdk_prog_init "${MODULE} (${BOARD_PATH:-$SOC_PATH})"
-log_rvdk "Kit: board=${BOARD_PATH:-generic} | soc=${SOC_PATH} | os=${OS_ID} (${RVDK_KIT_SOURCE:-probed}) | Module: ${MODULE}"
-
 # Match OS-specific scripts first, falling back to a unified non-symlink forge.sh
 # (excludes bootstrap.sh symlinks to prevent recursion)
 resolve_os_script() {
@@ -677,6 +805,41 @@ resolve_os_script() {
     done
     return 1
 }
+
+if [[ "$WANT_SUB_HELP" == "true" && "$MODULE" == "bsp" ]]; then
+    BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
+    exec bash "$BSP_SCRIPT" --help
+fi
+
+rvdk_sync_cold_clock
+
+export RVDK_APT_LIB="${LOCAL_ROOT}/lib/apt.sh"
+_RVDK_OWN_APT_STAMP=""
+if [[ -z "${RVDK_APT_STAMP_FILE:-}" ]]; then
+    _RVDK_OWN_APT_STAMP="/run/rvdk-apt-$$.stamp"
+    rm -f "$_RVDK_OWN_APT_STAMP" 2>/dev/null || true
+    export RVDK_APT_STAMP_FILE="$_RVDK_OWN_APT_STAMP"
+fi
+
+sync_apt_stamp() {
+    if [[ -n "${RVDK_APT_STAMP_FILE:-}" && -f "$RVDK_APT_STAMP_FILE" ]]; then
+        export RVDK_NO_APT_UPDATE="1"
+    fi
+}
+
+export RVDK_PROGBAR_LIB="${LOCAL_ROOT}/lib/progbar.sh"
+if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
+    if [[ -f "$RVDK_PROGBAR_LIB" ]]; then
+        # shellcheck disable=SC1090
+        source "$RVDK_PROGBAR_LIB"
+    else
+        rvdk_prog_init() { :; }
+        rvdk_prog()      { :; }
+    fi
+fi
+
+rvdk_prog_init "${MODULE} (${BOARD_PATH:-$SOC_PATH})"
+log_rvdk "Kit: board=${BOARD_PATH:-generic} | soc=${SOC_PATH} | os=${OS_ID} (${RVDK_KIT_SOURCE:-probed}) | Module: ${MODULE}"
 
 # Execute collected DeepTune layers (`os/deeptune.sh` -> `bsp/<soc>/deeptune.sh` -> `boards/<board>/deeptune.sh`)
 run_kit_deeptune() {
@@ -726,10 +889,11 @@ run_kit_deeptune() {
 
         local layer_args=("--tune" "$tune_label")
         [[ "${RVDK_NO_APT_UPDATE:-0}" == "1" ]] && layer_args+=("--no-apt-update")
+        [[ "${RVDK_NO_PROGBAR:-0}" == "1" ]] && layer_args+=("--noprogbar")
 
         log_rvdk "DeepTune Layer $((idx + 1))/${count}: ${rel} (--tune ${tune_label})..."
         RVDK_TUNE="$tune_label" RVDK_PROG_BASE="$l_base" RVDK_PROG_SPAN="$l_span" \
-            bash "$s" "${layer_args[@]}" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            bash "$s" "${layer_args[@]}" ${DEEPTUNE_STAGE_ARGS[@]+"${DEEPTUNE_STAGE_ARGS[@]}"}
         idx=$((idx + 1))
     done
 
@@ -760,6 +924,7 @@ run_optional_tailscale() {
     log_rvdk "Optional Add-On: Tailscale Mesh VPN (${ts_script})..."
     local ts_args=()
     [[ "${RVDK_NO_APT_UPDATE:-0}" == "1" ]] && ts_args+=("--no-apt-update")
+    [[ "${RVDK_NO_PROGBAR:-0}" == "1" ]] && ts_args+=("--noprogbar")
     if [[ -n "$TS_AUTHKEY_CLI" ]]; then
         TS_AUTHKEY="$TS_AUTHKEY_CLI" RVDK_PROG_BASE="$base_pct" RVDK_PROG_SPAN="$span_pct" \
             bash "$ts_script" ${ts_args[@]+"${ts_args[@]}"} ${TS_EXTRA_ARGS[@]+"${TS_EXTRA_ARGS[@]}"}
@@ -795,18 +960,26 @@ case "$MODULE" in
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             log_rvdk "Stage 1/2: Silicon BSP & APT Repo Migration (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$BSP_SCRIPT" \
+                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
             sync_apt_stamp
-            log_rvdk "Stage 2/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            log_rvdk "Stage 2/2: OS Normalization & IPv4 IP-Options / MPTCP Guard (${OS_SCRIPT})..."
+            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" \
+                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
         else
             OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
             BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
-            log_rvdk "Stage 1/2: OS Normalization & CVE-2026-98432 Guard (${OS_SCRIPT})..."
-            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            log_rvdk "Stage 1/2: OS Normalization & IPv4 IP-Options / MPTCP Guard (${OS_SCRIPT})..."
+            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" \
+                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
             sync_apt_stamp
             log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" \
+                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
         fi
         # Refresh /etc/rvdk/kit.env after Day-0 networkd/interface changes
         rvdk_kit_resolve --refresh
@@ -824,13 +997,17 @@ case "$MODULE" in
         ;;
     os)
         OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
-        bash "$OS_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        bash "$OS_SCRIPT" \
+            ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+            ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
         run_addon_tail
         rvdk_prog 100 "OS normalization converged"
         ;;
     bsp)
         BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
-        bash "$BSP_SCRIPT" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+        bash "$BSP_SCRIPT" \
+            ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+            ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
         run_addon_tail
         rvdk_prog 100 "Silicon BSP converged"
         ;;

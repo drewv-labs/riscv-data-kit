@@ -13,16 +13,18 @@
 #                locks U74 max OPP governor, and unlocks SiFive U74 PMU counters.
 #
 # Usage:
-#   sudo rvdk bsp [--skip-upgrade] [--debian-suite trixie|unstable] [--with-vendor-repo] [--expose-kallsyms]
+#   sudo rvdk bsp [--skip-upgrade] [--full-upgrade] [--debian-suite trixie|unstable] [--with-vendor-repo] [--expose-kallsyms]
 # ==============================================================================
 
 set -Eeuo pipefail
 
 ORIG_ARGS=("$@")
 SKIP_UPGRADE="false"
+FORCE_FULL_UPGRADE="false"
 DEBIAN_SUITE="trixie"
 EXPOSE_KALLSYMS="false"
 WITH_VENDOR_REPO="false"
+UPGRADE_STAMP="/var/lib/rvdk/jh7110-debian-full-upgrade.stamp"
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
@@ -35,40 +37,87 @@ _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 
 # @RVDK_INLINE_LIBS: common apt bsp progbar
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_REPO_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:JH7110]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
+        rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _own="${3:-}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            [[ -n "$_own" ]] && chown "$_own" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
-    # shellcheck source=lib/apt.sh
-    source "${_REPO_ROOT}/lib/apt.sh"
+if [[ -z "${_RVDK_APT_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
+        # shellcheck source=lib/apt.sh
+        source "${_REPO_ROOT}/lib/apt.sh"
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/bsp.sh" ]]; then
-    # shellcheck source=lib/bsp.sh
-    source "${_REPO_ROOT}/lib/bsp.sh"
+if [[ -z "${_RVDK_BSP_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/bsp.sh" ]]; then
+        # shellcheck source=lib/bsp.sh
+        source "${_REPO_ROOT}/lib/bsp.sh"
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
-    # shellcheck source=lib/progbar.sh
-    source "${_REPO_ROOT}/lib/progbar.sh"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
+if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
+        # shellcheck source=lib/progbar.sh
+        source "${_REPO_ROOT}/lib/progbar.sh"
+    else
+        rvdk_prog_init() { :; }
+        rvdk_prog()      { :; }
+    fi
 fi
 
 rvdk_log_init "RVDK:JH7110"
-rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
-rvdk_sanitize_locale
+
+usage() {
+    cat <<'EOF'
+Usage: sudo rvdk bsp [OPTIONS]
+Layer 2 BSP script: bsp/starfive/jh7110/bootstrap-debian.sh
+
+Options:
+  --skip-upgrade              Skip apt-get full-upgrade pass
+  --full-upgrade              Force re-running apt-get full-upgrade even when stamped
+  --debian-suite <suite>      Target Debian suite (trixie|unstable; default: trixie)
+  --with-vendor-repo          Retain StarFive legacy Debian vendor repository if keyring exists
+  --expose-kallsyms           Set kernel.kptr_restrict=1 for perf symbol profiling
+  --keep-mirrors              Preserve existing APT mirror configuration
+  --no-apt-update             Skip redundant apt-get update calls
+  --noprogbar                 Disable persistent bottom progress bar
+  -h, --help                  Show this help message and exit
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-upgrade)                    SKIP_UPGRADE="true"; shift ;;
-        --debian-suite)                    DEBIAN_SUITE="${2:-trixie}"; shift 2 ;;
+        --full-upgrade)                    FORCE_FULL_UPGRADE="true"; shift ;;
+        --debian-suite)
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument (trixie|unstable)."
+            DEBIAN_SUITE="$2"
+            shift 2 ;;
         --with-vendor-repo)                WITH_VENDOR_REPO="true"; shift ;;
         --expose-kallsyms)                 EXPOSE_KALLSYMS="true"; shift ;;
         --keep-mirrors)                    export RVDK_KEEP_VENDOR_MIRRORS="1"; shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
-        *)                                 shift ;;
+        -h|--help)                         usage; exit 0 ;;
+        *)                                 log_fatal "Unknown argument: $1 (try --help)" ;;
     esac
 done
 
@@ -76,6 +125,9 @@ case "$DEBIAN_SUITE" in
     trixie|testing|sid|unstable) ;;
     *) log_fatal "Invalid --debian-suite '${DEBIAN_SUITE}' (expected trixie or unstable)." ;;
 esac
+
+rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+rvdk_sanitize_locale
 
 rvdk_prog_init "JH7110 BSP: inspecting device tree..."
 DT_MODEL="$(rvdk_bsp_read_dt_model)"
@@ -103,23 +155,20 @@ if grep -rqE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list
 
     log_info "Migrating legacy StarFive snapshot APT sources to signed HTTPS Debian (${DEBIAN_SUITE})..."
     mkdir -p /var/lib/rvdk/backups/apt
-    cp -a /etc/apt/sources.list "/var/lib/rvdk/backups/apt/etc__apt__sources.list.orig" 2>/dev/null || true
+    if [[ -f /etc/apt/sources.list && ! -f /var/lib/rvdk/backups/apt/etc__apt__sources.list.orig ]]; then
+        cp -a /etc/apt/sources.list "/var/lib/rvdk/backups/apt/etc__apt__sources.list.orig" 2>/dev/null || true
+    fi
     rm -f /etc/apt/trusted.gpg.d/debian-ports* 2>/dev/null || true
 
-    cat <<EOF > /etc/apt/sources.list
-deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE} main contrib non-free non-free-firmware
-EOF
+    NEW_SOURCES="deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE} main contrib non-free non-free-firmware"
     if [[ "$DEBIAN_SUITE" == "trixie" || "$DEBIAN_SUITE" == "testing" ]]; then
-        cat <<EOF >> /etc/apt/sources.list
-deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE}-updates main contrib non-free non-free-firmware
-deb [signed-by=${DEBIAN_KEYRING}] https://security.debian.org/debian-security ${DEBIAN_SUITE}-security main contrib non-free non-free-firmware
-EOF
+        NEW_SOURCES+=$'\n'"deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE}-updates main contrib non-free non-free-firmware"
+        NEW_SOURCES+=$'\n'"deb [signed-by=${DEBIAN_KEYRING}] https://security.debian.org/debian-security ${DEBIAN_SUITE}-security main contrib non-free non-free-firmware"
     fi
     if [[ "$WITH_VENDOR_REPO" == "true" ]] && [[ -f /etc/apt/trusted.gpg.d/starfive.gpg || -f /usr/share/keyrings/starfive-archive-keyring.gpg ]]; then
-        cat <<'EOF' >> /etc/apt/sources.list
-deb https://debianrepo-t.starfivetech.com starfive-debian main
-EOF
+        NEW_SOURCES+=$'\n'"deb https://debianrepo-t.starfivetech.com starfive-debian main"
     fi
+    printf '%s\n' "$NEW_SOURCES" | rvdk_atomic_write /etc/apt/sources.list 0644
 
     rm -rf /var/lib/apt/lists/*
     apt-get clean
@@ -161,7 +210,18 @@ if [[ "$SNAPSHOT_MIGRATION" == "true" ]] && dpkg -l 2>/dev/null | grep -q "^ii.*
     log_ok "Removed legacy libcurl3-gnutls:riscv64 t64 blocker"
 fi
 
-if [[ "$SKIP_UPGRADE" == "false" ]]; then
+JH7110_CORE_PKGS=(
+    build-essential dkms pciutils nvme-cli lvm2 parted git curl wget
+    htop jq tmux bc rsync time sysstat linux-perf zstd dpkg-dev
+)
+
+if [[ "$SKIP_UPGRADE" == "true" ]]; then
+    log_skip "Skipped apt-get full-upgrade (--skip-upgrade)"
+elif [[ -f "$UPGRADE_STAMP" && "$FORCE_FULL_UPGRADE" != "true" && "$SNAPSHOT_MIGRATION" != "true" ]]; then
+    rvdk_prog 72 "JH7110 BSP: verifying core build & perf packages..."
+    rvdk_apt_ensure "${JH7110_CORE_PKGS[@]}"
+    log_skip "Initial Debian ${DEBIAN_SUITE} full-upgrade already converged (${UPGRADE_STAMP}; pass --full-upgrade to re-run)"
+else
     rvdk_prog 58 "JH7110 BSP: converging system packages & utilities..."
     rvdk_apt_update
     UPGRADE_FLAGS=("${APT_FLAGS[@]}")
@@ -170,16 +230,14 @@ if [[ "$SKIP_UPGRADE" == "false" ]]; then
     fi
     apt-get full-upgrade "${UPGRADE_FLAGS[@]}"
     rvdk_prog 72 "JH7110 BSP: verifying core build & perf packages..."
-    rvdk_apt_ensure \
-        build-essential dkms pciutils nvme-cli lvm2 parted git curl wget \
-        htop jq tmux bc rsync time sysstat linux-perf zstd dpkg-dev
+    rvdk_apt_ensure "${JH7110_CORE_PKGS[@]}"
     K_HDR="linux-headers-$(uname -r)"
     if ! dpkg -s "$K_HDR" >/dev/null 2>&1; then
         apt-get install "${APT_FLAGS[@]}" "$K_HDR" 2>/dev/null || true
     fi
+    mkdir -p /var/lib/rvdk
+    printf 'SUITE=%s\nCONVERGED_AT=%s\n' "$DEBIAN_SUITE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | rvdk_atomic_write "$UPGRADE_STAMP" 0644
     log_ok "System packages and JH7110 utilities converged"
-else
-    log_skip "Skipped apt-get full-upgrade (--skip-upgrade)"
 fi
 
 # 4. SSH-Safe Primary Wired NIC Persistence & Sleep Lockout

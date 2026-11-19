@@ -8,6 +8,13 @@
 
 set -Eeuo pipefail
 
+if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]}" ]]; then
+    printf "\033[1;31m[RVDK:FATAL]\033[0m Board media flashers cannot be piped via stdin.\n" >&2
+    printf "  Install the host CLI ('curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | bash')\n" >&2
+    printf "  and run: rvdk flash starfive/vf2 sd <disk>\n" >&2
+    exit 1
+fi
+
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 

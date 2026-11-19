@@ -13,10 +13,20 @@
 #                                    instead of normalizing to US-first HTTPS.
 # ==============================================================================
 
-if [[ "${_RVDK_APT_SOURCED:-0}" == "1" ]]; then
-    return 0 2>/dev/null || true
+[[ -n "${_RVDK_APT_SH_LOADED:-}" ]] && return 0
+_RVDK_APT_SH_LOADED=1
+
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    _RVDK_APT_LIB_DIR=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        _RVDK_APT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -n "$_RVDK_APT_LIB_DIR" && -f "${_RVDK_APT_LIB_DIR}/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_RVDK_APT_LIB_DIR}/common.sh"
+    fi
+    unset _RVDK_APT_LIB_DIR
 fi
-_RVDK_APT_SOURCED="1"
 
 _rvdk_apt_log_ok() {
     if declare -F log_ok >/dev/null 2>&1; then
@@ -39,36 +49,38 @@ rvdk_apt_has_lists() {
     compgen -G "/var/lib/apt/lists/*InRelease" >/dev/null 2>&1
 }
 
-# Rewrite APT source stream ($1=in_file, $2=scheme, $3=out_file) from CN / plain
+# Rewrite APT source stream ($1=in_file, $2=scheme) to stdout from CN / plain
 # HTTP mirrors onto US-first canonical endpoints. Uses `@` as the `sed` `s`
 # delimiter so ERE `|` alternations never collide with the delimiter, and zero
 # inner capture groups in `cn_hosts` for deterministic `\1` / `\2` captures.
 _rvdk_apt_rewrite_stream() {
     local in_file="$1"
     local scheme="$2"
-    local out_file="$3"
     local cn_hosts="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sohu\\.com|mirrors\\.zju\\.edu\\.cn|mirrors\\.nju\\.edu\\.cn|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirrors\\.shanghaitech\\.edu\\.cn|mirrors\\.hit\\.edu\\.cn|mirrors\\.lzu\\.edu\\.cn|mirrors\\.cqu\\.edu\\.cn|mirrors\\.neusoft\\.edu\\.cn|mirrors\\.xjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn|mirror\\.lzu\\.edu\\.cn|cn\\.archive\\.ubuntu\\.com|hk\\.archive\\.ubuntu\\.com|ftp\\.cn\\.debian\\.org|ftp\\.hk\\.debian\\.org"
 
-    sed -E \
-        -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g" \
-        -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
-        -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
-        -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
-        -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
-        -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
-        "$in_file" > "$out_file"
-
     if [[ "$scheme" == "https" ]]; then
-        local tmp_https
-        tmp_https="$(mktemp)"
         sed -E \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
             -e '/^[[:space:]]*#/! s@http://(deb|ftp\.us|ftp\.debian)\.debian\.org/debian([[:space:]/]|$)@https://deb.debian.org/debian\2@g' \
             -e '/^[[:space:]]*#/! s@http://security\.debian\.org/debian-security([[:space:]/]|$)@https://security.debian.org/debian-security\1@g' \
             -e '/^[[:space:]]*#/! s@http://ports\.ubuntu\.com/ubuntu-ports([[:space:]/]|$)@https://ports.ubuntu.com/ubuntu-ports\1@g' \
             -e '/^[[:space:]]*#/! s@http://(us\.)?archive\.ubuntu\.com/ubuntu([[:space:]/]|$)@https://us.archive.ubuntu.com/ubuntu\2@g' \
             -e '/^[[:space:]]*#/! s@http://security\.ubuntu\.com/ubuntu([[:space:]/]|$)@https://security.ubuntu.com/ubuntu\1@g' \
-            "$out_file" > "$tmp_https"
-        mv -f "$tmp_https" "$out_file"
+            "$in_file"
+    else
+        sed -E \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
+            -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
+            "$in_file"
     fi
 }
 
@@ -111,21 +123,17 @@ rvdk_apt_normalize_mirrors() {
         done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null | sort)
     fi
 
-    local changed="false" backup_dir="/var/lib/rvdk/backups/apt" tmp_f bname
+    local changed="false" backup_dir="/var/lib/rvdk/backups/apt" rewritten bname
     for f in ${src_files[@]+"${src_files[@]}"}; do
         [[ -f "$f" ]] || continue
-        tmp_f="$(mktemp)"
-        _rvdk_apt_rewrite_stream "$f" "$scheme" "$tmp_f"
+        rewritten="$(_rvdk_apt_rewrite_stream "$f" "$scheme")"
 
-        if ! cmp -s "$tmp_f" "$f" 2>/dev/null; then
+        if ! printf '%s\n' "$rewritten" | cmp -s - "$f" 2>/dev/null; then
             mkdir -p "$backup_dir"
             bname="$(printf '%s' "$f" | sed 's@^/@@; s@/@__@g')"
             [[ -f "${backup_dir}/${bname}.orig" ]] || cp -a "$f" "${backup_dir}/${bname}.orig" 2>/dev/null || true
-            chmod 0644 "$tmp_f"
-            mv -f "$tmp_f" "$f"
+            printf '%s\n' "$rewritten" | rvdk_atomic_write "$f" 0644
             changed="true"
-        else
-            rm -f "$tmp_f"
         fi
     done
 
@@ -152,7 +160,10 @@ rvdk_apt_normalize_mirrors() {
                     fi
                     local sec_comps="main contrib non-free non-free-firmware"
                     [[ "$os_codename" == "bullseye" ]] && sec_comps="main contrib non-free"
-                    printf 'deb %s%s://security.debian.org/debian-security %s-security %s\n' "$sec_opt" "$scheme" "$os_codename" "$sec_comps" >> /etc/apt/sources.list
+                    {
+                        cat /etc/apt/sources.list
+                        printf 'deb %s%s://security.debian.org/debian-security %s-security %s\n' "$sec_opt" "$scheme" "$os_codename" "$sec_comps"
+                    } | rvdk_atomic_write /etc/apt/sources.list 0644
                     changed="true"
                 fi
             fi

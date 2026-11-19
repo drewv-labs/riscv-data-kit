@@ -6,6 +6,9 @@
   Idempotent Day-0 Bare-Metal Bootstrap, Multi-Layer Kernel Tuning, & Prebuilt Package Catalog for<br>
   **[RISC-V](https://riscv.org/) Data, Storage, Networking, and Edge AI Systems.**
 
+  > [!NOTE]
+  > ‼ Please note that this project is in active development.
+
 </div>
 
 ---

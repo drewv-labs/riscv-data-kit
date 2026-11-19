@@ -24,43 +24,102 @@ _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../.." && pwd)"
 
 # @RVDK_INLINE_LIBS: common apt progbar
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_REPO_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:NFSv4]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; }
+        rvdk_load_config_env() { :; }
+        rvdk_normalize_mount_path() {
+            local p="${1:-}"
+            while [[ "$p" != "/" && "$p" == */ ]]; do p="${p%/}"; done
+            printf '%s\n' "$p"
+        }
+        rvdk_resolve_data_mount() {
+            local explicit="${1:-${MOUNT_POINT:-}}"
+            if [[ -n "$explicit" ]]; then
+                rvdk_normalize_mount_path "$explicit"
+            elif mountpoint -q /mnt/nvme_data 2>/dev/null; then
+                printf '%s\n' "/mnt/nvme_data"
+            else
+                printf '%s' ""
+            fi
+        }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _own="${3:-}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            [[ -n "$_own" ]] && chown "$_own" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
-    # shellcheck source=lib/apt.sh
-    source "${_REPO_ROOT}/lib/apt.sh"
+if [[ -z "${_RVDK_APT_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
+        # shellcheck source=lib/apt.sh
+        source "${_REPO_ROOT}/lib/apt.sh"
+    fi
 fi
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
-    # shellcheck source=lib/progbar.sh
-    source "${_REPO_ROOT}/lib/progbar.sh"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
+if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
+        # shellcheck source=lib/progbar.sh
+        source "${_REPO_ROOT}/lib/progbar.sh"
+    else
+        rvdk_prog_init() { :; }
+        rvdk_prog()      { :; }
+    fi
 fi
 
 rvdk_log_init "RVDK:NFSv4"
+
+usage() {
+    cat <<'EOF'
+Usage: sudo rvdk mods/nfs-vault (--allow-cidr <CIDR> | --auto-subnet) [options]
+
+Options:
+  --allow-cidr <CIDR>          Authorized client IPv4 subnet (e.g. 192.168.1.0/24; alias: --subnet)
+  --auto-subnet                Auto-detect primary interface IPv4 subnet CIDR
+  --data-mount <path>          Optional NVMe mount root for shared vault subdirectory
+  --vault-path <path>          Explicit directory to export via NFSv4
+  --backend <auto|kernel|ganesha>
+                               NFSv4 server implementation (default: auto)
+  --workers <N>                NFS-Ganesha worker thread count (default: 4x CPU clamped [16..64])
+  --dangerous-no-root-squash   Disable root_squash (NOT recommended; grants remote UID 0 root access)
+  --no-apt-update              Skip redundant apt-get update calls
+  --noprogbar                  Disable persistent bottom progress bar
+  -h, --help                   Show this help message and exit
+EOF
+}
+
+for _arg in "$@"; do
+    if [[ "$_arg" == "-h" || "$_arg" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+done
+
 rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
 rvdk_resolve_caller
 
 PRESET_BACKEND="${NFS_BACKEND:-}"
 rvdk_load_config_env \
-    NFS_ALLOW_CIDR LAB_SUBNET MOUNT_POINT SECONDARY_MOUNT_POINT NFS_MOUNT_POINT \
+    NFS_ALLOW_CIDR RVDK_ALLOW_CIDR MOUNT_POINT SECONDARY_MOUNT_POINT NFS_MOUNT_POINT \
     NFS_VAULT_PATH NFS_WORKERS WITH_RAID RAID_ARRAYS_JSON NFS_BACKEND
 
-ALLOW_CIDR="${NFS_ALLOW_CIDR:-${LAB_SUBNET:-}}"
+ALLOW_CIDR="${NFS_ALLOW_CIDR:-${RVDK_ALLOW_CIDR:-}}"
 AUTO_SUBNET="false"
 DANGEROUS_NO_ROOT_SQUASH="false"
-if [[ -z "${MOUNT_POINT:-}" ]]; then
-    if mountpoint -q /mnt/nvme_data 2>/dev/null; then
-        DATA_MOUNT="/mnt/nvme_data"
-    else
-        DATA_MOUNT="/mnt/nvme_pgdata"
-    fi
-else
-    DATA_MOUNT="$MOUNT_POINT"
-fi
+EXPLICIT_DATA_MOUNT=""
 DEDICATED_NFS_MOUNT="${SECONDARY_MOUNT_POINT:-${NFS_MOUNT_POINT:-/mnt/nfs_vault}}"
 VAULT_PATH_OVERRIDE="${NFS_VAULT_PATH:-}"
 NFS_WORKERS_OVERRIDE="${NFS_WORKERS:-}"
@@ -68,38 +127,33 @@ WITH_RAID="${WITH_RAID:-false}"
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
 REQUESTED_BACKEND="${PRESET_BACKEND:-${NFS_BACKEND:-auto}}"
 
+_require_arg() {
+    [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."
+    return 0
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --allow-cidr|--subnet)               ALLOW_CIDR="${2:-}"; shift 2 ;;
+        --allow-cidr|--subnet)               _require_arg "$1" "${2:-}"; ALLOW_CIDR="$2"; shift 2 ;;
         --auto-subnet)                       AUTO_SUBNET="true"; shift ;;
         --dangerous-no-root-squash)          DANGEROUS_NO_ROOT_SQUASH="true"; shift ;;
-        --data-mount)                        DATA_MOUNT="${2:-/mnt/nvme_data}"; shift 2 ;;
-        --vault-path|--nfs-mount)            VAULT_PATH_OVERRIDE="${2:-}"; shift 2 ;;
-        --workers|--nb-worker)               NFS_WORKERS_OVERRIDE="${2:-}"; shift 2 ;;
-        --backend|--nfs-backend)             REQUESTED_BACKEND="${2:-auto}"; shift 2 ;;
+        --data-mount)                        _require_arg "$1" "${2:-}"; EXPLICIT_DATA_MOUNT="$2"; shift 2 ;;
+        --vault-path|--nfs-mount)            _require_arg "$1" "${2:-}"; VAULT_PATH_OVERRIDE="$2"; shift 2 ;;
+        --workers|--nb-worker)               _require_arg "$1" "${2:-}"; NFS_WORKERS_OVERRIDE="$2"; shift 2 ;;
+        --backend|--nfs-backend)             _require_arg "$1" "${2:-}"; REQUESTED_BACKEND="$2"; shift 2 ;;
         --auto|--nfs-auto)                   REQUESTED_BACKEND="auto"; shift ;;
         --ganesha|--nfs-ganesha|--userspace) REQUESTED_BACKEND="ganesha"; shift ;;
         --kernel|--nfs-kernel|--nfs-kernal)  REQUESTED_BACKEND="kernel"; shift ;;
         --no-apt-update|--skip-apt-update)   export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)            export RVDK_NO_PROGBAR="1"; shift ;;
-        -h|--help)
-            cat <<EOF
-Usage: sudo rvdk mods/nfs-vault (--allow-cidr <CIDR> | --auto-subnet) [options]
-
-Options:
-  --allow-cidr <CIDR>          Authorized client IPv4 subnet (e.g. 192.168.1.0/24; alias: --subnet)
-  --auto-subnet                Auto-detect primary interface IPv4 subnet CIDR
-  --vault-path <path>          Explicit directory to export via NFSv4
-  --backend <auto|kernel|ganesha>
-                               NFSv4 server implementation (default: auto)
-  --workers <N>                NFS-Ganesha worker thread count (default: 4x CPU clamped [16..64])
-  --dangerous-no-root-squash   Disable root_squash (NOT recommended; grants remote UID 0 root access)
-EOF
-            exit 0
-            ;;
-        *) shift ;;
+        -h|--help)                           usage; exit 0 ;;
+        *)                                   log_fatal "Unknown argument: $1 (try --help)" ;;
     esac
 done
+
+DATA_MOUNT="$(rvdk_resolve_data_mount "$EXPLICIT_DATA_MOUNT")"
+DEDICATED_NFS_MOUNT="$(rvdk_normalize_mount_path "$DEDICATED_NFS_MOUNT")"
+[[ -n "$VAULT_PATH_OVERRIDE" ]] && VAULT_PATH_OVERRIDE="$(rvdk_normalize_mount_path "$VAULT_PATH_OVERRIDE")"
 
 if [[ -z "$ALLOW_CIDR" && "$AUTO_SUBNET" == "true" ]]; then
     ALLOW_CIDR="$(rvdk_detect_primary_cidr || true)"
@@ -181,7 +235,7 @@ EXPORT_LINES=()
 ARRAY_COUNT="$(jq 'length' <<< "$RAID_ARRAYS_JSON" 2>/dev/null || echo 0)"
 if [[ "$WITH_RAID" == "true" ]] && (( ARRAY_COUNT > 0 )); then
     for (( i=0; i<ARRAY_COUNT; i++ )); do
-        ARR_MOUNT="$(jq -r ".[$i].mount" <<< "$RAID_ARRAYS_JSON")"
+        ARR_MOUNT="$(rvdk_normalize_mount_path "$(jq -r ".[$i].mount" <<< "$RAID_ARRAYS_JSON")")"
         ARR_FSID="$(jq -r ".[$i].nfs_fsid // $(( (i + 1) * 10 ))" <<< "$RAID_ARRAYS_JSON")"
         mkdir -p "$ARR_MOUNT"
         EXPORT_PATHS+=("$ARR_MOUNT")
@@ -194,19 +248,26 @@ elif [[ -n "$VAULT_PATH_OVERRIDE" ]]; then
     EXPORT_FSIDS+=("10")
     EXPORT_LINES+=("${VAULT_PATH_OVERRIDE} ${ALLOW_CIDR}(rw,sync,no_subtree_check,${KERNEL_SQUASH_OPT},fsid=10)")
     log_info "Export target: explicit vault path (${VAULT_PATH_OVERRIDE})"
-elif mountpoint -q "$DEDICATED_NFS_MOUNT" 2>/dev/null; then
+elif [[ -n "$DEDICATED_NFS_MOUNT" ]] && mountpoint -q "$DEDICATED_NFS_MOUNT" 2>/dev/null; then
     chmod 0775 "$DEDICATED_NFS_MOUNT" 2>/dev/null || true
     EXPORT_PATHS+=("$DEDICATED_NFS_MOUNT")
     EXPORT_FSIDS+=("10")
     EXPORT_LINES+=("${DEDICATED_NFS_MOUNT} ${ALLOW_CIDR}(rw,sync,no_subtree_check,${KERNEL_SQUASH_OPT},fsid=10)")
     log_info "Export target: Dual-LVM isolated NFS volume (${DEDICATED_NFS_MOUNT})"
-else
-    FALLBACK_VAULT="${VAULT_PATH_OVERRIDE:-${DATA_MOUNT}/nfs_vault}"
+elif [[ -n "$DATA_MOUNT" ]] && mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
+    FALLBACK_VAULT="${DATA_MOUNT}/nfs_vault"
     install -d -m 0775 -o "$REAL_USER" -g "$REAL_GRP" "$FALLBACK_VAULT"
     EXPORT_PATHS+=("$FALLBACK_VAULT")
     EXPORT_FSIDS+=("10")
     EXPORT_LINES+=("${FALLBACK_VAULT} ${ALLOW_CIDR}(rw,sync,no_subtree_check,${KERNEL_SQUASH_OPT},fsid=10)")
-    log_info "Export target: shared directory fallback (${FALLBACK_VAULT})"
+    log_info "Export target: NVMe data mount subdirectory (${FALLBACK_VAULT})"
+else
+    FALLBACK_VAULT="/srv/nfs_vault"
+    install -d -m 0775 -o "$REAL_USER" -g "$REAL_GRP" "$FALLBACK_VAULT"
+    EXPORT_PATHS+=("$FALLBACK_VAULT")
+    EXPORT_FSIDS+=("10")
+    EXPORT_LINES+=("${FALLBACK_VAULT} ${ALLOW_CIDR}(rw,sync,no_subtree_check,${KERNEL_SQUASH_OPT},fsid=10)")
+    log_info "Export target: rootfs service vault fallback (${FALLBACK_VAULT})"
 fi
 
 mkdir -p /etc/exports.d
@@ -215,7 +276,7 @@ WANT_EXPORTS="$(printf "%s\n" "${EXPORT_LINES[@]}")"
 
 EXPORTS_CHANGED="false"
 if ! printf "%s\n" "$WANT_EXPORTS" | cmp -s - "$EXPORTS_FILE" 2>/dev/null; then
-    printf "%s\n" "$WANT_EXPORTS" > "$EXPORTS_FILE"
+    printf "%s\n" "$WANT_EXPORTS" | rvdk_atomic_write "$EXPORTS_FILE" 0644
     EXPORTS_CHANGED="true"
 fi
 
@@ -245,8 +306,7 @@ if [[ "$NFS_MODE" == "kernel" ]]; then
     QOS_CHANGED="false"
     install -d -m 0755 "$QOS_DIR"
     if ! printf "%s\n" "$WANT_NFS_QOS" | cmp -s - "$QOS_FILE" 2>/dev/null; then
-        printf "%s\n" "$WANT_NFS_QOS" > "$QOS_FILE"
-        chmod 0644 "$QOS_FILE"
+        printf "%s\n" "$WANT_NFS_QOS" | rvdk_atomic_write "$QOS_FILE" 0644
         systemctl daemon-reload
         QOS_CHANGED="true"
     fi
@@ -269,8 +329,7 @@ else
     QOS_CHANGED="false"
     install -d -m 0755 "$QOS_DIR"
     if ! printf "%s\n" "$WANT_NFS_QOS" | cmp -s - "$QOS_FILE" 2>/dev/null; then
-        printf "%s\n" "$WANT_NFS_QOS" > "$QOS_FILE"
-        chmod 0644 "$QOS_FILE"
+        printf "%s\n" "$WANT_NFS_QOS" | rvdk_atomic_write "$QOS_FILE" 0644
         systemctl daemon-reload
         QOS_CHANGED="true"
         log_ok "Applied cgroup v2 CPU/IO yield policy (${QOS_FILE}: CPUWeight=30, IOWeight=25, Nice=5)"
@@ -331,7 +390,7 @@ EOF
 
     GANESHA_CHANGED="false"
     if ! printf "%s\n" "$WANT_GANESHA" | cmp -s - "$GANESHA_CONF" 2>/dev/null; then
-        printf "%s\n" "$WANT_GANESHA" > "$GANESHA_CONF"
+        printf "%s\n" "$WANT_GANESHA" | rvdk_atomic_write "$GANESHA_CONF" 0644
         GANESHA_CHANGED="true"
     fi
 

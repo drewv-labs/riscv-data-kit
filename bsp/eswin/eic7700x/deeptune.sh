@@ -30,11 +30,55 @@ MODPROBE_SOC="/etc/modprobe.d/90-rvdk-eic7700x-deeptune.conf"
 IRQ_SCRIPT="/usr/local/sbin/rvdk-eic7700x-irq-tune"
 IRQ_UNIT="/etc/systemd/system/eic7700x-irq-affinity.service"
 
-log_info()  { printf "\033[1;36m[RVDK:EIC7700X-DEEPTUNE]\033[0m %s\n" "$1"; }
-log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+_REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
+
+# @RVDK_INLINE_LIBS: common kit progbar
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:EIC7700X-DEEPTUNE]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _own="${3:-}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            [[ -n "$_own" ]] && chown "$_own" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
+fi
+if [[ -z "${_RVDK_KIT_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/kit.sh" ]]; then
+        # shellcheck source=lib/kit.sh
+        source "${_REPO_ROOT}/lib/kit.sh"
+    fi
+fi
+if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
+    _PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
+    [[ -z "$_PROGBAR_CANDIDATE" && -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${_REPO_ROOT}/lib/progbar.sh"
+    if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" ]]; then
+        # shellcheck disable=SC1090
+        source "$_PROGBAR_CANDIDATE"
+    else
+        rvdk_prog_init() { :; }
+        rvdk_prog()      { :; }
+    fi
+fi
+
+rvdk_log_init "RVDK:EIC7700X-DEEPTUNE"
 
 ACTION="apply"
 TUNE_REQUEST="${RVDK_TUNE:-}"
@@ -73,44 +117,27 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            cat <<EOF
+            cat <<'EOF'
 Usage: sudo rvdk deeptune [--tune <data|ai>] [status] [--force] [--noprogbar]
 Layer 2 SoC script: bsp/eswin/eic7700x/deeptune.sh
 EOF
             exit 0
             ;;
         *)
-            shift
+            log_fatal "Unknown argument: $1 (try --help)"
             ;;
     esac
 done
 
-if [[ "$ACTION" != "status" && $EUID -ne 0 ]]; then
-    exec sudo -E bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    else
+        log_fatal "Root privileges required. Pipe into 'sudo bash' or run via 'sudo rvdk deeptune'."
+    fi
 fi
 
-_SCRIPT_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
-REPO_ROOT=""
-[[ -n "$_SCRIPT_DIR" ]] && REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
-
-if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/kit.sh" ]]; then
-    # shellcheck disable=SC1091
-    source "${REPO_ROOT}/lib/kit.sh"
-    rvdk_kit_resolve
-fi
-
-_PROGBAR_CANDIDATE="${RVDK_PROGBAR_LIB:-}"
-[[ -z "$_PROGBAR_CANDIDATE" && -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/progbar.sh" ]] && _PROGBAR_CANDIDATE="${REPO_ROOT}/lib/progbar.sh"
-if [[ -n "$_PROGBAR_CANDIDATE" && -f "$_PROGBAR_CANDIDATE" && "$ACTION" != "status" ]]; then
-    # shellcheck disable=SC1090
-    source "$_PROGBAR_CANDIDATE"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
-fi
+declare -F rvdk_kit_resolve >/dev/null 2>&1 && rvdk_kit_resolve
 
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
@@ -147,7 +174,13 @@ if [[ "$ACTION" == "status" ]]; then
 fi
 
 if [[ -z "$TUNE_REQUEST" && -r /etc/rvdk/deeptune.env ]]; then
-    TUNE_REQUEST="$(awk -F= '/^RVDK_TUNE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' /etc/rvdk/deeptune.env 2>/dev/null || true)"
+    if declare -F rvdk_kv_load >/dev/null 2>&1; then
+        RVDK_TUNE=""
+        rvdk_kv_load /etc/rvdk/deeptune.env RVDK_TUNE
+        TUNE_REQUEST="$RVDK_TUNE"
+    else
+        TUNE_REQUEST="$(awk -F= '/^RVDK_TUNE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' /etc/rvdk/deeptune.env 2>/dev/null || true)"
+    fi
 fi
 TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "${TUNE_REQUEST:-data}")"
 
@@ -168,7 +201,6 @@ log_info "Converging ESWIN EIC7700X Silicon DeepTune (--tune ${TUNE_LABEL} | mod
 # ==============================================================================
 rvdk_prog 35 "EIC7700X DeepTune: converging SoC audio & PowerVR GPU modules (--tune ${TUNE_LABEL})..."
 
-# Clean up legacy pre-split modprobe file if present
 if [[ -f "$LEGACY_MODPROBE" ]]; then
     rm -f "$LEGACY_MODPROBE"
 fi
@@ -199,8 +231,7 @@ for m in "${TARGET_MODS[@]}"; do
 done
 
 if ! printf "%s\n" "$WANT_MODPROBE" | cmp -s - "$MODPROBE_SOC" 2>/dev/null; then
-    printf "%s\n" "$WANT_MODPROBE" > "$MODPROBE_SOC"
-    chmod 0644 "$MODPROBE_SOC"
+    printf "%s\n" "$WANT_MODPROBE" | rvdk_atomic_write "$MODPROBE_SOC" 0644
     log_ok "Updated EIC7700X kernel module policy (--tune ${TUNE_LABEL}) in ${MODPROBE_SOC}"
 else
     log_skip "EIC7700X kernel module policy (${MODPROBE_SOC}) already converged for '${TUNE_LABEL}'"
@@ -269,12 +300,11 @@ WantedBy=multi-user.target"
 install -d -m 0755 /usr/local/sbin
 IRQ_CHANGED="false"
 if ! printf "%s" "$WANT_IRQ_SCRIPT" | cmp -s - "$IRQ_SCRIPT" 2>/dev/null; then
-    printf "%s" "$WANT_IRQ_SCRIPT" > "$IRQ_SCRIPT"
-    chmod 0755 "$IRQ_SCRIPT"
+    printf "%s" "$WANT_IRQ_SCRIPT" | rvdk_atomic_write "$IRQ_SCRIPT" 0755
     IRQ_CHANGED="true"
 fi
 if ! printf "%s\n" "$WANT_IRQ_UNIT" | cmp -s - "$IRQ_UNIT" 2>/dev/null; then
-    printf "%s\n" "$WANT_IRQ_UNIT" > "$IRQ_UNIT"
+    printf "%s\n" "$WANT_IRQ_UNIT" | rvdk_atomic_write "$IRQ_UNIT" 0644
     systemctl daemon-reload
     systemctl enable eic7700x-irq-affinity.service >/dev/null
     IRQ_CHANGED="true"

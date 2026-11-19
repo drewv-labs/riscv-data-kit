@@ -17,16 +17,13 @@
 #        RVDK_PARENT_BADGE_SGR   ANSI SGR sequence for parent badge
 #        RVDK_PARENT_BAR_SGR     ANSI SGR sequence for parent gauge fill
 #        RVDK_PARENT_STATE       Path to parent `<pct>|<msg>` state file
-#        RVDK_SUB_STATE          Path where RVDK writes its `<pct>|<msg>` state
+#        RVDK_SUB_STATE          Root-owned path where RVDK writes `<pct>|<msg>`
 #   3. Suppressed Mode (--noprogbar | RVDK_NO_PROGBAR=1 | non-TTY | dumb term):
 #      All functions become zero-overhead no-ops.
 # ==============================================================================
 
-# Guard against double-sourcing within the same shell process
-if [[ "${_RVDK_PROGBAR_SOURCED:-0}" == "1" ]]; then
-    return 0 2>/dev/null || true
-fi
-_RVDK_PROGBAR_SOURCED="1"
+[[ -n "${_RVDK_PROGBAR_SH_LOADED:-}" ]] && return 0
+_RVDK_PROGBAR_SH_LOADED=1
 
 # Literal ESC byte (0x1B). Never pass `\0337` through `printf "%b"`, because
 # bash parses `\0` + 3 octal digits (`\0337` -> 0xDF) instead of ESC + '7'!
@@ -49,19 +46,63 @@ fi
 _RVDK_PROG_ACTIVE="0"
 _RVDK_PROG_MODE="off"       # off | standalone | stacked
 _RVDK_PROG_OWNER="0"        # 1 if this shell owns DECSTBM teardown on EXIT
-_RVDK_PROG_ROWS=0
-_RVDK_PROG_COLS=0
+_RVDK_PROG_ROWS=24
+_RVDK_PROG_COLS=80
+_RVDK_PREV_ROWS=0
 _RVDK_PROG_PCT=0
 _RVDK_PROG_MSG=""
+_RVDK_LINE_OUT=""
+_RVDK_SUB_STATE_VALID="0"
 
-_RVDK_FILL_TEMPLATE="########################################"
-_RVDK_DOTS_TEMPLATE="........................................"
+_RVDK_FILL_BUF="################################################################"
+_RVDK_FILL_BUF="${_RVDK_FILL_BUF}${_RVDK_FILL_BUF}${_RVDK_FILL_BUF}${_RVDK_FILL_BUF}"
+_RVDK_PAD_BUF="................................................................"
+_RVDK_PAD_BUF="${_RVDK_PAD_BUF}${_RVDK_PAD_BUF}${_RVDK_PAD_BUF}${_RVDK_PAD_BUF}"
 
 _rvdk_prog_out() {
     if [[ -t 1 ]]; then
         printf '%s' "$1" 2>/dev/null || true
     fi
     return 0
+}
+
+# Validate RVDK_SUB_STATE confinement (`^(/run/rvdk/|/tmp/rvdk-)[A-Za-z0-9._-]+$`,
+# root-owned 0700/0755 parent directory, non-symlink target).
+_rvdk_prog_validate_sub_state() {
+    local path="${1:-}"
+    [[ -n "$path" ]] || return 1
+    [[ "$path" =~ ^(/run/rvdk/|/tmp/rvdk-)[A-Za-z0-9._-]+$ ]] || return 1
+    [[ ! -L "$path" ]] || return 1
+
+    local pdir powner pmode
+    pdir="$(dirname "$path")"
+    [[ -d "$pdir" && ! -L "$pdir" ]] || return 1
+    powner="$(stat -c '%u' "$pdir" 2>/dev/null || stat -f '%u' "$pdir" 2>/dev/null || echo "")"
+    pmode="$(stat -c '%a' "$pdir" 2>/dev/null || stat -f '%Lp' "$pdir" 2>/dev/null || echo "")"
+    [[ "$powner" == "0" ]] || return 1
+    case "$pmode" in
+        700|0700|755|0755) ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Atomically update validated RVDK_SUB_STATE via same-directory temp file + mv -f
+_rvdk_prog_write_sub_state() {
+    [[ "$_RVDK_SUB_STATE_VALID" == "1" && -n "${RVDK_SUB_STATE:-}" ]] || return 0
+    [[ ! -L "$RVDK_SUB_STATE" ]] || return 0
+    local sub_dir sub_base tmp_sub
+    sub_dir="$(dirname "$RVDK_SUB_STATE")"
+    sub_base="$(basename "$RVDK_SUB_STATE")"
+    [[ -d "$sub_dir" && ! -L "$sub_dir" ]] || return 0
+    tmp_sub="$(mktemp "${sub_dir}/.${sub_base}.rvdk.XXXXXX" 2>/dev/null || true)"
+    [[ -n "$tmp_sub" && ! -L "$tmp_sub" ]] || return 0
+    if printf '%s|%s\n' "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" > "$tmp_sub" 2>/dev/null; then
+        chmod 0644 "$tmp_sub" 2>/dev/null || true
+        mv -f "$tmp_sub" "$RVDK_SUB_STATE" 2>/dev/null || rm -f "$tmp_sub" 2>/dev/null || true
+    else
+        rm -f "$tmp_sub" 2>/dev/null || true
+    fi
 }
 
 _rvdk_prog_query_geom() {
@@ -84,7 +125,7 @@ _rvdk_prog_query_geom() {
     return 0
 }
 
-# Format a single progress bar row (strictly <= COLS - 1 visible chars)
+# Format a single progress bar row into `_RVDK_LINE_OUT` with ZERO subshell forks (`$(...)`).
 # Usage: _rvdk_prog_format_line <badge_label> <badge_ansi> <bar_ansi> <pct> <msg> <cols>
 _rvdk_prog_format_line() {
     local label="$1"
@@ -100,13 +141,13 @@ _rvdk_prog_format_line() {
 
     local max_vis=$(( cols - 1 ))
     if (( max_vis < 24 )); then
-        printf ''
+        _RVDK_LINE_OUT=""
         return 0
     fi
 
     # Fixed 18-char badge (" %-9s [%3d%%] ") so stacked parent & child bars align vertically
-    local badge_txt
-    badge_txt="$(printf " %-9s [%3d%%] " "$label" "$pct")"
+    local badge_txt=""
+    printf -v badge_txt " %-9s [%3d%%] " "$label" "$pct"
 
     local bar_w=$(( cols / 4 ))
     (( bar_w < 10 )) && bar_w=10
@@ -117,11 +158,12 @@ _rvdk_prog_format_line() {
         bar_w=$(( max_vis - 21 ))
         (( bar_w < 4 )) && bar_w=4
     fi
+    (( bar_w > 256 )) && bar_w=256
 
     local filled=$(( pct * bar_w / 100 ))
     local empty=$(( bar_w - filled ))
-    local hashes="${_RVDK_FILL_TEMPLATE:0:$filled}"
-    local dots="${_RVDK_DOTS_TEMPLATE:0:$empty}"
+    local hashes="${_RVDK_FILL_BUF:0:$filled}"
+    local dots="${_RVDK_PAD_BUF:0:$empty}"
 
     # Sanitize single-line message and clamp to remaining columns
     msg="${msg//$'\r'/}"
@@ -137,7 +179,7 @@ _rvdk_prog_format_line() {
         fi
     fi
 
-    printf '%s%s%s[0m[%s%s%s[0m%s[2m%s%s[0m]%s' \
+    printf -v _RVDK_LINE_OUT '%s%s%s[0m[%s%s%s[0m%s[2m%s%s[0m]%s' \
         "$badge_ansi" "$badge_txt" "$esc" \
         "$bar_ansi" "$hashes" "$esc" \
         "$esc" "$dots" "$esc" \
@@ -149,14 +191,14 @@ _rvdk_prog_render() {
     [[ "$_RVDK_PROG_ACTIVE" != "1" ]] && return 0
 
     local esc="$_RVDK_ESC"
-    local prev_rows="$_RVDK_PROG_ROWS"
-    _rvdk_prog_query_geom
+    local prev_rows="$_RVDK_PREV_ROWS"
+    _RVDK_PREV_ROWS=0
     local rows="$_RVDK_PROG_ROWS"
     local cols="$_RVDK_PROG_COLS"
     (( rows < 10 || cols < 40 )) && return 0
 
-    local rvdk_line
-    rvdk_line="$(_rvdk_prog_format_line "RVDK" "$_RVDK_BADGE_SGR" "$_RVDK_BAR_SGR" "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" "$cols")"
+    _rvdk_prog_format_line "RVDK" "$_RVDK_BADGE_SGR" "$_RVDK_BAR_SGR" "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" "$cols"
+    local rvdk_line="$_RVDK_LINE_OUT"
 
     if [[ "$_RVDK_PROG_MODE" == "stacked" ]]; then
         local scroll_end=$(( rows - 2 ))
@@ -177,7 +219,7 @@ _rvdk_prog_render() {
         seq+="${esc}[${sub_row};1H${rvdk_line}${esc}[0K"
 
         # Self-heal parent orchestrator bar on row=ROWS if state file is present
-        if [[ -n "${RVDK_PARENT_STATE:-}" && -r "${RVDK_PARENT_STATE}" ]]; then
+        if [[ -n "${RVDK_PARENT_STATE:-}" && -r "${RVDK_PARENT_STATE}" && ! -L "${RVDK_PARENT_STATE}" ]]; then
             local m_raw="" m_pct="0" m_msg="" m_line=""
             local p_label="${RVDK_PARENT_LABEL:-Pipeline}"
             local p_badge="${RVDK_PARENT_BADGE_SGR:-$_RVDK_DEFAULT_PARENT_BADGE_SGR}"
@@ -187,7 +229,8 @@ _rvdk_prog_render() {
                 m_pct="${m_raw%%|*}"
                 m_msg="${m_raw#*|}"
                 [[ "$m_pct" =~ ^[0-9]+$ ]] || m_pct=0
-                m_line="$(_rvdk_prog_format_line "$p_label" "$p_badge" "$p_bar" "$m_pct" "$m_msg" "$cols")"
+                _rvdk_prog_format_line "$p_label" "$p_badge" "$p_bar" "$m_pct" "$m_msg" "$cols"
+                m_line="$_RVDK_LINE_OUT"
                 seq+="${esc}[${master_row};1H${m_line}${esc}[0K"
             fi
         fi
@@ -213,6 +256,12 @@ _rvdk_prog_render() {
     return 0
 }
 
+_rvdk_prog_on_winch() {
+    _RVDK_PREV_ROWS="$_RVDK_PROG_ROWS"
+    _rvdk_prog_query_geom
+    _rvdk_prog_render
+}
+
 rvdk_prog_init() {
     local init_label="${1:-Initializing...}"
     local esc="$_RVDK_ESC"
@@ -224,6 +273,12 @@ rvdk_prog_init() {
         return 0
     fi
 
+    # Pre-allocate 256-char fill & pad buffers once at init
+    _RVDK_FILL_BUF="################################################################"
+    _RVDK_FILL_BUF="${_RVDK_FILL_BUF}${_RVDK_FILL_BUF}${_RVDK_FILL_BUF}${_RVDK_FILL_BUF}"
+    _RVDK_PAD_BUF="................................................................"
+    _RVDK_PAD_BUF="${_RVDK_PAD_BUF}${_RVDK_PAD_BUF}${_RVDK_PAD_BUF}${_RVDK_PAD_BUF}"
+
     _rvdk_prog_query_geom
     if (( _RVDK_PROG_ROWS < 10 || _RVDK_PROG_COLS < 40 )); then
         return 0
@@ -232,21 +287,23 @@ rvdk_prog_init() {
     _RVDK_PROG_ACTIVE="1"
     _RVDK_PROG_PCT="${RVDK_PROG_BASE:-0}"
     _RVDK_PROG_MSG="$init_label"
+    _RVDK_SUB_STATE_VALID="0"
 
     if [[ "${RVDK_PARENT_PROGBAR:-0}" == "1" ]]; then
         # Stacked above parent orchestrator bar (parent already reserved 2 rows)
         _RVDK_PROG_MODE="stacked"
         _RVDK_PROG_OWNER="0"
-        trap '_rvdk_prog_render' WINCH
-        if [[ -n "${RVDK_SUB_STATE:-}" ]]; then
-            printf '%s|%s\n' "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" > "${RVDK_SUB_STATE}" 2>/dev/null || true
+        if [[ -n "${RVDK_SUB_STATE:-}" ]] && _rvdk_prog_validate_sub_state "$RVDK_SUB_STATE"; then
+            _RVDK_SUB_STATE_VALID="1"
+            _rvdk_prog_write_sub_state
         fi
+        trap '_rvdk_prog_on_winch' WINCH
         _rvdk_prog_render
     elif [[ "${RVDK_PROGBAR_SESSION:-0}" == "1" ]]; then
         # Child script inside an already-initialized standalone `rvdk` session
         _RVDK_PROG_MODE="standalone"
         _RVDK_PROG_OWNER="0"
-        trap '_rvdk_prog_render' WINCH
+        trap '_rvdk_prog_on_winch' WINCH
         _rvdk_prog_render
     else
         # Top-level standalone `rvdk` (or direct module invocation): reserve 1 bottom row.
@@ -260,7 +317,7 @@ rvdk_prog_init() {
         trap 'rvdk_prog_cleanup' EXIT
         trap 'rvdk_prog_cleanup; trap - INT; kill -INT $$' INT
         trap 'rvdk_prog_cleanup; trap - TERM; kill -TERM $$' TERM
-        trap '_rvdk_prog_render' WINCH
+        trap '_rvdk_prog_on_winch' WINCH
         _rvdk_prog_render
     fi
     return 0
@@ -288,8 +345,8 @@ rvdk_prog() {
     _RVDK_PROG_PCT="$scaled"
     [[ -n "$msg" ]] && _RVDK_PROG_MSG="$msg"
 
-    if [[ "$_RVDK_PROG_MODE" == "stacked" && -n "${RVDK_SUB_STATE:-}" ]]; then
-        printf '%s|%s\n' "$_RVDK_PROG_PCT" "$_RVDK_PROG_MSG" > "${RVDK_SUB_STATE}" 2>/dev/null || true
+    if [[ "$_RVDK_PROG_MODE" == "stacked" && "$_RVDK_SUB_STATE_VALID" == "1" ]]; then
+        _rvdk_prog_write_sub_state
     fi
 
     _rvdk_prog_render
@@ -312,5 +369,6 @@ rvdk_prog_cleanup() {
     if [[ -n "${_RVDK_OWN_APT_STAMP:-}" ]]; then
         rm -f "${_RVDK_OWN_APT_STAMP}" 2>/dev/null || true
     fi
+    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
     return "$rc"
 }

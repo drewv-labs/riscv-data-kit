@@ -27,6 +27,21 @@ elif [[ -n "${ZSH_VERSION:-}" && "${0:-}" != "zsh" && "${0:-}" != "-zsh" && -f "
 else
     SCRIPT_SELF=""
 fi
+
+for _arg in "$@"; do
+    if [[ "$_arg" == "-h" || "$_arg" == "--help" ]]; then
+        cat <<'EOF'
+Usage:
+  curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash [-s -- --quiet]
+
+Options:
+  -q, --quiet   Suppress post-install banner
+  -h, --help    Show this help message and exit
+EOF
+        exit 0
+    fi
+done
+
 if [[ $EUID -ne 0 ]]; then
     if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
         exec sudo -E bash "$SCRIPT_SELF" "$@"
@@ -40,37 +55,37 @@ fi
 # even on hardened root environments with umask 077/027.
 umask 022
 
-# Sanitize SSH-forwarded LC_* environment variables before target locales exist
-if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
-    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
-elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
-    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
-else
-    export LANG="C" LC_ALL="C"
+_REPO_ROOT=""
+if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
+    _REPO_ROOT="$(cd "$(dirname "$SCRIPT_SELF")" && pwd)"
 fi
 
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
-if [[ ! "$REAL_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-    REAL_USER="root"
-fi
-
-REAL_HOME=""
-if command -v getent >/dev/null 2>&1; then
-    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
-elif command -v dscl >/dev/null 2>&1; then
-    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
-fi
-if [[ -z "$REAL_HOME" ]]; then
-    if [[ "$REAL_USER" == "root" ]]; then
-        REAL_HOME="/root"
-    elif [[ -d "/Users/${REAL_USER}" ]]; then
-        REAL_HOME="/Users/${REAL_USER}"
-    elif [[ -d "/home/${REAL_USER}" ]]; then
-        REAL_HOME="/home/${REAL_USER}"
+# @RVDK_INLINE_LIBS: common
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
     else
-        REAL_HOME="/root"
+        log_info()  { printf "\033[1;36m[RVDK:CLI]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_sanitize_locale() { export LANG="C" LC_ALL="C"; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; REAL_HOME="/root"; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _tmp
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+        rvdk_sync_cold_clock() { :; }
     fi
 fi
+
+rvdk_log_init "RVDK:CLI"
+rvdk_sanitize_locale
+rvdk_resolve_caller
 
 LEGACY_HOME_RVDK="${REAL_HOME}/.rvdk"
 SYS_ETC_DIR="/etc/rvdk"
@@ -84,71 +99,17 @@ QUIET_MODE="false"
 for arg in "$@"; do
     case "$arg" in
         -q|--quiet) QUIET_MODE="true" ;;
+        *) log_fatal "Unknown argument: ${arg} (try --help)" ;;
     esac
 done
-
-log_info()  { printf "\033[1;36m[RVDK:CLI]\033[0m %s\n" "$1"; }
-log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
 if [[ ! "$REPO_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
     log_fatal "Invalid RVDK_BRANCH name: '${REPO_BRANCH}'."
 fi
 
-# 0. Step skewed cold-RTC clocks on batteryless Linux SBCs via plain HTTP Date
-#    before APT InRelease validation or git HTTPS transport runs.
-sync_cold_rtc_clock() {
-    [[ "$(uname -s)" == "Linux" ]] || return 0
-    if command -v timedatectl >/dev/null 2>&1; then
-        if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" == "yes" ]]; then
-            return 0
-        fi
-    fi
-
-    local hdr_date="" probe_url raw_hdr
-    for probe_url in \
-        "http://rvdk.drewv-labs.dev/" \
-        "http://deb.debian.org/" \
-        "http://connectivitycheck.gstatic.com/generate_204"; do
-        raw_hdr=""
-        if command -v curl >/dev/null 2>&1; then
-            raw_hdr="$(curl -fsSI --connect-timeout 3 --max-time 5 "$probe_url" 2>/dev/null || true)"
-        elif command -v wget >/dev/null 2>&1; then
-            raw_hdr="$(wget -qSO- --max-redirect=0 --timeout=4 "$probe_url" 2>&1 || true)"
-        else
-            return 0
-        fi
-        if [[ -n "$raw_hdr" ]]; then
-            hdr_date="$(printf '%s\n' "$raw_hdr" | awk 'tolower($1) == "date:" { sub(/^[[:space:]]*[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }')"
-            [[ -n "$hdr_date" ]] && break
-        fi
-    done
-    [[ -n "$hdr_date" ]] || return 0
-
-    local remote_epoch="" local_epoch=""
-    remote_epoch="$(date -u -d "$hdr_date" +%s 2>/dev/null || true)"
-    local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
-
-    if [[ -n "$remote_epoch" && "$remote_epoch" =~ ^[0-9]+$ && "$local_epoch" =~ ^[0-9]+$ ]] && (( remote_epoch >= 1700000000 )); then
-        local skew=$(( remote_epoch - local_epoch ))
-        (( skew < 0 )) && skew=$(( -skew ))
-        if (( skew > 120 )); then
-            if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
-                if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
-                    date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true
-                fi
-                [[ -d /var/lib/systemd/timesync ]] && { : > /var/lib/systemd/timesync/clock 2>/dev/null || true; }
-                log_ok "Stepped cold-RTC system clock via HTTP Date (skew=${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
-            fi
-        fi
-    elif (( local_epoch < 1700000000 )); then
-        if date -u -s "$hdr_date" >/dev/null 2>&1; then
-            log_ok "Stepped cold-RTC system clock via HTTP Date (-> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
-        fi
-    fi
-    return 0
-}
-sync_cold_rtc_clock
+# 0. Recover cold-RTC clocks (< 2026-01-01 floor) on batteryless Linux SBCs
+#    monotonically before APT InRelease validation or git HTTPS transport runs.
+rvdk_sync_cold_clock
 
 # 0b. Scrub factory CN mirrors onto US-first signed HTTPS endpoints BEFORE Day-0
 #     prerequisite installs (`git`, `curl`, `bash`) ever touch `apt-get` / `opkg` / `apk`.
@@ -163,27 +124,23 @@ normalize_pkg_mirrors_early() {
     [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/ssl/certs/ca-bundle.crt ]] && scheme="https"
 
     if command -v apt-get >/dev/null 2>&1; then
-        local changed="false" f tmp_f bname backup_dir="/var/lib/rvdk/backups/apt"
+        local changed="false" f rendered bname backup_dir="/var/lib/rvdk/backups/apt"
         for f in /etc/apt/sources.list $(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null); do
             [[ -f "$f" ]] || continue
-            tmp_f="$(mktemp)"
-            sed -E \
+            rendered="$(sed -E \
                 -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g" \
                 -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
                 -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
                 -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
                 -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
                 -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
-                "$f" > "$tmp_f"
-            if ! cmp -s "$tmp_f" "$f" 2>/dev/null; then
+                "$f")"
+            if ! printf '%s\n' "$rendered" | cmp -s - "$f" 2>/dev/null; then
                 mkdir -p "$backup_dir"
                 bname="$(printf '%s' "$f" | sed 's@^/@@; s@/@__@g')"
                 [[ -f "${backup_dir}/${bname}.orig" ]] || cp -a "$f" "${backup_dir}/${bname}.orig" 2>/dev/null || true
-                chmod 0644 "$tmp_f"
-                mv -f "$tmp_f" "$f"
+                printf '%s\n' "$rendered" | rvdk_atomic_write "$f" 0644
                 changed="true"
-            else
-                rm -f "$tmp_f"
             fi
         done
         if [[ "$changed" == "true" ]]; then
@@ -192,19 +149,15 @@ normalize_pkg_mirrors_early() {
         fi
     fi
 
-    local owrt_f tmp_of
+    local owrt_f owrt_rendered
     for owrt_f in /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf /etc/apk/repositories; do
         [[ -f "$owrt_f" ]] || continue
-        tmp_of="$(mktemp)"
-        sed -E "/^[[:space:]]*#/! s@https?://(${cn_hosts})/openwrt([[:space:]/]|$)@${scheme}://downloads.openwrt.org\\2@g" "$owrt_f" > "$tmp_of"
-        if ! cmp -s "$tmp_of" "$owrt_f" 2>/dev/null; then
+        owrt_rendered="$(sed -E "/^[[:space:]]*#/! s@https?://(${cn_hosts})/openwrt([[:space:]/]|$)@${scheme}://downloads.openwrt.org\\2@g" "$owrt_f")"
+        if ! printf '%s\n' "$owrt_rendered" | cmp -s - "$owrt_f" 2>/dev/null; then
             mkdir -p /var/lib/rvdk/backups/openwrt
-            cp -a "$owrt_f" "/var/lib/rvdk/backups/openwrt/$(basename "$owrt_f").orig" 2>/dev/null || true
-            chmod 0644 "$tmp_of"
-            mv -f "$tmp_of" "$owrt_f"
+            [[ -f "/var/lib/rvdk/backups/openwrt/$(basename "$owrt_f").orig" ]] || cp -a "$owrt_f" "/var/lib/rvdk/backups/openwrt/$(basename "$owrt_f").orig" 2>/dev/null || true
+            printf '%s\n' "$owrt_rendered" | rvdk_atomic_write "$owrt_f" 0644
             log_ok "Normalized OpenWrt package feeds onto ${scheme}://downloads.openwrt.org"
-        else
-            rm -f "$tmp_of"
         fi
     done
 }
@@ -349,7 +302,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    sudo rvdk quirk <name|list>    # Toggle board quirks (e.g. hdmi, fusb)
    rvdk flash <board> <medium>    # Flash board media (e.g. rvdk flash p550 usb 4)
    sudo rvdk bsp                  # Run Silicon BSP hardening only
-   sudo rvdk os                   # Run OS normalization & CVE guard only
+   sudo rvdk os                   # Run OS normalization & rvdk-net-guard only
    sudo rvdk postgresql           # Install PostgreSQL 18.6 (cache or --force-build)
    sudo rvdk mods/nvme-4kn        # Format 4Kn NVMe + LVM vg_rvdk + XFS/Btrfs
    sudo rvdk mods/btrfs-raid

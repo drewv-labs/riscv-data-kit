@@ -3,15 +3,105 @@
 # DREW-V Labs // RVDK Block Storage Non-Destructive Safety Interlocks
 # Path: riscv-data-kit/lib/storage_guard.sh
 #
-# Protects root/boot/swap/system filesystems unconditionally and refuses to
-# format or wipe pre-existing user filesystems, LVM PVs, RAID members, or LUKS
-# containers unless an explicit --force-wipe flag is passed by the operator.
+# Protects root/boot/swap/system filesystems unconditionally, enforces strict
+# cross-disk LVM/filesystem confinement, and refuses to format or wipe
+# pre-existing user filesystems, LVM PVs, RAID members, or LUKS containers
+# unless an explicit --force-wipe flag is passed by the operator.
 # ==============================================================================
 
-if [[ "${_RVDK_STORAGE_GUARD_SOURCED:-0}" == "1" ]]; then
-    return 0 2>/dev/null || true
-fi
-_RVDK_STORAGE_GUARD_SOURCED="1"
+[[ -n "${_RVDK_STORAGE_GUARD_SH_LOADED:-}" ]] && return 0
+_RVDK_STORAGE_GUARD_SH_LOADED=1
+
+# Recursively resolve a kernel block name (`dm-0`, `nvme0n1p1`, `nvme0n1`) to its
+# leaf whole-disk kernel names via `/sys/class/block/<kname>/slaves` and `lsblk`.
+_rvdk_collect_leaf_disks() {
+    local kname="$1"
+    [[ -n "$kname" ]] || return 0
+
+    local slave_dir="/sys/class/block/${kname}/slaves"
+    if [[ -d "$slave_dir" ]] && compgen -G "${slave_dir}/*" >/dev/null 2>&1; then
+        local s
+        for s in "${slave_dir}"/*; do
+            [[ -e "$s" ]] || continue
+            _rvdk_collect_leaf_disks "$(basename "$s")"
+        done
+        return 0
+    fi
+
+    local pk=""
+    if command -v lsblk >/dev/null 2>&1 && [[ -b "/dev/${kname}" ]]; then
+        pk="$(lsblk -ndo PKNAME "/dev/${kname}" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+    fi
+    if [[ -z "$pk" && -L "/sys/class/block/${kname}" ]]; then
+        local sys_real parent_base
+        sys_real="$(readlink -f "/sys/class/block/${kname}" 2>/dev/null || true)"
+        parent_base="$(basename "$(dirname "$sys_real")")"
+        if [[ -n "$parent_base" && "$parent_base" != "block" && -e "/sys/block/${parent_base}" ]]; then
+            pk="$parent_base"
+        fi
+    fi
+
+    if [[ -n "$pk" && "$pk" != "$kname" ]]; then
+        _rvdk_collect_leaf_disks "$pk"
+    else
+        printf '%s\n' "$kname"
+    fi
+}
+
+# Returns 0 only if <dev_path> (whole disk, partition, or dm/LVM LV) resides
+# exclusively on <target_disk>. Fails closed (returns 1) on cross-disk or unknown topology.
+rvdk_block_resides_on_disk() {
+    local dev_path="${1:-}"
+    local target_disk="${2:-}"
+    [[ -n "$dev_path" && -n "$target_disk" ]] || return 1
+
+    local dev_real target_real dev_kname target_kname
+    dev_real="$(readlink -f "$dev_path" 2>/dev/null || echo "$dev_path")"
+    target_real="$(readlink -f "$target_disk" 2>/dev/null || echo "$target_disk")"
+    dev_kname="$(basename "$dev_real")"
+    target_kname="$(basename "$target_real")"
+
+    [[ -n "$dev_kname" && -n "$target_kname" ]] || return 1
+    if [[ "$dev_real" == "$target_real" || "$dev_kname" == "$target_kname" ]]; then
+        return 0
+    fi
+
+    local found_any="false" leaf
+    while IFS= read -r leaf; do
+        [[ -n "$leaf" ]] || continue
+        found_any="true"
+        if [[ "$leaf" != "$target_kname" ]]; then
+            return 1
+        fi
+    done < <(_rvdk_collect_leaf_disks "$dev_kname")
+
+    [[ "$found_any" == "true" ]]
+}
+
+# Returns 0 only if every Physical Volume backing <vg_name> resides exclusively
+# on <target_disk>. Fails closed if any PV is missing/unknown or on another disk.
+rvdk_vg_exclusively_on_disk() {
+    local vg_name="${1:-}"
+    local target_disk="${2:-}"
+    [[ -n "$vg_name" && -n "$target_disk" ]] || return 1
+    command -v pvs >/dev/null 2>&1 || return 1
+
+    local found_pv="false" raw_pv pv
+    while IFS= read -r raw_pv; do
+        pv="${raw_pv#"${raw_pv%%[![:space:]]*}"}"
+        pv="${pv%"${pv##*[![:space:]]}"}"
+        [[ -n "$pv" ]] || continue
+        found_pv="true"
+        if [[ "$pv" == *"[unknown]"* || ! -b "$pv" ]]; then
+            return 1
+        fi
+        if ! rvdk_block_resides_on_disk "$pv" "$target_disk"; then
+            return 1
+        fi
+    done < <(pvs --noheadings -o pv_name -S "vg_name=${vg_name}" 2>/dev/null || true)
+
+    [[ "$found_pv" == "true" ]]
+}
 
 # Returns 0 if any partition/LV on <dev> backs a critical OS mountpoint or active swap
 rvdk_device_backs_os_or_swap() {

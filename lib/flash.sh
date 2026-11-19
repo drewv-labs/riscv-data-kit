@@ -15,7 +15,8 @@
 #   • mode = "sd_bootstrap" : Delegates on-board SD -> eMMC bootstrap to board script
 #
 # Security & Safety Interlocks:
-#   • Fail-closed SHA-256 verification on all downloaded images (unless --insecure-skip-sha256)
+#   • Fail-closed SHA-256 verification on all downloaded images (requires pinned
+#     digest in media.json / --sha256, or explicit --allow-remote-sha256)
 #   • Blocks macOS disk0/disk1 and Internal non-removable storage
 #   • Blocks Linux OS/swap disks and non-removable/non-USB/MMC disks (unless --allow-non-removable)
 #   • Enforces minimum capacity and 256 GiB backup-drive ceiling (unless --force)
@@ -29,11 +30,16 @@ else
     set -Eeuo pipefail
 fi
 
+[[ -n "${_RVDK_FLASH_SH_LOADED:-}" ]] && return 0
+_RVDK_FLASH_SH_LOADED=1
+
 _FLASH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _FLASH_REPO_ROOT="$(cd "${_FLASH_LIB_DIR}/.." && pwd)"
 
-# shellcheck source=lib/common.sh
-source "${_FLASH_LIB_DIR}/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    # shellcheck source=lib/common.sh
+    source "${_FLASH_LIB_DIR}/common.sh"
+fi
 rvdk_log_init "RVDK:FLASH"
 
 _rvdk_run_priv() {
@@ -69,6 +75,7 @@ _rvdk_flash_cleanup() {
         fi
         rmdir "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
     fi
+    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
 }
 
 rvdk_flash_list() {
@@ -142,13 +149,14 @@ _rvdk_flash_verify_sha256() {
     local pinned_sha="$4"
     local skip_sha="$5"
     local owner_user="$6"
+    local allow_remote_sha="${7:-false}"
 
     local expected=""
     if [[ -n "$pinned_sha" ]]; then
         expected="$(printf '%s' "$pinned_sha" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
-    else
+    elif [[ "$allow_remote_sha" == "true" ]]; then
         if [[ ! -s "$sha_file" && -n "$remote_sha_url" ]]; then
-            log_info "Fetching cryptographic digest from ${remote_sha_url}..."
+            log_info "Fetching same-origin SHA-256 sidecar (${remote_sha_url}) (--allow-remote-sha256)..."
             if ! curl -fsSL --retry 3 "$remote_sha_url" -o "${sha_file}.tmp"; then
                 rm -f "${sha_file}.tmp"
                 if [[ "$skip_sha" == "true" ]]; then
@@ -169,6 +177,9 @@ _rvdk_flash_verify_sha256() {
         if [[ "$skip_sha" == "true" ]]; then
             log_warn "Skipping SHA-256 verification (--insecure-skip-sha256 enabled)."
             return 0
+        fi
+        if [[ -n "$remote_sha_url" ]]; then
+            log_fatal "Fail-closed security check: no pinned SHA-256 digest for ${img_file}. Pass --sha256 <hex>, --allow-remote-sha256 (to trust ${remote_sha_url}), or --insecure-skip-sha256."
         fi
         log_fatal "Fail-closed security check: no SHA-256 digest available for ${img_file}. Pass --sha256 <hex> or --insecure-skip-sha256."
     fi
@@ -294,15 +305,7 @@ _rvdk_select_ext4_root_slice() {
     return 1
 }
 
-# Harden vendor raw ext4 superblocks & fstab before first boot on reused media:
-#   1. Enables `uninit_bg` if both `metadata_csum` and `uninit_bg` were omitted by
-#      vendor image builders (e.g. Xunlong RV2), preventing online `resize2fs` +
-#      interrupted `ext4lazyinit` from tripping `fsck.ext4` ("Inode ... seems to
-#      contain garbage") over stale non-zero blocks on reused SD cards.
-#   2. Replaces unsafe `journal_data_writeback` default mount options with ordered
-#      journaling (`journal_data_ordered`).
-#   3. Strips 10-minute `commit=600` mount delays from `/etc/fstab` so unclean bench
-#      power cycles never lose 10 minutes of uncommitted metadata.
+# Harden vendor raw ext4 superblocks & fstab before first boot on reused media
 _rvdk_harden_ext4_superblock() {
     local tune2fs_bin="$1"
     local e2fsck_bin="$2"
@@ -379,7 +382,7 @@ _rvdk_seed_ext4_rtc_floor() {
 
     local now_epoch=""
     now_epoch="$(date -u +%s 2>/dev/null || echo 0)"
-    [[ "$now_epoch" =~ ^[0-9]+$ ]] && (( now_epoch >= 1700000000 )) || return 0
+    [[ "$now_epoch" =~ ^[0-9]+$ ]] && (( now_epoch >= 1767225600 )) || return 0
 
     local utc_now
     utc_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
@@ -699,6 +702,7 @@ Options:
   -d, --device <disk>          Target disk number (macOS: 4 or /dev/disk4) or block path (Linux: /dev/sdX, /dev/mmcblk2)
   -i, --image <path>           Flash a local image file instead of cached/mirror image
       --sha256 <hex64>         Expected SHA-256 digest for custom or remote image
+      --allow-remote-sha256    Trust same-origin .sha256 sidecar when media.json has no pinned digest
       --root-label <label>     Override post-flash ext4 root filesystem label (max 16 chars)
       --no-root-label          Skip post-flash ext4 root filesystem labeling
       --insecure-skip-sha256   Bypass mandatory SHA-256 verification (NOT recommended)
@@ -727,6 +731,7 @@ rvdk_flash_main() {
     local dry_run="false"
     local want_help="false"
     local skip_root_label="false"
+    local allow_remote_sha256="false"
     local skip_sha256="false"
     local allow_non_removable="false"
     local force_large_disk="false"
@@ -734,21 +739,22 @@ rvdk_flash_main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --board)                board_query="${2:-}"; shift 2 ;;
-            --medium)               medium="${2:-}"; shift 2 ;;
-            -d|--device)            target_arg="${2:-}"; shift 2 ;;
-            -i|--image)             image_path="${2:-}"; shift 2 ;;
-            --sha256)               cli_sha256="${2:-}"; shift 2 ;;
-            --root-label)           cli_root_label="${2:-}"; shift 2 ;;
-            --no-root-label)        skip_root_label="true"; shift ;;
-            --hostname)             bootstrap_hostname="${2:-}"; shift 2 ;;
-            -n|--dry-run)           dry_run="true"; shift ;;
-            --insecure-skip-sha256) skip_sha256="true"; shift ;;
-            --allow-non-removable)  allow_non_removable="true"; shift ;;
-            --force)                force_large_disk="true"; shift ;;
-            -y|--yes)               skip_confirm="true"; shift ;;
-            -h|--help)              want_help="true"; shift ;;
-            -*)                     log_fatal "Unknown flag: $1" ;;
+            --board)                 board_query="${2:-}"; shift 2 ;;
+            --medium)                medium="${2:-}"; shift 2 ;;
+            -d|--device)             target_arg="${2:-}"; shift 2 ;;
+            -i|--image)              image_path="${2:-}"; shift 2 ;;
+            --sha256)                cli_sha256="${2:-}"; shift 2 ;;
+            --allow-remote-sha256)   allow_remote_sha256="true"; shift ;;
+            --root-label)            cli_root_label="${2:-}"; shift 2 ;;
+            --no-root-label)         skip_root_label="true"; shift ;;
+            --hostname)              bootstrap_hostname="${2:-}"; shift 2 ;;
+            -n|--dry-run)            dry_run="true"; shift ;;
+            --insecure-skip-sha256)  skip_sha256="true"; shift ;;
+            --allow-non-removable)   allow_non_removable="true"; shift ;;
+            --force)                 force_large_disk="true"; shift ;;
+            -y|--yes)                skip_confirm="true"; shift ;;
+            -h|--help)               want_help="true"; shift ;;
+            -*)                      log_fatal "Unknown flag: $1" ;;
             *)
                 if [[ -z "$board_query" ]]; then
                     board_query="$1"
@@ -1013,7 +1019,7 @@ PY
         [[ ! -f "$image_path" ]] && log_fatal "Custom image file not found: ${image_path}"
         log_info "Using custom image : ${image_path}"
         if [[ -n "$cli_sha256" ]]; then
-            _rvdk_flash_verify_sha256 "$image_path" "" "" "$cli_sha256" "$skip_sha256" "$REAL_USER"
+            _rvdk_flash_verify_sha256 "$image_path" "" "" "$cli_sha256" "$skip_sha256" "$REAL_USER" "$allow_remote_sha256"
         fi
     else
         [[ -z "$default_img" ]] && log_fatal "No default image configured for ${board_id} (${medium}). Pass --image /path/to/img."
@@ -1055,7 +1061,7 @@ PY
             fi
         fi
 
-        _rvdk_flash_verify_sha256 "$image_path" "$sha_path" "${active_url}.sha256" "$active_pinned_sha" "$skip_sha256" "$REAL_USER"
+        _rvdk_flash_verify_sha256 "$image_path" "$sha_path" "${active_url}.sha256" "$active_pinned_sha" "$skip_sha256" "$REAL_USER" "$allow_remote_sha256"
     fi
 
     local img_size_bytes

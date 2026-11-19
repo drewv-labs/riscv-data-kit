@@ -3,17 +3,27 @@
 # DREW-V Labs // RVDK Unified Login Header (MOTD) Library
 # Path: riscv-data-kit/lib/motd.sh
 #
-# Converges a clean, sub-15ms, unified login header across Ubuntu, Debian,
+# Converges a clean, sub-10ms, unified login header across Ubuntu, Debian,
 # Armbian/OrangePi, SpacemiT Bianbu (`/etc/update-motd.d/10-rvdk-motd`), and
 # OpenWrt (`/etc/profile.d/10-rvdk-motd.sh`), while backing up stock distro
 # MOTD scripts/banners under `/var/lib/rvdk/backups/motd/` so `rvdk uninstall`
 # restores the exact default OS login header.
 # ==============================================================================
 
-if [[ "${_RVDK_MOTD_SOURCED:-0}" == "1" ]]; then
-    return 0 2>/dev/null || true
+[[ -n "${_RVDK_MOTD_SH_LOADED:-}" ]] && return 0
+_RVDK_MOTD_SH_LOADED=1
+
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    _RVDK_MOTD_LIB_DIR=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        _RVDK_MOTD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -n "$_RVDK_MOTD_LIB_DIR" && -f "${_RVDK_MOTD_LIB_DIR}/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_RVDK_MOTD_LIB_DIR}/common.sh"
+    fi
+    unset _RVDK_MOTD_LIB_DIR
 fi
-_RVDK_MOTD_SOURCED="1"
 
 _rvdk_emit_motd_renderer_body() {
     cat <<'MOTD_BODY'
@@ -126,25 +136,44 @@ _rvdk_motd_render() {
         '
     fi
 
-    rvdk_bin=""
-    if [ -x /usr/local/bin/rvdk ]; then
-        rvdk_bin="/usr/local/bin/rvdk"
-    elif [ -x /usr/bin/rvdk ]; then
-        rvdk_bin="/usr/bin/rvdk"
-    elif command -v rvdk >/dev/null 2>&1; then
-        rvdk_bin="$(command -v rvdk)"
-    fi
-
     kit_out=""
-    if [ -n "$rvdk_bin" ]; then
-        kit_out="$("$rvdk_bin" kit --motd 2>/dev/null || true)"
-    fi
-    if [ -z "$kit_out" ] && [ -r /etc/rvdk/kit.env ]; then
-        kit_out="$(awk -F= '
+    # Fast <10ms /bin/sh + awk + sysfs path when /etc/rvdk/kit.env exists (avoids ~95ms bash CLI fork)
+    if [ -r /etc/rvdk/kit.env ]; then
+        dt_tune=""
+        if [ -r /etc/rvdk/deeptune.env ]; then
+            dt_tune="$(awk -F= '/^RVDK_TUNE=/ {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' /etc/rvdk/deeptune.env 2>/dev/null)"
+        fi
+        eng_dir="/usr/local/share/rvdk/engine"
+
+        # Direct sysfs / modprobe quirk probes (<1ms, zero subprocesses)
+        p550_fusb=""
+        p550_hdmi=""
+        if [ -d /sys/module/fusb303b ]; then
+            p550_fusb="on"
+        elif [ -f /etc/modprobe.d/90-rvdk-p550-fusb303b.conf ]; then
+            p550_fusb="off"
+        fi
+        if [ -e /sys/bus/platform/drivers/dw-hdmi-eswin/502a0000.hdmi ] \
+            || [ -e /sys/bus/platform/drivers/es-dc/502c0000.display_control ] \
+            || [ -e /sys/bus/platform/drivers/es_drm/soc:display-subsystem ]; then
+            p550_hdmi="on"
+        elif [ -d /sys/bus/platform/drivers/dw-hdmi-eswin ] || [ -d /sys/bus/platform/drivers/es-dc ]; then
+            p550_hdmi="off"
+        fi
+
+        kit_out="$(awk -F= \
+            -v tune="$dt_tune" \
+            -v eng="$eng_dir" \
+            -v fusb="$p550_fusb" \
+            -v hdmi="$p550_hdmi" '
             function unq(s) {
                 sub(/^[^=]*=/, "", s)
                 gsub(/^"|"$/, "", s)
+                gsub(/\\\\/, "\x01", s)
                 gsub(/\\"/, "\"", s)
+                gsub(/\\\$/, "$", s)
+                gsub(/\\`/, "`", s)
+                gsub(/\x01/, "\\", s)
                 return s
             }
             /^RVDK_DT_MODEL=/      { dt = unq($0) }
@@ -164,10 +193,45 @@ _rvdk_motd_render() {
                     printf "  • OS (os/)          : %s %s\n", (oi != "" ? oi : "unknown"), ov
                     printf "  • Primary NIC / CPU : %s | %s Harts\n", (pn != "" ? pn : "none"), (ch != "" ? ch : "?")
                     printf "  • Kit Cache File    : /etc/rvdk/kit.env (cached)\n"
+                    chain = "os/deeptune.sh"
+                    if (sc == "eswin/eic7700x" || sc == "spacemit/k1") {
+                        chain = chain " -> bsp/" sc "/deeptune.sh"
+                    }
+                    if (bd == "sifive/p550") {
+                        chain = chain " -> boards/sifive/p550/deeptune.sh"
+                    }
+                    if (tune != "") {
+                        printf "  • DeepTune Chain    : %s (active: %s)\n", chain, tune
+                    } else {
+                        printf "  • DeepTune Chain    : %s\n", chain
+                    }
+                    if (bd == "sifive/p550") {
+                        fs = (fusb != "" ? "fusb=" fusb : "fusb")
+                        hs = (hdmi != "" ? "hdmi=" hdmi : "hdmi")
+                        printf "  • Board Quirks      : %s %s\n", fs, hs
+                    } else {
+                        printf "  • Board Quirks      : none\n"
+                    }
                 }
             }
         ' /etc/rvdk/kit.env 2>/dev/null)"
     fi
+
+    # Fallback ONLY when /etc/rvdk/kit.env does not exist
+    if [ -z "$kit_out" ] && [ ! -r /etc/rvdk/kit.env ]; then
+        rvdk_bin=""
+        if [ -x /usr/local/bin/rvdk ]; then
+            rvdk_bin="/usr/local/bin/rvdk"
+        elif [ -x /usr/bin/rvdk ]; then
+            rvdk_bin="/usr/bin/rvdk"
+        elif command -v rvdk >/dev/null 2>&1; then
+            rvdk_bin="$(command -v rvdk)"
+        fi
+        if [ -n "$rvdk_bin" ]; then
+            kit_out="$("$rvdk_bin" kit --motd 2>/dev/null || true)"
+        fi
+    fi
+
     if [ -n "$kit_out" ]; then
         printf '\nRVDK Kit\n\n%s\n' "$kit_out"
     fi
@@ -208,7 +272,7 @@ rvdk_converge_apt_motd() {
     # 2. Back up and clear static /etc/motd (e.g. Debian legal blurb) so pam_motd doesn't append it
     if [[ ! -L "$etc_motd" && -s "$etc_motd" ]]; then
         [[ -f "${bkp_dir}/etc.motd.orig" ]] || cp -a "$etc_motd" "${bkp_dir}/etc.motd.orig" 2>/dev/null || true
-        : > "$etc_motd"
+        printf '' | rvdk_atomic_write "$etc_motd" 0644
         changed="true"
     fi
 
@@ -216,29 +280,26 @@ rvdk_converge_apt_motd() {
     local mnews="${root_prefix}/etc/default/motd-news"
     if [[ -f "$mnews" ]] && grep -Eq '^[[:space:]]*ENABLED=1' "$mnews" 2>/dev/null; then
         [[ -f "${bkp_dir}/default.motd-news.orig" ]] || cp -a "$mnews" "${bkp_dir}/default.motd-news.orig" 2>/dev/null || true
-        sed -i 's/^[[:space:]]*ENABLED=1/ENABLED=0/' "$mnews" 2>/dev/null || {
-            local _tmp_mn
-            _tmp_mn="$(mktemp)"
-            sed 's/^[[:space:]]*ENABLED=1/ENABLED=0/' "$mnews" > "$_tmp_mn"
-            chmod 0644 "$_tmp_mn"
-            mv -f "$_tmp_mn" "$mnews"
-        }
+        local _mnews_out
+        _mnews_out="$(sed 's/^[[:space:]]*ENABLED=1/ENABLED=0/' "$mnews")"
+        printf '%s\n' "$_mnews_out" | rvdk_atomic_write "$mnews" 0644
         changed="true"
     fi
 
-    local vname vcfg _tmp_vc
+    local vname vcfg _vcfg_out
     for vname in orangepi-motd armbian-motd; do
         vcfg="${root_prefix}/etc/default/${vname}"
         [[ -f "$vcfg" ]] || continue
         if ! grep -Eq '^MOTD_DISABLE="header sysinfo tips updates config autoreboot-warn"$' "$vcfg" 2>/dev/null; then
             [[ -f "${bkp_dir}/default.${vname}.orig" ]] || cp -a "$vcfg" "${bkp_dir}/default.${vname}.orig" 2>/dev/null || true
             if grep -Eq '^[[:space:]]*MOTD_DISABLE=' "$vcfg" 2>/dev/null; then
-                _tmp_vc="$(mktemp)"
-                sed 's/^[[:space:]]*MOTD_DISABLE=.*/MOTD_DISABLE="header sysinfo tips updates config autoreboot-warn"/' "$vcfg" > "$_tmp_vc"
-                chmod 0644 "$_tmp_vc"
-                mv -f "$_tmp_vc" "$vcfg"
+                _vcfg_out="$(sed 's/^[[:space:]]*MOTD_DISABLE=.*/MOTD_DISABLE="header sysinfo tips updates config autoreboot-warn"/' "$vcfg")"
+                printf '%s\n' "$_vcfg_out" | rvdk_atomic_write "$vcfg" 0644
             else
-                printf '\nMOTD_DISABLE="header sysinfo tips updates config autoreboot-warn"\n' >> "$vcfg"
+                {
+                    cat "$vcfg"
+                    printf '\nMOTD_DISABLE="header sysinfo tips updates config autoreboot-warn"\n'
+                } | rvdk_atomic_write "$vcfg" 0644
             fi
             changed="true"
         fi
@@ -249,23 +310,18 @@ rvdk_converge_apt_motd() {
         rm -f "${root_prefix}/root/.not_logged_in_yet" 2>/dev/null || true
     fi
 
-    # 4. Install executable /etc/update-motd.d/10-rvdk-motd
-    local tmp_hook
-    tmp_hook="$(mktemp)"
-    {
+    # 4. Install executable /etc/update-motd.d/10-rvdk-motd via same-dir atomic write
+    local want_hook
+    want_hook="$(
         printf '#!/bin/sh\n'
         printf '# Managed by RVDK (lib/motd.sh)\n'
         _rvdk_emit_motd_renderer_body
         printf '_rvdk_motd_render\n'
-    } > "$tmp_hook"
-    chmod 0755 "$tmp_hook"
+    )"
 
-    if [[ ! -x "$motd_hook" ]] || ! cmp -s "$tmp_hook" "$motd_hook" 2>/dev/null; then
-        mv -f "$tmp_hook" "$motd_hook"
-        chmod 0755 "$motd_hook"
+    if [[ ! -x "$motd_hook" ]] || ! printf '%s\n' "$want_hook" | cmp -s - "$motd_hook" 2>/dev/null; then
+        printf '%s\n' "$want_hook" | rvdk_atomic_write "$motd_hook" 0755
         changed="true"
-    else
-        rm -f "$tmp_hook"
     fi
 
     if [[ -z "$root_prefix" ]] && command -v run-parts >/dev/null 2>&1 && [[ -d /run ]]; then
@@ -294,19 +350,18 @@ rvdk_converge_openwrt_motd() {
 
     if [[ ! -L "$banner_f" && -s "$banner_f" ]]; then
         [[ -f "${bkp_dir}/etc.banner.orig" ]] || cp -a "$banner_f" "${bkp_dir}/etc.banner.orig" 2>/dev/null || true
-        : > "$banner_f"
+        printf '' | rvdk_atomic_write "$banner_f" 0644
         changed="true"
     fi
 
     if [[ ! -L "$etc_motd" && -s "$etc_motd" ]]; then
         [[ -f "${bkp_dir}/etc.motd.orig" ]] || cp -a "$etc_motd" "${bkp_dir}/etc.motd.orig" 2>/dev/null || true
-        : > "$etc_motd"
+        printf '' | rvdk_atomic_write "$etc_motd" 0644
         changed="true"
     fi
 
-    local tmp_hook
-    tmp_hook="$(mktemp)"
-    {
+    local want_prof
+    want_prof="$(
         printf '#!/bin/sh\n'
         printf '# Managed by RVDK (lib/motd.sh)\n'
         printf 'if [ -n "${PS1:-}" ] && [ -z "${_RVDK_MOTD_SHOWN:-}" ]; then\n'
@@ -314,15 +369,11 @@ rvdk_converge_openwrt_motd() {
         _rvdk_emit_motd_renderer_body
         printf '    _rvdk_motd_render\n'
         printf 'fi\n'
-    } > "$tmp_hook"
-    chmod 0644 "$tmp_hook"
+    )"
 
-    if ! cmp -s "$tmp_hook" "$prof_hook" 2>/dev/null; then
-        mv -f "$tmp_hook" "$prof_hook"
-        chmod 0644 "$prof_hook"
+    if ! printf '%s\n' "$want_prof" | cmp -s - "$prof_hook" 2>/dev/null; then
+        printf '%s\n' "$want_prof" | rvdk_atomic_write "$prof_hook" 0644
         changed="true"
-    else
-        rm -f "$tmp_hook"
     fi
 
     if [[ "$changed" == "true" ]]; then

@@ -28,9 +28,21 @@ _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 
 # @RVDK_INLINE_LIBS: common
-if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_REPO_ROOT}/lib/common.sh"
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:RV2-EMMC]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m  [WARN]\033[0m %s\n" "$1" >&2; }
+        log_fatal() { printf "\033[1;31m  [FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_sanitize_locale() { export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C; }
+        rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
+        rvdk_validate_hostname() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || log_fatal "Invalid hostname: $1"; }
+        rvdk_sync_cold_clock() { :; }
+    fi
 fi
 
 rvdk_log_init "RVDK:RV2-EMMC"
@@ -50,6 +62,7 @@ _rvdk_emmc_cleanup() {
         fi
         rmdir "${_EMMC_TMP_MNT}" 2>/dev/null || true
     fi
+    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
 }
 
 print_emmc_usage() {
@@ -133,7 +146,7 @@ main() {
     dt_lc="$(tr '[:upper:]' '[:lower:]' <<< "$dt_model")"
     if [[ "$force_run" != "true" ]]; then
         case "$dt_lc" in
-            *"orangepi-rv2"*|*"orangepi rv2"*|*"ky x1"*|*"spacemit"*) ;;
+            *"orangepi-rv2"*|*"orangepi rv2"*|*"orange pi rv2"*|*"ky x1"*|*"spacemit"*) ;;
             *) log_fatal "Host '${dt_model}' is not an Orange Pi RV2 / SpacemiT K1 board. Run this command on the booted RV2 (or pass --force)." ;;
         esac
     fi
@@ -394,7 +407,7 @@ main() {
 
     # Force RVDK kit.env refresh on first eMMC boot & seed cold-RTC floor
     rm -f "${_EMMC_TMP_MNT}/etc/rvdk/kit.env" 2>/dev/null || true
-    if (( $(date -u +%s 2>/dev/null || echo 0) >= 1700000000 )); then
+    if (( $(date -u +%s 2>/dev/null || echo 0) >= 1767225600 )); then
         date -u '+%Y-%m-%d %H:%M:%S' > "${_EMMC_TMP_MNT}/etc/fake-hwclock.data" 2>/dev/null || true
         chmod 0644 "${_EMMC_TMP_MNT}/etc/fake-hwclock.data" 2>/dev/null || true
         if [[ -d "${_EMMC_TMP_MNT}/var/lib/systemd/timesync" ]]; then

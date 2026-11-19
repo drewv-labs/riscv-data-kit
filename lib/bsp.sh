@@ -13,10 +13,20 @@
 #   • KASLR-safe hardware PMU counter exposure (kptr_restrict=1 default)
 # ==============================================================================
 
-if [[ "${_RVDK_BSP_SOURCED:-0}" == "1" ]]; then
-    return 0 2>/dev/null || true
+[[ -n "${_RVDK_BSP_SH_LOADED:-}" ]] && return 0
+_RVDK_BSP_SH_LOADED=1
+
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    _RVDK_BSP_LIB_DIR=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        _RVDK_BSP_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -n "$_RVDK_BSP_LIB_DIR" && -f "${_RVDK_BSP_LIB_DIR}/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_RVDK_BSP_LIB_DIR}/common.sh"
+    fi
+    unset _RVDK_BSP_LIB_DIR
 fi
-_RVDK_BSP_SOURCED="1"
 
 rvdk_bsp_read_dt_model() {
     local dt="Unknown"
@@ -38,8 +48,7 @@ rvdk_bsp_protect_dpkg() {
    "--force-confold";
 };'
     if ! printf '%s\n' "$want" | cmp -s - "$conf_path" 2>/dev/null; then
-        printf '%s\n' "$want" > "$conf_path"
-        chmod 0644 "$conf_path"
+        printf '%s\n' "$want" | rvdk_atomic_write "$conf_path" 0644
         log_ok "Configured dpkg confold protection for ${label} hooks (${conf_path})"
     else
         log_skip "${label} dpkg protection already active (${conf_path})"
@@ -100,7 +109,7 @@ rvdk_bsp_persist_wired_nic() {
         fi
 
         local np_file="/etc/netplan/01-${prefix}-${target_nic}.yaml"
-        cat <<EOF > "$np_file"
+        cat <<EOF | rvdk_atomic_write "$np_file" 0600
 network:
   version: 2
   ethernets:
@@ -108,7 +117,6 @@ network:
       dhcp4: true
       optional: true
 EOF
-        chmod 0600 "$np_file"
         netplan apply
         log_ok "Persisted fallback DHCP configuration for ${target_nic} in ${np_file}"
     elif [[ -d /etc/network/interfaces.d ]]; then
@@ -117,11 +125,10 @@ EOF
         elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager.service 2>/dev/null; then
             log_skip "NetworkManager is active; skipping /etc/network/interfaces.d/${target_nic}"
         else
-            cat <<EOF > "/etc/network/interfaces.d/${target_nic}"
+            cat <<EOF | rvdk_atomic_write "/etc/network/interfaces.d/${target_nic}" 0644
 allow-hotplug ${target_nic}
 iface ${target_nic} inet dhcp
 EOF
-            chmod 0644 "/etc/network/interfaces.d/${target_nic}"
             log_ok "Persisted ${target_nic} DHCP configuration in /etc/network/interfaces.d/${target_nic}"
         fi
     fi
@@ -158,7 +165,9 @@ rvdk_bsp_converge_mmc_root_labels() {
             fi
         fi
         if [[ -f /etc/fstab ]] && grep -Eq '^[[:space:]]*[^#].*[[:space:]]/[[:space:]]+ext4[[:space:]].*commit=[0-9]{2,}' /etc/fstab 2>/dev/null; then
-            sed -i -E '/^[[:space:]]*#/! s/,commit=[0-9]{2,}//g; /^[[:space:]]*#/! s/commit=[0-9]{2,},//g' /etc/fstab
+            local _fstab_clean
+            _fstab_clean="$(sed -E '/^[[:space:]]*#/! s/,commit=[0-9]{2,}//g; /^[[:space:]]*#/! s/commit=[0-9]{2,},//g' /etc/fstab)"
+            printf '%s\n' "$_fstab_clean" | rvdk_atomic_write /etc/fstab 0644
             mount -o remount,commit=5 / 2>/dev/null || true
             live_durability+=("-commit=600")
         fi
@@ -246,7 +255,9 @@ rvdk_bsp_converge_mmc_root_labels() {
                         local rel_cfg
                         for rel_cfg in etc/fstab boot/orangepiEnv.txt boot/armbianEnv.txt boot/env_k1-x.txt boot/spacemit/env_k1-x.txt boot/extlinux/extlinux.conf boot/efi/extlinux.conf; do
                             if [[ -f "${tmp_mnt}/${rel_cfg}" ]] && grep -qF "$peer_uuid" "${tmp_mnt}/${rel_cfg}" 2>/dev/null; then
-                                sed -i "s|${peer_uuid}|${new_uuid}|g" "${tmp_mnt}/${rel_cfg}"
+                                local _peer_rewritten
+                                _peer_rewritten="$(sed "s|${peer_uuid}|${new_uuid}|g" "${tmp_mnt}/${rel_cfg}")"
+                                printf '%s\n' "$_peer_rewritten" | rvdk_atomic_write "${tmp_mnt}/${rel_cfg}" 0644
                             fi
                         done
                         sync
@@ -260,7 +271,9 @@ rvdk_bsp_converge_mmc_root_labels() {
 
         if [[ "$cur_lbl" != "$want_lbl" ]]; then
             if [[ "$root_part" == "$live_root" && -n "$cur_lbl" && -f /etc/fstab ]] && grep -qF "LABEL=${cur_lbl}" /etc/fstab 2>/dev/null; then
-                sed -i "s|LABEL=${cur_lbl}|LABEL=${want_lbl}|g" /etc/fstab
+                local _fstab_lbl
+                _fstab_lbl="$(sed "s|LABEL=${cur_lbl}|LABEL=${want_lbl}|g" /etc/fstab)"
+                printf '%s\n' "$_fstab_lbl" | rvdk_atomic_write /etc/fstab 0644
             fi
             e2label "$root_part" "$want_lbl"
             log_ok "Labeled ${mmc_kind} ext4 rootfs: ${root_part} -> ${want_lbl}"
@@ -307,9 +320,14 @@ rvdk_bsp_lock_cpufreq_performance() {
     # Prevent Armbian/OrangePi cpufrequtils hooks from resetting cpu0 back to ondemand
     if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq '^GOVERNOR="?performance"?$' /etc/default/cpufrequtils 2>/dev/null; then
         if grep -Eq '^GOVERNOR=' /etc/default/cpufrequtils 2>/dev/null; then
-            sed -i 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils
+            local _cpufreq_cfg
+            _cpufreq_cfg="$(sed 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils)"
+            printf '%s\n' "$_cpufreq_cfg" | rvdk_atomic_write /etc/default/cpufrequtils 0644
         else
-            printf '\nGOVERNOR="performance"\n' >> /etc/default/cpufrequtils
+            {
+                cat /etc/default/cpufrequtils
+                printf '\nGOVERNOR="performance"\n'
+            } | rvdk_atomic_write /etc/default/cpufrequtils 0644
         fi
         log_ok "Pinned /etc/default/cpufrequtils GOVERNOR=\"performance\""
     fi
@@ -335,8 +353,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target"
 
         if ! printf '%s\n' "$want_unit" | cmp -s - "$gov_unit" 2>/dev/null; then
-            printf '%s\n' "$want_unit" > "$gov_unit"
-            chmod 0644 "$gov_unit"
+            printf '%s\n' "$want_unit" | rvdk_atomic_write "$gov_unit" 0644
             systemctl daemon-reload
             systemctl enable --now "${unit_prefix}-cpufreq-performance.service" >/dev/null
             if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
@@ -355,7 +372,7 @@ WantedBy=multi-user.target"
             [[ -f "$g" ]] && echo performance > "$g" 2>/dev/null || true
         done
         if [[ ! -x "$procd_gov" ]]; then
-            cat <<'PROCD_EOF' > "$procd_gov"
+            cat <<'PROCD_EOF' | rvdk_atomic_write "$procd_gov" 0755
 #!/bin/sh /etc/rc.common
 START=95
 start() {
@@ -364,7 +381,6 @@ start() {
     done
 }
 PROCD_EOF
-            chmod +x "$procd_gov"
             "$procd_gov" enable 2>/dev/null || true
             log_ok "Enabled OpenWrt procd performance governor (${procd_gov})"
         else
@@ -392,9 +408,8 @@ kernel.perf_event_paranoid = -1
 kernel.kptr_restrict = ${kptr_val}"
 
     if ! printf '%s\n' "$want_pmu" | cmp -s - "$sysctl_file" 2>/dev/null; then
-        printf '%s\n' "$want_pmu" > "$sysctl_file"
-        chmod 0644 "$sysctl_file"
-        sysctl --system >/dev/null 2>&1 || sysctl -p "$sysctl_file" >/dev/null 2>&1 || true
+        printf '%s\n' "$want_pmu" | rvdk_atomic_write "$sysctl_file" 0644
+        sysctl -p "$sysctl_file" >/dev/null 2>&1 || true
         log_ok "Unlocked ${cpu_label} PMU counters in ${sysctl_file} (kptr_restrict=${kptr_val})"
     else
         log_skip "${cpu_label} PMU sysctls already converged (${sysctl_file})"

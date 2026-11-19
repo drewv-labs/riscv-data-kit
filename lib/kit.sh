@@ -1,57 +1,50 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // RVDK Kit Inference & Cache Library (`lib/kit.sh`)
+# DREW-V Labs // RVDK Kit Inference, Compiler Profiles & Cache Library (`lib/kit.sh`)
 # Path: riscv-data-kit/lib/kit.sh
 #
 # Description:
 #   Resolves the hardware & OS "Kit" identity (Board, SoC, OS, Primary NIC,
-#   CPU Hart Count, Factory Default User) once and caches it system-wide at
-#   `/etc/rvdk/kit.env` (0644) using safe non-executing key-value I/O so all
-#   subsequent RVDK operations load from cache in <1ms without re-probing sysfs.
+#   CPU Hart Count, Factory Default User) and silicon compiler profiles once,
+#   caching Kit state system-wide at `/etc/rvdk/kit.env` (0644) using safe
+#   non-executing key-value I/O (`rvdk_kv_load` / `rvdk_kv_write`).
 # ==============================================================================
+
+[[ -n "${_RVDK_KIT_SH_LOADED:-}" ]] && return 0
+_RVDK_KIT_SH_LOADED=1
+
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    _RVDK_KIT_LIB_DIR=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        _RVDK_KIT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -n "$_RVDK_KIT_LIB_DIR" && -f "${_RVDK_KIT_LIB_DIR}/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_RVDK_KIT_LIB_DIR}/common.sh"
+    fi
+    unset _RVDK_KIT_LIB_DIR
+fi
 
 RVDK_KIT_CACHE_FILE="${RVDK_KIT_CACHE_FILE:-/etc/rvdk/kit.env}"
 RVDK_KIT_SCHEMA_VERSION="1"
 
-_RVDK_KIT_ALLOWED_KEYS=" RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS "
-
-# Safe non-executing parser for /etc/rvdk/kit.env (never invokes `source`)
-_rvdk_kit_read_cache() {
-    local cache_file="$1"
-    [[ -r "$cache_file" ]] || return 1
-    local raw_line line key val
-    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
-        line="${raw_line%$'\r'}"
-        line="${line#"${line%%[![:space:]]*}"}"
-        [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
-        key="${line%%=*}"
-        val="${line#*=}"
-        [[ "$key" =~ ^RVDK_[A-Z0-9_]+$ ]] || continue
-        [[ "$_RVDK_KIT_ALLOWED_KEYS" == *" ${key} "* ]] || continue
-        if [[ ${#val} -ge 2 && "${val:0:1}" == '"' && "${val:$(( ${#val} - 1 )):1}" == '"' ]]; then
-            val="${val:1:$(( ${#val} - 2 ))}"
-            val="${val//\\\"/\"}"
-            val="${val//\\\$/\$}"
-            val="${val//\\\`/\`}"
-            val="${val//\\\\/\\}"
-        fi
-        printf -v "$key" '%s' "$val"
-    done < "$cache_file"
-}
-
-_rvdk_kit_escape_val() {
-    local v="${1:-}"
-    v="${v//$'\n'/ }"
-    v="${v//$'\r'/}"
-    v="${v//\\/\\\\}"
-    v="${v//\"/\\\"}"
-    v="${v//\$/\\\$}"
-    v="${v//\`/\\\`}"
-    printf '%s' "$v"
-}
+_RVDK_KIT_ALLOWED_KEYS=(
+    RVDK_KIT_SCHEMA
+    RVDK_DT_MODEL
+    RVDK_SOC
+    RVDK_SOC_SLUG
+    RVDK_BOARD
+    RVDK_BOARD_TAG
+    RVDK_FACTORY_USER
+    RVDK_OS_ID
+    RVDK_OS_VERSION_ID
+    RVDK_PRIMARY_NIC
+    RVDK_CPU_HARTS
+)
 
 # Map a Device Tree model string -> "SOC|BOARD|BOARD_TAG|FACTORY_USER"
 # Case-insensitive matching handles vendor DT strings such as "ky x1 orangepi-rv2 board".
+# IMPORTANT: OrangePi RV2 (SpacemiT K1/Ky X1) MUST precede OrangePi RV (StarFive JH7110).
 _rvdk_infer_from_dt_model() {
     local dt_lc
     dt_lc="$(tr '[:upper:]' '[:lower:]' <<< "${1:-}")"
@@ -122,20 +115,20 @@ rvdk_normalize_board_id() {
             echo "starfive/vf2" ;;
         mars|milkv-mars|milkv/mars|milk-v/mars)
             echo "milkv/mars" ;;
-        rv|opirv|orangepi-rv|orangepi/rv)
-            echo "orangepi/rv" ;;
         rv2|opirv2|orangepi-rv2|orangepi/rv2)
             echo "orangepi/rv2" ;;
         r2s|opir2s|orangepi-r2s|orangepi/r2s)
             echo "orangepi/r2s" ;;
+        rv|opirv|orangepi-rv|orangepi/rv)
+            echo "orangepi/rv" ;;
         f3|bpif3|bpi-f3|bananapi-f3|bananapi/f3|bananapi/bpi-f3|banana-pi/f3)
             echo "bananapi/f3" ;;
         cm6|bpicm6|bpi-cm6|bananapi-cm6|bananapi/cm6|bananapi/bpi-cm6|banana-pi/cm6)
             echo "bananapi/cm6" ;;
-        jupiter|jptr1|jupiter1|milkv-jupiter|milkv/jupiter|milk-v/jupiter)
-            echo "milkv/jupiter" ;;
         jupiter2|jptr2|milkv-jupiter2|milkv/jupiter2|milk-v/jupiter2)
             echo "milkv/jupiter2" ;;
+        jupiter|jptr1|jupiter1|milkv-jupiter|milkv/jupiter|milk-v/jupiter)
+            echo "milkv/jupiter" ;;
         aibox-k3|aiboxk3|firefly-k3|firefly-aibox-k3|firefly/aibox-k3)
             echo "firefly/aibox-k3" ;;
         titan|dp1000|milkv-titan|milkv/titan|milk-v/titan|ultrarisc-titan|ultrarisc/titan)
@@ -184,35 +177,44 @@ rvdk_detect_primary_nic() {
 }
 
 # Resolve Kit metadata (in-memory -> /etc/rvdk/kit.env -> live sysfs probe & persist if root)
-# Args: [--refresh] [--soc <v/s>] [--board <v/b>] [--os <id>]
+# Args: [--refresh] [--no-cache] [--soc <v/s>] [--board <v/b>] [--os <id>]
+# shellcheck disable=SC2120
 rvdk_kit_resolve() {
     local force_refresh="false"
+    local no_cache="false"
     local cli_soc=""
     local cli_board=""
     local cli_os=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --refresh) force_refresh="true"; shift ;;
-            --soc)     cli_soc="${2:-}"; shift 2 ;;
-            --board)   cli_board="${2:-}"; shift 2 ;;
-            --os)      cli_os="${2:-}"; shift 2 ;;
-            *)         shift ;;
+            --refresh)  force_refresh="true"; shift ;;
+            --no-cache) no_cache="true"; shift ;;
+            --soc)      cli_soc="${2:-}"; shift 2 ;;
+            --board)    cli_board="${2:-}"; shift 2 ;;
+            --os)       cli_os="${2:-}"; shift 2 ;;
+            *)          shift ;;
         esac
     done
 
+    local dt_override=""
+    if [[ -n "${RVDK_DT_MODEL:-}" && "${RVDK_DT_MODEL}" != "${_RVDK_LAST_PROBED_DT_MODEL:-}" ]]; then
+        dt_override="$RVDK_DT_MODEL"
+    fi
+
     local has_override="false"
-    [[ -n "$cli_soc" || -n "$cli_board" || -n "$cli_os" ]] && has_override="true"
+    [[ -n "$cli_soc" || -n "$cli_board" || -n "$cli_os" || -n "$dt_override" ]] && has_override="true"
 
     # 0ms in-memory fast-path when parent RVDK dispatcher already resolved the Kit
-    if [[ "$force_refresh" == "false" && "$has_override" == "false" && "${RVDK_KIT_SCHEMA:-}" == "$RVDK_KIT_SCHEMA_VERSION" && -n "${RVDK_SOC:-}" && -n "${RVDK_OS_ID:-}" ]]; then
+    if [[ "$force_refresh" == "false" && "$no_cache" == "false" && "$has_override" == "false" && "${RVDK_KIT_SCHEMA:-}" == "$RVDK_KIT_SCHEMA_VERSION" && -n "${RVDK_SOC:-}" && -n "${RVDK_OS_ID:-}" ]]; then
         return 0
     fi
 
-    # <1ms disk fast-path: parse cached /etc/rvdk/kit.env safely without `source`
-    if [[ "$force_refresh" == "false" && "$has_override" == "false" && -r "$RVDK_KIT_CACHE_FILE" ]]; then
-        _rvdk_kit_read_cache "$RVDK_KIT_CACHE_FILE" || true
+    # <1ms disk fast-path: parse cached /etc/rvdk/kit.env safely via rvdk_kv_load without `source`
+    if [[ "$force_refresh" == "false" && "$no_cache" == "false" && "$has_override" == "false" && -r "$RVDK_KIT_CACHE_FILE" ]]; then
+        rvdk_kv_load "$RVDK_KIT_CACHE_FILE" "${_RVDK_KIT_ALLOWED_KEYS[@]}" || true
         if [[ "${RVDK_KIT_SCHEMA:-}" == "$RVDK_KIT_SCHEMA_VERSION" && -n "${RVDK_SOC:-}" && -n "${RVDK_OS_ID:-}" ]]; then
+            _RVDK_LAST_PROBED_DT_MODEL="${RVDK_DT_MODEL:-}"
             export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS
             export RVDK_KIT_SOURCE="cache"
             return 0
@@ -220,7 +222,9 @@ rvdk_kit_resolve() {
     fi
 
     local dt_model="Unknown"
-    if [[ -r /proc/device-tree/model ]]; then
+    if [[ -n "$dt_override" ]]; then
+        dt_model="$dt_override"
+    elif [[ -r /proc/device-tree/model ]]; then
         dt_model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
     elif [[ "$(uname -s)" == "Darwin" ]]; then
         dt_model="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m) (macOS Host)"
@@ -329,36 +333,168 @@ rvdk_kit_resolve() {
     RVDK_PRIMARY_NIC="$primary_nic"
     RVDK_CPU_HARTS="$cpu_harts"
     RVDK_KIT_SOURCE="probed"
+    _RVDK_LAST_PROBED_DT_MODEL="$dt_model"
 
     export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS RVDK_KIT_SOURCE
 
-    # Persist system-wide cache on Linux target nodes using escaped non-executing serialization
-    if [[ "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 && -n "$RVDK_SOC" ]] && [[ "$has_override" == "false" || "$force_refresh" == "true" ]]; then
-        local cache_dir
-        cache_dir="$(dirname "$RVDK_KIT_CACHE_FILE")"
-        mkdir -p "$cache_dir"
-        chmod 0755 "$cache_dir"
-        local tmp_kit="${RVDK_KIT_CACHE_FILE}.tmp.$$"
-        {
-            printf '# ==============================================================================\n'
-            printf '# DREW-V Labs // RVDK Kit Hardware & OS Cache (%s)\n' "$RVDK_KIT_CACHE_FILE"
-            printf '# Auto-generated once by lib/kit.sh. Refresh anytime via: sudo rvdk kit --refresh\n'
-            printf '# ==============================================================================\n'
-            printf 'RVDK_KIT_SCHEMA="%s"\n'    "$(_rvdk_kit_escape_val "$RVDK_KIT_SCHEMA")"
-            printf 'RVDK_DT_MODEL="%s"\n'      "$(_rvdk_kit_escape_val "$RVDK_DT_MODEL")"
-            printf 'RVDK_SOC="%s"\n'           "$(_rvdk_kit_escape_val "$RVDK_SOC")"
-            printf 'RVDK_SOC_SLUG="%s"\n'      "$(_rvdk_kit_escape_val "$RVDK_SOC_SLUG")"
-            printf 'RVDK_BOARD="%s"\n'         "$(_rvdk_kit_escape_val "$RVDK_BOARD")"
-            printf 'RVDK_BOARD_TAG="%s"\n'     "$(_rvdk_kit_escape_val "$RVDK_BOARD_TAG")"
-            printf 'RVDK_FACTORY_USER="%s"\n'  "$(_rvdk_kit_escape_val "$RVDK_FACTORY_USER")"
-            printf 'RVDK_OS_ID="%s"\n'         "$(_rvdk_kit_escape_val "$RVDK_OS_ID")"
-            printf 'RVDK_OS_VERSION_ID="%s"\n' "$(_rvdk_kit_escape_val "$RVDK_OS_VERSION_ID")"
-            printf 'RVDK_PRIMARY_NIC="%s"\n'   "$(_rvdk_kit_escape_val "$RVDK_PRIMARY_NIC")"
-            printf 'RVDK_CPU_HARTS="%s"\n'     "$(_rvdk_kit_escape_val "$RVDK_CPU_HARTS")"
-        } > "$tmp_kit"
-        chmod 0644 "$tmp_kit"
-        mv -f "$tmp_kit" "$RVDK_KIT_CACHE_FILE"
+    # Persist system-wide cache on Linux target nodes using escaped atomic serialization
+    if [[ "$no_cache" == "false" && -z "$dt_override" && "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 && -n "$RVDK_SOC" ]] && [[ "$has_override" == "false" || "$force_refresh" == "true" ]]; then
+        rvdk_kv_write "$RVDK_KIT_CACHE_FILE" 0644 \
+            "DREW-V Labs // RVDK Kit Hardware & OS Cache (${RVDK_KIT_CACHE_FILE}) — refresh via: sudo rvdk kit --refresh" \
+            "RVDK_KIT_SCHEMA=${RVDK_KIT_SCHEMA}" \
+            "RVDK_DT_MODEL=${RVDK_DT_MODEL}" \
+            "RVDK_SOC=${RVDK_SOC}" \
+            "RVDK_SOC_SLUG=${RVDK_SOC_SLUG}" \
+            "RVDK_BOARD=${RVDK_BOARD}" \
+            "RVDK_BOARD_TAG=${RVDK_BOARD_TAG}" \
+            "RVDK_FACTORY_USER=${RVDK_FACTORY_USER}" \
+            "RVDK_OS_ID=${RVDK_OS_ID}" \
+            "RVDK_OS_VERSION_ID=${RVDK_OS_VERSION_ID}" \
+            "RVDK_PRIMARY_NIC=${RVDK_PRIMARY_NIC}" \
+            "RVDK_CPU_HARTS=${RVDK_CPU_HARTS}"
     fi
+}
+
+# Single source of truth for silicon compiler profiles across C/C++ (GCC/Clang) & Go (GORISCV64).
+# Sets: RVDK_TARGET_SLUG, RVDK_CPU_MTUNE, RVDK_MARCH_CANDIDATES, RVDK_GORISCV64_CANDIDATES
+# shellcheck disable=SC2120
+rvdk_kit_compiler_profile() {
+    local soc="${1:-${RVDK_SOC:-}}"
+    local host_arch="${2:-$(uname -m)}"
+
+    case "$host_arch" in
+        riscv64)         host_arch="riscv64" ;;
+        x86_64|amd64)    host_arch="amd64" ;;
+        aarch64|arm64)   host_arch="arm64" ;;
+    esac
+
+    case "$soc" in
+        eswin/eic7700x)
+            RVDK_TARGET_SLUG="sifive-p550"
+            RVDK_CPU_MTUNE="sifive-p550"
+            RVDK_MARCH_CANDIDATES="rv64gc_zba_zbb rv64gc"
+            RVDK_GORISCV64_CANDIDATES="rva20u64"
+            ;;
+        starfive/jh7110)
+            RVDK_TARGET_SLUG="starfive-jh7110"
+            RVDK_CPU_MTUNE="sifive-u74"
+            RVDK_MARCH_CANDIDATES="rv64gc_zba_zbb rv64gc"
+            RVDK_GORISCV64_CANDIDATES="rva20u64"
+            ;;
+        sifive/fu740)
+            RVDK_TARGET_SLUG="sifive-fu740"
+            RVDK_CPU_MTUNE="sifive-u74"
+            RVDK_MARCH_CANDIDATES="rv64gc"
+            RVDK_GORISCV64_CANDIDATES="rva20u64"
+            ;;
+        spacemit/k1)
+            RVDK_TARGET_SLUG="spacemit-k1"
+            RVDK_CPU_MTUNE="spacemit-x60"
+            RVDK_MARCH_CANDIDATES="rv64gcv_zba_zbb_zbc_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_GORISCV64_CANDIDATES="rva22u64 rva20u64"
+            ;;
+        spacemit/k3)
+            RVDK_TARGET_SLUG="spacemit-k3"
+            RVDK_CPU_MTUNE="spacemit-x100"
+            RVDK_MARCH_CANDIDATES="rva23u64 rv64gcv_zba_zbb_zbc_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_GORISCV64_CANDIDATES="rva23u64 rva22u64 rva20u64"
+            ;;
+        ultrarisc/dp1000)
+            RVDK_TARGET_SLUG="ultrarisc-dp1000"
+            RVDK_CPU_MTUNE="generic-ooo"
+            RVDK_MARCH_CANDIDATES="rva22u64 rv64gc_zba_zbb_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_GORISCV64_CANDIDATES="rva22u64 rva20u64"
+            ;;
+        tenstorrent/atlantis|tenstorrent/blackhole)
+            RVDK_TARGET_SLUG="${soc//\//-}"
+            RVDK_CPU_MTUNE="tt-ascalon-d8"
+            RVDK_MARCH_CANDIDATES="rva23u64 rv64gcv_zba_zbb_zbc_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_GORISCV64_CANDIDATES="rva23u64 rva22u64 rva20u64"
+            ;;
+        *)
+            case "$host_arch" in
+                riscv64)
+                    RVDK_TARGET_SLUG="riscv64-generic"
+                    RVDK_CPU_MTUNE=""
+                    RVDK_MARCH_CANDIDATES="rv64gc"
+                    RVDK_GORISCV64_CANDIDATES="rva20u64"
+                    ;;
+                amd64|arm64)
+                    RVDK_TARGET_SLUG="linux-${host_arch}"
+                    RVDK_CPU_MTUNE=""
+                    RVDK_MARCH_CANDIDATES=""
+                    RVDK_GORISCV64_CANDIDATES=""
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+    esac
+
+    export RVDK_TARGET_SLUG RVDK_CPU_MTUNE RVDK_MARCH_CANDIDATES RVDK_GORISCV64_CANDIDATES
+    return 0
+}
+
+# Probe local GCC support against RVDK_MARCH_CANDIDATES & RVDK_CPU_MTUNE.
+# Sets: RVDK_SELECTED_MARCH, RVDK_OPT_CFLAGS
+# shellcheck disable=SC2120
+rvdk_kit_probe_cflags() {
+    local cc_bin="${1:-gcc}"
+    RVDK_SELECTED_MARCH=""
+    RVDK_OPT_CFLAGS="-O3 -pipe"
+
+    if [[ -n "${RVDK_MARCH_CANDIDATES:-}" ]]; then
+        local -a cands=()
+        read -r -a cands <<< "$RVDK_MARCH_CANDIDATES"
+        if (( ${#cands[@]} > 0 )); then
+            RVDK_SELECTED_MARCH="${cands[${#cands[@]}-1]}"
+            local cand_march
+            for cand_march in "${cands[@]}"; do
+                if "$cc_bin" -march="$cand_march" -E -x c /dev/null >/dev/null 2>&1; then
+                    RVDK_SELECTED_MARCH="$cand_march"
+                    break
+                fi
+            done
+            RVDK_OPT_CFLAGS="-O3 -pipe -march=${RVDK_SELECTED_MARCH}"
+            if [[ -n "${RVDK_CPU_MTUNE:-}" ]]; then
+                if "$cc_bin" -march="${RVDK_SELECTED_MARCH}" -mcpu="${RVDK_CPU_MTUNE}" -E -x c /dev/null >/dev/null 2>&1; then
+                    RVDK_OPT_CFLAGS="${RVDK_OPT_CFLAGS} -mcpu=${RVDK_CPU_MTUNE} -mtune=${RVDK_CPU_MTUNE}"
+                elif "$cc_bin" -march="${RVDK_SELECTED_MARCH}" -mtune="${RVDK_CPU_MTUNE}" -E -x c /dev/null >/dev/null 2>&1; then
+                    RVDK_OPT_CFLAGS="${RVDK_OPT_CFLAGS} -mtune=${RVDK_CPU_MTUNE}"
+                fi
+            fi
+        fi
+    fi
+
+    export RVDK_SELECTED_MARCH RVDK_OPT_CFLAGS
+    return 0
+}
+
+# Probe Go toolchain support against RVDK_GORISCV64_CANDIDATES.
+# Sets: RVDK_SELECTED_GORISCV64
+# shellcheck disable=SC2120
+rvdk_kit_probe_goriscv64() {
+    local go_bin="${1:-go}"
+    RVDK_SELECTED_GORISCV64=""
+
+    if [[ "$(uname -m)" == "riscv64" && -n "${RVDK_GORISCV64_CANDIDATES:-}" ]]; then
+        local -a go_cands=()
+        read -r -a go_cands <<< "$RVDK_GORISCV64_CANDIDATES"
+        if (( ${#go_cands[@]} > 0 )); then
+            RVDK_SELECTED_GORISCV64="rva20u64"
+            local cand_gorv
+            for cand_gorv in "${go_cands[@]}"; do
+                if GORISCV64="$cand_gorv" "$go_bin" list runtime >/dev/null 2>&1; then
+                    RVDK_SELECTED_GORISCV64="$cand_gorv"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    export RVDK_SELECTED_GORISCV64
+    return 0
 }
 
 # Collect all applicable deeptune.sh layers for the resolved Kit in execution order:

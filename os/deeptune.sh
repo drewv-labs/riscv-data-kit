@@ -33,60 +33,87 @@ _SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
-REPO_ROOT=""
-[[ -n "$_SCRIPT_DIR" ]] && REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
+_REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
+: "$_REPO_ROOT"
 
-# @RVDK_INLINE_LIBS: common progbar
-if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/common.sh" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${REPO_ROOT}/lib/common.sh"
-else
-    log_info()  { printf "\033[1;36m[RVDK:OS-DEEPTUNE]\033[0m %s\n" "$1"; }
-    log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-    log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-    log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-    log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
-    rvdk_log_init() { :; }
+# @RVDK_INLINE_LIBS: common kit progbar
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:OS-DEEPTUNE]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
 fi
-if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/progbar.sh" ]]; then
-    # shellcheck source=lib/progbar.sh
-    source "${REPO_ROOT}/lib/progbar.sh"
-else
-    rvdk_prog_init() { :; }
-    rvdk_prog()      { :; }
+if [[ -z "${_RVDK_KIT_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/kit.sh" ]]; then
+        # shellcheck source=lib/kit.sh
+        source "${_REPO_ROOT}/lib/kit.sh"
+    fi
+fi
+if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/progbar.sh" ]]; then
+        # shellcheck source=lib/progbar.sh
+        source "${_REPO_ROOT}/lib/progbar.sh"
+    else
+        rvdk_prog_init() { :; }
+        rvdk_prog()      { :; }
+    fi
 fi
 
 rvdk_log_init "RVDK:OS-DEEPTUNE"
 
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--tune <data|ai>] [--force] [--no-apt-update] [--noprogbar]
+EOF
+}
+
+ORIG_ARGS=("$@")
+TUNE_REQUEST="${RVDK_TUNE:-data}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--tune) TUNE_REQUEST="${2:-}"; shift 2 ;;
+        --tune=*)  TUNE_REQUEST="${1#*=}"; shift ;;
+        data|ai|ml) TUNE_REQUEST="$1"; shift ;;
+        --force)   shift ;;
+        --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
+        --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) log_fatal "Unknown argument: $1 (try --help)" ;;
+    esac
+done
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
         log_fatal "Run as root."
     fi
 fi
 
-TUNE_REQUEST="${RVDK_TUNE:-data}"
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -t|--tune) TUNE_REQUEST="${2:-data}"; shift 2 ;;
-        --tune=*)  TUNE_REQUEST="${1#*=}"; shift ;;
-        data|ai|ml) TUNE_REQUEST="$1"; shift ;;
-        --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
-        --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
-        *) shift ;;
-    esac
-done
-
 TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "$TUNE_REQUEST")"
 case "$TUNE_REQUEST" in
+    data)                  TUNE_MODE="data"; TUNE_LABEL="data" ;;
     ai|ml|edge-ai|edge-ml) TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
-    *)                     TUNE_MODE="data"; TUNE_LABEL="data" ;;
+    *) log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai)" ;;
 esac
 
-if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/lib/kit.sh" ]]; then
-    # shellcheck disable=SC1091
-    source "${REPO_ROOT}/lib/kit.sh"
+if declare -F rvdk_kit_resolve >/dev/null 2>&1; then
     rvdk_kit_resolve
 fi
 
@@ -120,17 +147,17 @@ if [[ "${RVDK_OS_ID:-}" == "openwrt" || -f /etc/openwrt_release ]] || ! command 
         done
         if [[ -f /etc/rc.common ]]; then
             PROCD_THP="/etc/init.d/rvdk-thp-tune"
-            cat <<EOF > "$PROCD_THP"
-#!/bin/sh /etc/rc.common
+            WANT_PROCD_THP="#!/bin/sh /etc/rc.common
 START=96
 start() {
     for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do
-        [ -w "\$f" ] && echo ${THP_MODE} > "\$f" 2>/dev/null || true
+        [ -w \"\$f\" ] && echo ${THP_MODE} > \"\$f\" 2>/dev/null || true
     done
-}
-EOF
-            chmod +x "$PROCD_THP"
-            "$PROCD_THP" enable 2>/dev/null || true
+}"
+            if ! printf '%s\n' "$WANT_PROCD_THP" | cmp -s - "$PROCD_THP" 2>/dev/null; then
+                printf '%s\n' "$WANT_PROCD_THP" | rvdk_atomic_write "$PROCD_THP" 0755
+                "$PROCD_THP" enable 2>/dev/null || true
+            fi
         fi
         log_ok "Set Transparent HugePages -> '${THP_MODE}' (--tune ${TUNE_LABEL})"
     fi
@@ -142,9 +169,14 @@ EOF
     [[ -e /proc/sys/vm/swappiness ]]                  && OWRT_SYSCTLS+=("vm.swappiness = 1")
     [[ -e /proc/sys/kernel/printk ]]                  && OWRT_SYSCTLS+=("kernel.printk = 3 4 1 3")
     [[ -e /proc/sys/kernel/nmi_watchdog ]]            && OWRT_SYSCTLS+=("kernel.nmi_watchdog = 0")
-    printf "%s\n" "${OWRT_SYSCTLS[@]}" > "$DEEPTUNE_SYSCTL"
-    sysctl -p "$DEEPTUNE_SYSCTL" >/dev/null 2>&1 || true
-    log_ok "Applied router/non-systemd scheduler & VM sysctls (${DEEPTUNE_SYSCTL})"
+    WANT_OWRT_DT_SYSCTL="$(printf '%s\n' "${OWRT_SYSCTLS[@]}")"
+    if ! printf '%s\n' "$WANT_OWRT_DT_SYSCTL" | cmp -s - "$DEEPTUNE_SYSCTL" 2>/dev/null; then
+        printf '%s\n' "$WANT_OWRT_DT_SYSCTL" | rvdk_atomic_write "$DEEPTUNE_SYSCTL" 0644
+        sysctl -p "$DEEPTUNE_SYSCTL" >/dev/null 2>&1 || true
+        log_ok "Applied router/non-systemd scheduler & VM sysctls (${DEEPTUNE_SYSCTL})"
+    else
+        log_skip "Router/non-systemd scheduler & VM sysctls already converged"
+    fi
     rvdk_prog 100 "OS DeepTune (--tune ${TUNE_LABEL}) complete"
     exit 0
 fi
@@ -171,9 +203,13 @@ if command -v findmnt >/dev/null 2>&1; then
 fi
 
 if [[ -f /etc/logrotate.conf ]] && grep -qF "/var/log.hdd/" /etc/logrotate.conf 2>/dev/null; then
-    sed -i 's|/var/log\.hdd/|/var/log/|g' /etc/logrotate.conf
+    _new_lr="$(sed 's|/var/log\.hdd/|/var/log/|g' /etc/logrotate.conf)"
+    printf '%s\n' "$_new_lr" | rvdk_atomic_write /etc/logrotate.conf 0644
     for lr_cfg in /etc/logrotate.d/*; do
-        [[ -f "$lr_cfg" ]] && sed -i 's|/var/log\.hdd/|/var/log/|g' "$lr_cfg"
+        if [[ -f "$lr_cfg" ]] && grep -qF "/var/log.hdd/" "$lr_cfg" 2>/dev/null; then
+            _new_lr_sub="$(sed 's|/var/log\.hdd/|/var/log/|g' "$lr_cfg")"
+            printf '%s\n' "$_new_lr_sub" | rvdk_atomic_write "$lr_cfg" 0644
+        fi
     done
     VENDOR_ZRAM_CHANGED="true"
 fi
@@ -184,7 +220,8 @@ for vz_cfg in \
     /etc/default/orangepi-zram-config \
     /etc/default/armbian-zram-config; do
     if [[ -f "$vz_cfg" ]] && grep -Eq '^ENABLED=true' "$vz_cfg" 2>/dev/null; then
-        sed -i 's/^ENABLED=true/ENABLED=false/' "$vz_cfg"
+        _new_vz="$(sed 's/^ENABLED=true/ENABLED=false/' "$vz_cfg")"
+        printf '%s\n' "$_new_vz" | rvdk_atomic_write "$vz_cfg" 0644
         VENDOR_ZRAM_CHANGED="true"
     fi
 done
@@ -226,7 +263,8 @@ systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
 # Clear Armbian/OrangePi 20M SystemMaxUse override in /etc/systemd/journald.conf if present
 if [[ -f /etc/systemd/journald.conf ]] && grep -qx 'SystemMaxUse=20M' /etc/systemd/journald.conf 2>/dev/null; then
-    sed -i 's/^SystemMaxUse=20M$/#SystemMaxUse=/' /etc/systemd/journald.conf
+    _new_jconf="$(sed 's/^SystemMaxUse=20M$/#SystemMaxUse=/' /etc/systemd/journald.conf)"
+    printf '%s\n' "$_new_jconf" | rvdk_atomic_write /etc/systemd/journald.conf 0644
 fi
 
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-rvdk-deeptune.conf"
@@ -238,7 +276,7 @@ ForwardToSyslog=no
 ForwardToWall=no"
 
 if ! printf "%s\n" "$WANT_JOURNALD" | cmp -s - "$JOURNALD_DROPIN" 2>/dev/null; then
-    printf "%s\n" "$WANT_JOURNALD" > "$JOURNALD_DROPIN"
+    printf "%s\n" "$WANT_JOURNALD" | rvdk_atomic_write "$JOURNALD_DROPIN" 0644
     systemctl restart systemd-journald.service 2>/dev/null || true
     journalctl --flush >/dev/null 2>&1 || true
     journalctl --vacuum-size=256M >/dev/null 2>&1 || true
@@ -482,7 +520,6 @@ OS_BLACKLIST_MODS=(
 )
 [[ "$PRIMARY_IS_WIFI" == "false" ]] && OS_BLACKLIST_MODS=(cfg80211 "${OS_BLACKLIST_MODS[@]}")
 
-mkdir -p /etc/modprobe.d
 MODPROBE_OS="/etc/modprobe.d/85-rvdk-os-deeptune.conf"
 WANT_OS_MODPROBE="# Managed by RVDK (os/deeptune.sh)
 # Suppresses non-server modules on headless nodes."
@@ -491,8 +528,7 @@ for m in "${OS_BLACKLIST_MODS[@]}"; do
 done
 
 if ! printf "%s\n" "$WANT_OS_MODPROBE" | cmp -s - "$MODPROBE_OS" 2>/dev/null; then
-    printf "%s\n" "$WANT_OS_MODPROBE" > "$MODPROBE_OS"
-    chmod 0644 "$MODPROBE_OS"
+    printf "%s\n" "$WANT_OS_MODPROBE" | rvdk_atomic_write "$MODPROBE_OS" 0644
     log_ok "Wrote OS kernel module blacklist to ${MODPROBE_OS}"
 else
     log_skip "OS kernel module blacklist (${MODPROBE_OS}) already converged"
@@ -539,7 +575,7 @@ WantedBy=multi-user.target"
 
 if [[ -d /sys/kernel/mm/transparent_hugepage ]]; then
     if ! printf "%s\n" "$WANT_THP_UNIT" | cmp -s - "$THP_UNIT" 2>/dev/null; then
-        printf "%s\n" "$WANT_THP_UNIT" > "$THP_UNIT"
+        printf "%s\n" "$WANT_THP_UNIT" | rvdk_atomic_write "$THP_UNIT" 0644
         systemctl daemon-reload
         systemctl enable rvdk-thp-tune.service >/dev/null
         systemctl restart rvdk-thp-tune.service
@@ -562,8 +598,8 @@ kernel.printk = 3 4 1 3
 -kernel.nmi_watchdog = 0"
 
 if ! printf "%s\n" "$WANT_SYSCTL" | cmp -s - "$DEEPTUNE_SYSCTL" 2>/dev/null; then
-    printf "%s\n" "$WANT_SYSCTL" > "$DEEPTUNE_SYSCTL"
-    sysctl --system >/dev/null
+    printf "%s\n" "$WANT_SYSCTL" | rvdk_atomic_write "$DEEPTUNE_SYSCTL" 0644
+    sysctl -e -p "$DEEPTUNE_SYSCTL" >/dev/null 2>&1 || sysctl -p "$DEEPTUNE_SYSCTL" >/dev/null 2>&1 || true
     log_ok "Applied headless scheduler & VM sysctls (${DEEPTUNE_SYSCTL})"
 else
     log_skip "Headless scheduler & VM sysctls already converged"
