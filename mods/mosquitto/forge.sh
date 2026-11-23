@@ -179,6 +179,9 @@ else
     MOSQ_DATA="/var/lib/mosquitto"
 fi
 
+id -u mosquitto >/dev/null 2>&1 || log_fatal "System user 'mosquitto' is missing after package installation."
+MOSQ_USER="mosquitto"
+
 # Grant non-root operator group access to restricted 0750 /run/mosquitto socket directory
 SOCK_GROUP="mosquitto"
 if [[ -n "${REAL_USER:-}" && "$REAL_USER" != "root" ]] && id -u "$REAL_USER" >/dev/null 2>&1 && getent group mosquitto >/dev/null 2>&1; then
@@ -189,17 +192,30 @@ elif [[ -n "${REAL_GRP:-}" && "$REAL_GRP" != "root" ]] && getent group "$REAL_GR
     SOCK_GROUP="$REAL_GRP"
 fi
 
-install -d -m 0750 -o mosquitto -g mosquitto "$MOSQ_DATA"
-install -d -m 0750 -o mosquitto -g "$SOCK_GROUP" /run/mosquitto
+install -d -m 0750 -o "$MOSQ_USER" -g mosquitto "$MOSQ_DATA"
+install -d -m 0750 -o "$MOSQ_USER" -g "$SOCK_GROUP" /var/log/mosquitto
+install -d -m 0750 -o "$MOSQ_USER" -g "$SOCK_GROUP" /run/mosquitto
 
-# Persist /run/mosquitto across reboots with restricted 0750 mode via systemd RuntimeDirectory
+# Persist /run/mosquitto & /var/log/mosquitto across reboots with restricted 0750 mode.
+# Explicitly set User=mosquitto and clear legacy root-only ExecStartPre= hooks (Ubuntu 24.04
+# omits User= in /usr/lib/systemd/system/mosquitto.service, which otherwise causes systemd's
+# RuntimeDirectory= setup to chown /run/mosquitto to root:mosquitto 0750 right before ExecStart
+# and trigger EACCES on /run/mosquitto/mosquitto.sock after drop_privileges()).
 MOSQ_DROPIN_DIR="/etc/systemd/system/mosquitto.service.d"
 MOSQ_DROPIN_FILE="${MOSQ_DROPIN_DIR}/90-rvdk-runtime.conf"
 WANT_DROPIN="[Service]
+User=${MOSQ_USER}
 Group=${SOCK_GROUP}
 SupplementaryGroups=mosquitto
 RuntimeDirectory=mosquitto
-RuntimeDirectoryMode=0750"
+RuntimeDirectoryMode=0750
+LogsDirectory=mosquitto
+LogsDirectoryMode=0750
+ExecStartPre="
+if (( MQTT_PORT < 1024 )); then
+    WANT_DROPIN="${WANT_DROPIN}
+AmbientCapabilities=CAP_NET_BIND_SERVICE"
+fi
 
 DROPIN_CHANGED="false"
 install -d -m 0755 "$MOSQ_DROPIN_DIR"
@@ -279,17 +295,43 @@ max_queued_messages 10000
 set_tcp_nodelay true
 "
 
+_activate_mosquitto() {
+    local action="$1"
+    systemctl enable mosquitto.service >/dev/null 2>&1 || systemctl enable mosquitto >/dev/null 2>&1 || true
+    systemctl reset-failed mosquitto.service 2>/dev/null || true
+    if ! systemctl "$action" mosquitto.service; then
+        if [[ -r /var/log/mosquitto/mosquitto.log ]]; then
+            tail -n 25 /var/log/mosquitto/mosquitto.log >&2 || true
+        fi
+        journalctl -u mosquitto.service -n 25 --no-pager >&2 || true
+        log_fatal "mosquitto.service failed during '${action}' (${MQTT_BIND}:${MQTT_PORT})."
+    fi
+    local _i
+    for (( _i=0; _i<20; _i++ )); do
+        if systemctl is-active --quiet mosquitto.service && [[ -S /run/mosquitto/mosquitto.sock ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    if ! systemctl is-active --quiet mosquitto.service; then
+        if [[ -r /var/log/mosquitto/mosquitto.log ]]; then
+            tail -n 25 /var/log/mosquitto/mosquitto.log >&2 || true
+        fi
+        journalctl -u mosquitto.service -n 25 --no-pager >&2 || true
+        log_fatal "mosquitto.service failed to stay active (${MQTT_BIND}:${MQTT_PORT})."
+    fi
+}
+
 rvdk_prog 85 "Mosquitto MQTT: converging listener ${MQTT_BIND}:${MQTT_PORT} + Unix socket..."
 if [[ "$DROPIN_CHANGED" == "true" || "$AUTH_CHANGED" == "true" || ! -f "$MOSQ_CONF" ]] || ! printf '%s' "$WANT_MOSQ_CONF" | cmp -s - "$MOSQ_CONF" 2>/dev/null; then
     printf "%s" "$WANT_MOSQ_CONF" | rvdk_atomic_write "$MOSQ_CONF" 0644
-    systemctl enable --now mosquitto
-    systemctl restart mosquitto
+    _activate_mosquitto restart
     log_ok "Converged Mosquitto MQTT on ${MQTT_BIND}:${MQTT_PORT} & /run/mosquitto/mosquitto.sock (Storage: ${MOSQ_DATA})"
-elif ! systemctl is-active --quiet mosquitto; then
-    systemctl enable --now mosquitto
-    log_ok "Started Mosquitto MQTT on ${MQTT_BIND}:${MQTT_PORT} (Storage: ${MOSQ_DATA})"
+elif ! systemctl is-active --quiet mosquitto.service || [[ ! -S /run/mosquitto/mosquitto.sock ]]; then
+    _activate_mosquitto restart
+    log_ok "Started Mosquitto MQTT on ${MQTT_BIND}:${MQTT_PORT} & /run/mosquitto/mosquitto.sock (Storage: ${MOSQ_DATA})"
 else
-    systemctl enable mosquitto >/dev/null 2>&1 || true
+    systemctl enable mosquitto.service >/dev/null 2>&1 || systemctl enable mosquitto >/dev/null 2>&1 || true
     log_skip "Mosquitto MQTT already converged on ${MQTT_BIND}:${MQTT_PORT} (${MOSQ_CONF})"
 fi
 
