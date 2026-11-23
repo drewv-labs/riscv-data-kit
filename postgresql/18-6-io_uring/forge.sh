@@ -12,6 +12,7 @@
 #   • Probes kernel `io_uring` availability + `LimitMEMLOCK=infinity` (clean worker fallback)
 #   • Computes exact 2MB HugePages via `postgres -C shared_memory_size_in_huge_pages`
 #   • Binds `listen_addresses = 'localhost'` by default unless `--listen` or `--allow-cidr`
+#   • Defers unattended `needrestart` auto-bounces of stateful broker services
 #   • Zero-disruption idempotency (0 restarts when converged; reload-only on HBA edits)
 # ==============================================================================
 set -Eeuo pipefail
@@ -284,14 +285,33 @@ BUNDLE_NAME="postgresql18-6-io_uring-${TARGET_SLUG}.tar.zst"
 BUNDLE_URL="${PG_PREBUILT_DEB_URL:-${RVDK_RELEASE_BASE}/${BUNDLE_NAME}}"
 LOCAL_REPO_DIR="${PG_LIB_ROOT}/debs"
 LOCAL_LIST="/etc/apt/sources.list.d/rvdk-local-pgdg.list"
+WANT_LOCAL_LIST="deb [trusted=yes check-date=no lang=none] file://${LOCAL_REPO_DIR} ./"
 
 update_local_repo() {
+    chmod 0755 /var/lib/rvdk "$PG_LIB_ROOT" "$LOCAL_REPO_DIR" 2>/dev/null || true
     (
         cd "$LOCAL_REPO_DIR"
+        rm -f InRelease Release Release.gpg Packages Packages.gz Packages.xz Packages.bz2 Packages.lzma Packages.zst
         dpkg-scanpackages . /dev/null > Packages 2>/dev/null
         gzip -9cn Packages > Packages.gz
+        chmod 0644 Packages Packages.gz ./*.deb 2>/dev/null || true
+        if command -v apt-ftparchive >/dev/null 2>&1; then
+            apt-ftparchive release . > Release 2>/dev/null
+        else
+            {
+                printf 'Origin: RVDK\nLabel: RVDK-PGDG\nSuite: local\nCodename: local\nDate: %s\nSHA256:\n' \
+                    "$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')"
+                for _idx in Packages Packages.gz; do
+                    printf ' %s %16d %s\n' \
+                        "$(sha256sum "$_idx" | awk '{print $1}')" \
+                        "$(wc -c < "$_idx" | tr -d '[:space:]')" \
+                        "$_idx"
+                done
+            } > Release
+        fi
+        chmod 0644 Release
     )
-    printf 'deb [trusted=yes lang=none] file://%s ./\n' "$LOCAL_REPO_DIR" | rvdk_atomic_write "$LOCAL_LIST" 0644
+    printf '%s\n' "$WANT_LOCAL_LIST" | rvdk_atomic_write "$LOCAL_LIST" 0644
     if rvdk_apt_has_lists; then
         apt-get update \
             -o Dir::Etc::sourcelist="$LOCAL_LIST" \
@@ -306,6 +326,12 @@ update_local_repo() {
 rvdk_prog 15 "PG 18.6: checking postgresql-${PG_VERSION} package state..."
 PACKAGES_CHANGED="false"
 if dpkg -s "postgresql-${PG_VERSION}" >/dev/null 2>&1 && [[ "$FORCE_BUILD" == "false" ]]; then
+    if [[ -d "$LOCAL_REPO_DIR" ]] && compgen -G "${LOCAL_REPO_DIR}/*.deb" >/dev/null 2>&1 && command -v dpkg-scanpackages >/dev/null 2>&1; then
+        if [[ ! -f "${LOCAL_REPO_DIR}/Release" ]] || ! printf '%s\n' "$WANT_LOCAL_LIST" | cmp -s - "$LOCAL_LIST" 2>/dev/null; then
+            update_local_repo
+            log_ok "Refreshed local PGDG repository metadata (${LOCAL_REPO_DIR}/Release)"
+        fi
+    fi
     log_skip "postgresql-${PG_VERSION} is already installed (pass --force-build to recompile)"
 else
     mkdir -p /var/lib/rvdk "$PG_LIB_ROOT" "$LOCAL_REPO_DIR"
@@ -610,6 +636,19 @@ if ! printf "%s\n" "$WANT_PG_QOS" | cmp -s - "$PG_QOS_FILE" 2>/dev/null; then
     systemctl daemon-reload
     QOS_CHANGED="true"
     log_ok "Applied VIP cgroup v2 QoS & LimitMEMLOCK=infinity (${PG_QOS_FILE})"
+fi
+
+# Guard stateful data/storage/broker daemons against unattended `needrestart` bounces during APT upgrades
+if [[ -d /etc/needrestart ]] || dpkg-query -W -f='${Status}\n' needrestart 2>/dev/null | grep -qx "install ok installed"; then
+    NEEDRESTART_DROPIN="/etc/needrestart/conf.d/90-rvdk-stateful.conf"
+    WANT_NEEDRESTART="# Managed by RVDK — defer automatic restarts of stateful data/storage/broker services
+# during APT library upgrades so active PostgreSQL io_uring clusters, NFSv4 grace
+# leases, and MQTT/ntfy sessions are only restarted during controlled windows.
+\$nrconf{override_rc}{qr(^(?:postgresql|nfs-ganesha|nfs-server|nfs-kernel-server|rpcbind|mosquitto|ntfy)(?:@|\\.|\$))} = 0;"
+    if ! printf '%s\n' "$WANT_NEEDRESTART" | cmp -s - "$NEEDRESTART_DROPIN" 2>/dev/null; then
+        printf '%s\n' "$WANT_NEEDRESTART" | rvdk_atomic_write "$NEEDRESTART_DROPIN" 0644
+        log_ok "Deferred automatic needrestart bounces for stateful services (${NEEDRESTART_DROPIN})"
+    fi
 fi
 
 # 6. Zero-Disruption Cluster Activation (restart ONLY when required)

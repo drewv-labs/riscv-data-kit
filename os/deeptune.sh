@@ -16,8 +16,10 @@
 #       `motd-news`, `update-notifier`, `man-db`, `e2scrub_all`, `apt-daily*`)
 #     • Stops, masks & purges workstation, printer, audio, Wi-Fi & SAN bloat
 #       (`firefox`, `cups*`, `fwupd`, `multipathd`, `avahi`, `udisks2`, `upower`,
-#       `wpa_supplicant`, `rsyslog`, `pipewire*`, `wireplumber`, plus `NetworkManager`
-#       when `systemd-networkd` already owns the dynamically detected primary NIC)
+#       `wpa_supplicant`, `rsyslog`, `pipewire*`, `wireplumber`, `network-manager-*-gnome`,
+#       plus `NetworkManager` when `systemd-networkd` owns the primary NIC) and
+#       runs `apt-get autoremove --purge` so transitive GUI/printer orphans are reaped
+#     • Defers unattended `needrestart` auto-bounces of stateful broker daemons
 #     • Locks down per-SSH `systemd --user` PipeWire & GNOME Keyring sockets
 #     • Unloads & blacklists universal non-server kernel modules (`cfg80211`,
 #       `joydev`, `input_leds`, `apple_mfi_fastcharge`, `dm_multipath`, `nvme_fabrics`)
@@ -440,9 +442,12 @@ else
 fi
 
 # ==============================================================================
-# 3. PURGE WORKSTATION, PRINTER, AUDIO & SAN BLOAT PACKAGES
+# 3. PURGE WORKSTATION, PRINTER, AUDIO & SAN BLOAT PACKAGES (+ AUTOREMOVE)
 # ==============================================================================
 rvdk_prog 60 "OS DeepTune: purging workstation, printer & SAN bloat packages..."
+# Note: `network-manager-*-gnome` are GTK/WebKit desktop applets (`nm-applet`,
+# `nm-connection-editor`), NOT the headless `NetworkManager` daemon or `nmcli`,
+# so they are safe to purge even when `NetworkManager.service` owns the NIC.
 CANDIDATE_PURGE_PKGS=(
     firefox
     firefox-esr
@@ -471,6 +476,14 @@ CANDIDATE_PURGE_PKGS=(
     gvfs-daemons
     gvfs-backends
     gnome-remote-desktop
+    gnome-online-accounts
+    gnome-control-center
+    yelp
+    zenity
+    network-manager-gnome
+    network-manager-openvpn-gnome
+    network-manager-pptp-gnome
+    network-manager-openconnect-gnome
     pipewire
     pipewire-pulse
     pipewire-alsa
@@ -482,11 +495,8 @@ CANDIDATE_PURGE_PKGS=(
 if [[ "$NM_SAFE_TO_PURGE" == "true" ]]; then
     CANDIDATE_PURGE_PKGS+=(
         network-manager
-        network-manager-gnome
         network-manager-openvpn
-        network-manager-openvpn-gnome
         network-manager-pptp
-        network-manager-pptp-gnome
     )
 fi
 
@@ -498,13 +508,36 @@ for pkg in "${CANDIDATE_PURGE_PKGS[@]}"; do
 done
 
 if [[ ${#INSTALLED_BLOAT[@]} -gt 0 ]]; then
-    log_info "Purging ${#INSTALLED_BLOAT[@]} workstation/printer/SAN bloat packages..."
+    log_info "Purging ${#INSTALLED_BLOAT[@]} workstation/printer/SAN bloat packages + orphaned dependencies..."
     apt-get purge "${APT_FLAGS[@]}" "${INSTALLED_BLOAT[@]}"
+    apt-get autoremove "${APT_FLAGS[@]}" --purge
     apt-get clean
     rm -rf /var/log/cups /var/log/syslog* /var/log/kern.log* /var/log/auth.log* /var/cache/fwupd 2>/dev/null || true
-    log_ok "Purged bloat packages: ${INSTALLED_BLOAT[*]}"
+    log_ok "Purged bloat packages & orphaned dependencies: ${INSTALLED_BLOAT[*]}"
+elif apt-get -s autoremove 2>/dev/null | grep -q '^Remv '; then
+    log_info "Purging orphaned auto-installed packages left by prior bloat removal..."
+    apt-get autoremove "${APT_FLAGS[@]}" --purge
+    apt-get clean
+    log_ok "Purged orphaned auto-installed dependency packages"
 else
-    log_skip "Workstation, printer, audio & SAN bloat packages already purged"
+    log_skip "Workstation, printer, audio & SAN bloat packages (and orphans) already purged"
+fi
+
+# ==============================================================================
+# 3b. DEFER UNATTENDED `needrestart` BOUNCES FOR STATEFUL BROKER DAEMONS
+# ==============================================================================
+if [[ -d /etc/needrestart ]] || dpkg-query -W -f='${Status}\n' needrestart 2>/dev/null | grep -qx "install ok installed"; then
+    NEEDRESTART_DROPIN="/etc/needrestart/conf.d/90-rvdk-stateful.conf"
+    WANT_NEEDRESTART="# Managed by RVDK — defer automatic restarts of stateful data/storage/broker services
+# during APT library upgrades so active PostgreSQL io_uring clusters, NFSv4 grace
+# leases, and MQTT/ntfy sessions are only restarted during controlled windows.
+\$nrconf{override_rc}{qr(^(?:postgresql|nfs-ganesha|nfs-server|nfs-kernel-server|rpcbind|mosquitto|ntfy)(?:@|\\.|\$))} = 0;"
+    if ! printf '%s\n' "$WANT_NEEDRESTART" | cmp -s - "$NEEDRESTART_DROPIN" 2>/dev/null; then
+        printf '%s\n' "$WANT_NEEDRESTART" | rvdk_atomic_write "$NEEDRESTART_DROPIN" 0644
+        log_ok "Deferred automatic needrestart bounces for stateful services (${NEEDRESTART_DROPIN})"
+    else
+        log_skip "Stateful service needrestart guard (${NEEDRESTART_DROPIN}) already converged"
+    fi
 fi
 
 # ==============================================================================

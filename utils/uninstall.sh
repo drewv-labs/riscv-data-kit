@@ -518,6 +518,7 @@ main() {
             for mp_file in \
                 /etc/modprobe.d/85-rvdk-os-deeptune.conf \
                 /etc/modprobe.d/90-rvdk-*.conf \
+                /etc/needrestart/conf.d/90-rvdk-stateful.conf \
                 /etc/apt/preferences.d/nosnap.pref \
                 /etc/apt/apt.conf.d/90-p550-bsp-protect \
                 /etc/apt/apt.conf.d/90-starfive-bsp-protect \
