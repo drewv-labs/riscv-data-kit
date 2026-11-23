@@ -11,8 +11,10 @@
       "script": "flash-sd.sh",
       "description": "Raw block SD/eMMC image flasher for StarFive VisionFive 2 Debian",
       "image": "starfive-jh7110-202510-minimal-desktop-wayland.img.zst",
+      "sha256": "5ba79ab9945d50fd5737968131c01d72500e366ee51f4ae4bea046fcb02caadb",
       "fallback_url": "https://github.com/starfive-tech/Debian/releases/download/v0.15.0-engineering-release-wayland/starfive-jh7110-202510-minimal-desktop-wayland.img.bz2",
       "fallback_sha256": "c750eba29b590f84d8f7af82c492453ea880175fcc22350bff11f531d767d8e8",
+      "root_part": 4,
       "min_size_gib": 8
     }
   },

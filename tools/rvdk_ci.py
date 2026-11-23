@@ -146,6 +146,7 @@ def check_manifests(repo_root: Path) -> list[str]:
 
     required_keys = {"schema_version", "board", "tag", "name", "soc", "default_os", "media", "quirks"}
     seen_tags = {}
+    sha256_re = re.compile(r"^[0-9a-f]{64}$")
 
     for m_str in manifest_paths:
         m_path = Path(m_str)
@@ -196,6 +197,20 @@ def check_manifests(repo_root: Path) -> list[str]:
                     errors.append(f"{rel}: media.{med_key}.mode={mode!r} must be 'raw', 'uboot_ext4', or 'sd_bootstrap'")
                 if mode == "sd_bootstrap" and not script_rel:
                     errors.append(f"{rel}: media.{med_key} with mode='sd_bootstrap' requires 'script'")
+                eff_mode = mode or ("uboot_ext4" if spec.get("uboot_payload") else "raw")
+                for sha_field in ("sha256", "fallback_sha256"):
+                    sha_val = spec.get(sha_field)
+                    if sha_val is not None and (not isinstance(sha_val, str) or not sha256_re.match(sha_val)):
+                        errors.append(
+                            f"{rel}: media.{med_key}.{sha_field} must be a 64-character lowercase hex SHA-256 digest"
+                        )
+                if eff_mode in ("raw", "uboot_ext4"):
+                    if spec.get("fallback_url") and not spec.get("fallback_sha256"):
+                        errors.append(f"{rel}: media.{med_key} defines 'fallback_url' without 'fallback_sha256'")
+                    if not spec.get("sha256") and not spec.get("fallback_sha256"):
+                        errors.append(
+                            f"{rel}: media.{med_key} ({eff_mode}) requires pinned 'sha256' (or 'fallback_sha256')"
+                        )
 
         quirks = data.get("quirks")
         if not isinstance(quirks, list):

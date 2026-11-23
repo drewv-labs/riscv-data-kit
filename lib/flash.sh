@@ -42,6 +42,36 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
 fi
 rvdk_log_init "RVDK:FLASH"
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    for _rvdk_hb_dir in /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/local/sbin; do
+        if [[ -d "$_rvdk_hb_dir" && ":${PATH}:" != *":${_rvdk_hb_dir}:"* ]]; then
+            PATH="${PATH}:${_rvdk_hb_dir}"
+        fi
+    done
+    unset _rvdk_hb_dir
+    export PATH
+fi
+
+_rvdk_require_decompressor() {
+    local img_file="$1"
+    local os_type="$2"
+    local req_bin="" brew_pkg="" apt_pkg=""
+    case "$img_file" in
+        *.zst) req_bin="zstd";  brew_pkg="zstd";  apt_pkg="zstd" ;;
+        *.xz)  req_bin="xz";    brew_pkg="xz";    apt_pkg="xz-utils" ;;
+        *.bz2) req_bin="bzip2"; brew_pkg="bzip2"; apt_pkg="bzip2" ;;
+        *.gz)  req_bin="gzip";  brew_pkg="gzip";  apt_pkg="gzip" ;;
+        *)     return 0 ;;
+    esac
+    if ! command -v "$req_bin" >/dev/null 2>&1; then
+        if [[ "$os_type" == "Darwin" ]]; then
+            log_fatal "Missing '${req_bin}' required to decompress $(basename "$img_file"). Run: brew install ${brew_pkg}"
+        else
+            log_fatal "Missing '${req_bin}' required to decompress $(basename "$img_file"). Install '${apt_pkg}'."
+        fi
+    fi
+}
+
 _rvdk_run_priv() {
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
         "$@"
@@ -1064,6 +1094,8 @@ PY
         _rvdk_flash_verify_sha256 "$image_path" "$sha_path" "${active_url}.sha256" "$active_pinned_sha" "$skip_sha256" "$REAL_USER" "$allow_remote_sha256"
     fi
 
+    _rvdk_require_decompressor "$image_path" "$os_type"
+
     local img_size_bytes
     img_size_bytes="$(wc -c < "$image_path" | tr -dc '0-9')"
     if (( img_size_bytes < 104857600 )); then
@@ -1182,13 +1214,17 @@ PY
 
         local dd_bs="4M"
         [[ "$os_type" == "Darwin" ]] && dd_bs="4m"
+        local dd_pipe_args=("of=${raw_dev}" "bs=${dd_bs}" "status=progress")
+        if dd if=/dev/zero of=/dev/null bs=512 count=1 iflag=fullblock status=none 2>/dev/null; then
+            dd_pipe_args+=("iflag=fullblock")
+        fi
 
         log_info "Streaming image to ${raw_dev} (bs=${dd_bs})..."
         case "$image_path" in
-            *.zst) zstd -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
-            *.bz2) bzip2 -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
-            *.xz)  xz -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
-            *.gz)  gzip -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd of="$raw_dev" bs="$dd_bs" status=progress ;;
+            *.zst) zstd -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd "${dd_pipe_args[@]}" ;;
+            *.bz2) bzip2 -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd "${dd_pipe_args[@]}" ;;
+            *.xz)  xz -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd "${dd_pipe_args[@]}" ;;
+            *.gz)  gzip -dc "$image_path" | _rvdk_dev_priv "$raw_dev" dd "${dd_pipe_args[@]}" ;;
             *)     _rvdk_dev_priv "$raw_dev" dd if="$image_path" of="$raw_dev" bs="$dd_bs" status=progress ;;
         esac
 

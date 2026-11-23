@@ -11,6 +11,7 @@
       "script": "flash-usb.sh",
       "description": "U-Boot ext4 recovery USB stick for eMMC installation (es_fs write usb 0 -> mmc 0)",
       "image": "sifive-p550-ubuntu-24.04-preinstalled-server-riscv64.img.zst",
+      "sha256": "0d038a901740e51f3062cef78214f466644d36bcc9fb972bcd00375fab3a4ce8",
       "fallback_url": "https://github.com/sifiveinc/hifive-premier-p550-ubuntu/releases/download/2025.11.00/ubuntu-24.04-preinstalled-server-riscv64.img.xz",
       "fallback_sha256": "36d4305e6a0423874521c62fb76fa756223806686b4bdbd93c92487ec3db2ae3",
       "uboot_payload": "ubuntu-24.04-preinstalled-server-riscv64.img",
