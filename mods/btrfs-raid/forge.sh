@@ -185,11 +185,26 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
     rvdk_prog "$STEP_PCT" "Btrfs RAID (${ARR_PROFILE}): converging ${ARR_NAME} (${ARR_LABEL})..."
     log_info "Checking ${ARR_NAME} [${TYPE_UPPER}] (${ARR_LABEL} -> ${ARR_MOUNT})..."
     EXISTING_DEV="$(blkid -L "$ARR_LABEL" 2>/dev/null || true)"
+    if [[ -z "$EXISTING_DEV" && "$FORCE_WIPE_RAID" == "false" ]] && mountpoint -q "$ARR_MOUNT" 2>/dev/null; then
+        _arr_src="$(findmnt -rn -o SOURCE -M "$ARR_MOUNT" 2>/dev/null || true)"
+        _arr_src="${_arr_src%%\[*}"
+        [[ -b "$_arr_src" ]] && EXISTING_DEV="$_arr_src"
+    fi
 
+    EFFECTIVE_ARR_LABEL="$ARR_LABEL"
+    EFFECTIVE_ARR_SPEC="LABEL=${ARR_LABEL}"
     if [[ -n "$EXISTING_DEV" && "$FORCE_WIPE_RAID" == "false" ]]; then
-        log_skip "${ARR_NAME} volume '${ARR_LABEL}' already exists on ${EXISTING_DEV}"
+        _arr_lbl="$(blkid -s LABEL -o value "$EXISTING_DEV" 2>/dev/null || true)"
+        _arr_uuid="$(blkid -s UUID -o value "$EXISTING_DEV" 2>/dev/null || true)"
+        if [[ -n "$_arr_lbl" ]]; then
+            EFFECTIVE_ARR_LABEL="$_arr_lbl"
+            EFFECTIVE_ARR_SPEC="LABEL=${_arr_lbl}"
+        elif [[ -n "$_arr_uuid" ]]; then
+            EFFECTIVE_ARR_SPEC="UUID=${_arr_uuid}"
+        fi
+        log_skip "${ARR_NAME} volume '${EFFECTIVE_ARR_LABEL}' already exists on ${EXISTING_DEV}"
     else
-        umount -f "$ARR_MOUNT" 2>/dev/null || true
+        [[ "$FORCE_WIPE_RAID" == "true" ]] && { umount -f "$ARR_MOUNT" 2>/dev/null || true; }
         CANDIDATE_DISKS=()
 
         if [[ -n "$ARR_DEVS_RAW" ]]; then
@@ -232,32 +247,40 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
         mkfs.btrfs -f -L "$ARR_LABEL" -d "$ARR_PROFILE" -m "$ARR_PROFILE" "${CANDIDATE_DISKS[@]}"
         btrfs device scan >/dev/null 2>&1 || true
         udevadm settle
+        EFFECTIVE_ARR_LABEL="$ARR_LABEL"
+        EFFECTIVE_ARR_SPEC="LABEL=${ARR_LABEL}"
         log_ok "Created ${#CANDIDATE_DISKS[@]}-drive Btrfs (${ARR_PROFILE}) volume '${ARR_LABEL}'"
     fi
 
     mkdir -p "$ARR_MOUNT"
-    FSTAB_RAID="LABEL=${ARR_LABEL}  ${ARR_MOUNT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=30s  0  2"
+    ARR_FSTYPE="$(blkid -s TYPE -o value "$EXISTING_DEV" 2>/dev/null || true)"
+    [[ -z "$ARR_FSTYPE" ]] && ARR_FSTYPE="btrfs"
+    if [[ "$ARR_FSTYPE" == "btrfs" ]]; then
+        FSTAB_RAID="${EFFECTIVE_ARR_SPEC}  ${ARR_MOUNT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=30s  0  2"
+    else
+        FSTAB_RAID="${EFFECTIVE_ARR_SPEC}  ${ARR_MOUNT}  ${ARR_FSTYPE}  rw,noatime,nofail,x-systemd.device-timeout=30s  0  2"
+    fi
     CUR_FSTAB=""
     [[ -f /etc/fstab ]] && CUR_FSTAB="$(cat /etc/fstab)"
-    WANT_FSTAB="$(awk -v lbl="LABEL=${ARR_LABEL}" -v mp="$ARR_MOUNT" -v line="$FSTAB_RAID" '
+    WANT_FSTAB="$(awk -v sp="$EFFECTIVE_ARR_SPEC" -v mp="$ARR_MOUNT" -v line="$FSTAB_RAID" '
         /^[[:space:]]*#/ || NF < 2 { print; next }
         {
             m = $2
             while (length(m) > 1 && substr(m, length(m), 1) == "/") {
                 m = substr(m, 1, length(m) - 1)
             }
-            if ($1 == lbl || m == mp) next
+            if ($1 == sp || m == mp) next
             print
         }
         END { print line }
     ' <<< "$CUR_FSTAB")"
 
     if [[ -f /etc/fstab ]] && printf '%s\n' "$WANT_FSTAB" | cmp -s - /etc/fstab 2>/dev/null; then
-        log_skip "${ARR_LABEL} already in /etc/fstab"
+        log_skip "${EFFECTIVE_ARR_SPEC} already in /etc/fstab"
     else
         printf '%s\n' "$WANT_FSTAB" | rvdk_atomic_write /etc/fstab 0644
         systemctl daemon-reload
-        log_ok "Added ${ARR_LABEL} to /etc/fstab"
+        log_ok "Added ${EFFECTIVE_ARR_SPEC} to /etc/fstab"
     fi
 
     if ! mountpoint -q "$ARR_MOUNT"; then

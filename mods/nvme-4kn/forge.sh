@@ -216,8 +216,10 @@ rvdk_prog 15 "NVMe 4Kn: verifying storage prerequisites..."
 rvdk_apt_ensure "${REQ_PKGS[@]}"
 
 PRIMARY_FSTYPE="$(tr '[:upper:]' '[:lower:]' <<< "$PRIMARY_FSTYPE")"
+FSTYPE_IS_AUTO="false"
 case "$PRIMARY_FSTYPE" in
     auto)
+        FSTYPE_IS_AUTO="true"
         if modprobe xfs 2>/dev/null || grep -qw xfs /proc/filesystems; then
             NVME_FSTYPE="xfs"
         else
@@ -244,10 +246,37 @@ if [[ -n "$EXISTING_FS_DEV" ]] && ! rvdk_block_resides_on_disk "$EXISTING_FS_DEV
     log_fatal "Cross-Disk Safety Interlock: filesystem label '${FS_LABEL}' already exists on '${EXISTING_FS_DEV}', which does NOT reside on '${NVME_DEV}'. Pass a unique --label <name> (and --vg <name>)."
 fi
 
+# Idempotent adoption when target --mount (or --vg/--lv) is already provisioned on --device
+if [[ -z "$EXISTING_FS_DEV" && "$FORCE_WIPE" == "false" ]]; then
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        _mnt_src="$(findmnt -rn -o SOURCE -M "$MOUNT_POINT" 2>/dev/null || true)"
+        _mnt_src="${_mnt_src%%\[*}"
+        if [[ -b "$_mnt_src" ]]; then
+            if rvdk_block_resides_on_disk "$_mnt_src" "$NVME_DEV"; then
+                EXISTING_FS_DEV="$_mnt_src"
+            else
+                log_fatal "Cross-Disk Safety Interlock: target mount '${MOUNT_POINT}' is currently mounted from '${_mnt_src}', which does NOT reside on '${NVME_DEV}'."
+            fi
+        fi
+    elif [[ "$USE_LVM" == "true" && -b "/dev/${VG_NAME}/${LV_NAME}" ]] && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${LV_NAME}" "$NVME_DEV"; then
+        _lv_type="$(blkid -s TYPE -o value "/dev/${VG_NAME}/${LV_NAME}" 2>/dev/null || true)"
+        case "$_lv_type" in
+            xfs|ext4|btrfs) EXISTING_FS_DEV="/dev/${VG_NAME}/${LV_NAME}" ;;
+        esac
+    fi
+fi
+
 if [[ "$WITH_SECONDARY_LV" == "true" ]]; then
     EXISTING_SEC_PRE="$(blkid -L "$SECONDARY_FS_LABEL" 2>/dev/null || true)"
     if [[ -n "$EXISTING_SEC_PRE" ]] && ! rvdk_block_resides_on_disk "$EXISTING_SEC_PRE" "$NVME_DEV"; then
         log_fatal "Cross-Disk Safety Interlock: secondary label '${SECONDARY_FS_LABEL}' already exists on '${EXISTING_SEC_PRE}', which does NOT reside on '${NVME_DEV}'. Pass a unique --secondary-label <name>."
+    fi
+    if mountpoint -q "$SECONDARY_MOUNT_POINT" 2>/dev/null; then
+        _sec_mnt_src="$(findmnt -rn -o SOURCE -M "$SECONDARY_MOUNT_POINT" 2>/dev/null || true)"
+        _sec_mnt_src="${_sec_mnt_src%%\[*}"
+        if [[ -b "$_sec_mnt_src" ]] && ! rvdk_block_resides_on_disk "$_sec_mnt_src" "$NVME_DEV"; then
+            log_fatal "Cross-Disk Safety Interlock: secondary mount '${SECONDARY_MOUNT_POINT}' is currently mounted from '${_sec_mnt_src}', which does NOT reside on '${NVME_DEV}'."
+        fi
     fi
 fi
 
@@ -261,16 +290,39 @@ NVME_SHORT="$(basename "$NVME_DEV")"
 EXISTING_FS_TYPE=""
 [[ -n "$EXISTING_FS_DEV" ]] && EXISTING_FS_TYPE="$(blkid -s TYPE -o value "$EXISTING_FS_DEV" 2>/dev/null || true)"
 
+if [[ "$FORCE_WIPE" == "false" && "$FSTYPE_IS_AUTO" == "true" ]]; then
+    case "$EXISTING_FS_TYPE" in
+        xfs|ext4|btrfs) NVME_FSTYPE="$EXISTING_FS_TYPE" ;;
+    esac
+fi
+
+EFFECTIVE_PRI_LABEL="$FS_LABEL"
+EFFECTIVE_PRI_SPEC="LABEL=${FS_LABEL}"
+if [[ -n "$EXISTING_FS_DEV" && "$FORCE_WIPE" == "false" ]]; then
+    _pri_lbl="$(blkid -s LABEL -o value "$EXISTING_FS_DEV" 2>/dev/null || true)"
+    _pri_uuid="$(blkid -s UUID -o value "$EXISTING_FS_DEV" 2>/dev/null || true)"
+    if [[ -n "$_pri_lbl" ]]; then
+        EFFECTIVE_PRI_LABEL="$_pri_lbl"
+        EFFECTIVE_PRI_SPEC="LABEL=${_pri_lbl}"
+    elif [[ -n "$_pri_uuid" ]]; then
+        EFFECTIVE_PRI_SPEC="UUID=${_pri_uuid}"
+    fi
+fi
+
 # If existing volume is NOT already converged, enforce non-destructive storage guard before wiping
 if [[ -z "$EXISTING_FS_DEV" || "$EXISTING_FS_TYPE" != "$NVME_FSTYPE" || "$FORCE_WIPE" == "true" ]]; then
-    rvdk_assert_device_safe_to_wipe "$NVME_DEV" "$FORCE_WIPE" "${FS_LABEL},${SECONDARY_FS_LABEL},RVDK_NVME,RVDK_SECONDARY,NFS_VAULT"
+    rvdk_assert_device_safe_to_wipe "$NVME_DEV" "$FORCE_WIPE" "${FS_LABEL},${EFFECTIVE_PRI_LABEL},${SECONDARY_FS_LABEL},RVDK_NVME,RVDK_SECONDARY,NFS_VAULT"
 fi
 
 # 2. Verify or Convert to Native 4096-Byte (4Kn) Hardware LBA Sectors (ms:0 ONLY)
 rvdk_prog 35 "NVMe 4Kn: checking 4096B LBA sector geometry..."
 CUR_LBA="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
-if [[ -n "$EXISTING_FS_DEV" && "$CUR_LBA" == "4096" && "$FORCE_WIPE" == "false" ]]; then
-    log_skip "Existing 4Kn volume '${FS_LABEL}' found on ${EXISTING_FS_DEV} (4096B sectors)"
+if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
+    if [[ "$CUR_LBA" == "4096" ]]; then
+        log_skip "Existing 4Kn volume '${EFFECTIVE_PRI_LABEL}' found on ${EXISTING_FS_DEV} (4096B sectors)"
+    else
+        log_skip "Existing volume '${EFFECTIVE_PRI_LABEL}' found on ${EXISTING_FS_DEV} (${CUR_LBA}B sectors; pass --force-wipe to reformat as 4Kn)"
+    fi
 else
     if [[ "$CUR_LBA" != "4096" || "$FORCE_WIPE" == "true" ]]; then
         umount -f "$MOUNT_POINT" 2>/dev/null || true
@@ -303,13 +355,15 @@ FSTYPE_UPPER="$(tr '[:lower:]' '[:upper:]' <<< "$NVME_FSTYPE")"
 rvdk_prog 55 "NVMe 4Kn: converging primary volume (${VG_NAME}/${LV_NAME}) & ${FSTYPE_UPPER}..."
 if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
     TARGET_BLOCK_DEV="$EXISTING_FS_DEV"
-    log_skip "${FSTYPE_UPPER} volume '${FS_LABEL}' already converged at ${TARGET_BLOCK_DEV}"
+    log_skip "${FSTYPE_UPPER} volume '${EFFECTIVE_PRI_LABEL}' already converged at ${TARGET_BLOCK_DEV}"
 else
     umount -f "$MOUNT_POINT" 2>/dev/null || true
 
-    if [[ "$USE_LVM" == "true" && -b "/dev/${VG_NAME}/${LV_NAME}" && "$FORCE_WIPE" == "false" ]] && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${LV_NAME}" "$NVME_DEV"; then
+    if [[ "$USE_LVM" == "true" && -b "/dev/${VG_NAME}/${LV_NAME}" && "$FORCE_WIPE" == "false" ]] \
+       && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${LV_NAME}" "$NVME_DEV" \
+       && [[ -z "$(blkid -s TYPE -o value "/dev/${VG_NAME}/${LV_NAME}" 2>/dev/null || true)" ]]; then
         TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
-        log_warn "Formatting existing LVM volume ${TARGET_BLOCK_DEV} as ${NVME_FSTYPE}..."
+        log_warn "Formatting uninitialized LVM volume ${TARGET_BLOCK_DEV} as ${NVME_FSTYPE}..."
         wipefs -af "$TARGET_BLOCK_DEV" >/dev/null 2>&1 || true
     elif [[ "$USE_LVM" == "true" ]]; then
         umount -f "$SECONDARY_MOUNT_POINT" 2>/dev/null || true
@@ -346,25 +400,27 @@ else
         *)     mkfs.ext4 -F -b 4096 -L "$FS_LABEL" "$TARGET_BLOCK_DEV" ;;
     esac
     udevadm settle
+    EFFECTIVE_PRI_LABEL="$FS_LABEL"
+    EFFECTIVE_PRI_SPEC="LABEL=${FS_LABEL}"
     log_ok "Formatted ${TARGET_BLOCK_DEV} as ${FSTYPE_UPPER} (label: ${FS_LABEL}, sector: ${SECTOR_SZ}B)"
 fi
 
 converge_fstab_entry() {
-    local label="$1"
+    local spec="$1"
     local mnt="$2"
     local fstype="$3"
     local entry="$4"
     local cur_fstab="" want_fstab=""
 
     [[ -f /etc/fstab ]] && cur_fstab="$(cat /etc/fstab)"
-    want_fstab="$(awk -v lbl="LABEL=${label}" -v mp="$mnt" -v line="$entry" '
+    want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
         /^[[:space:]]*#/ || NF < 2 { print; next }
         {
             m = $2
             while (length(m) > 1 && substr(m, length(m), 1) == "/") {
                 m = substr(m, 1, length(m) - 1)
             }
-            if ($1 == lbl || m == mp) next
+            if ($1 == sp || m == mp) next
             print
         }
         END { print line }
@@ -375,7 +431,7 @@ converge_fstab_entry() {
     else
         printf '%s\n' "$want_fstab" | rvdk_atomic_write /etc/fstab 0644
         systemctl daemon-reload
-        log_ok "Persisted ${label} -> ${mnt} (${fstype}) in /etc/fstab"
+        log_ok "Persisted ${spec} -> ${mnt} (${fstype}) in /etc/fstab"
     fi
 }
 
@@ -383,12 +439,12 @@ converge_fstab_entry() {
 rvdk_prog 80 "NVMe 4Kn: persisting /etc/fstab & mounting ${MOUNT_POINT}..."
 mkdir -p "$MOUNT_POINT"
 case "$NVME_FSTYPE" in
-    xfs)   FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2" ;;
-    btrfs) FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=15s  0  2" ;;
-    *)     FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  ext4  rw,noatime,nodiratime,data=ordered,nofail,x-systemd.device-timeout=15s  0  2" ;;
+    xfs)   FSTAB_ENTRY="${EFFECTIVE_PRI_SPEC}  ${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2" ;;
+    btrfs) FSTAB_ENTRY="${EFFECTIVE_PRI_SPEC}  ${MOUNT_POINT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=15s  0  2" ;;
+    *)     FSTAB_ENTRY="${EFFECTIVE_PRI_SPEC}  ${MOUNT_POINT}  ext4  rw,noatime,nodiratime,data=ordered,nofail,x-systemd.device-timeout=15s  0  2" ;;
 esac
 
-converge_fstab_entry "$FS_LABEL" "$MOUNT_POINT" "$NVME_FSTYPE" "$FSTAB_ENTRY"
+converge_fstab_entry "$EFFECTIVE_PRI_SPEC" "$MOUNT_POINT" "$NVME_FSTYPE" "$FSTAB_ENTRY"
 
 if ! mountpoint -q "$MOUNT_POINT"; then
     mount "$MOUNT_POINT"
@@ -399,17 +455,53 @@ fi
 
 # 5. Optional Dual-LVM Secondary Elastic LV (${VG_NAME}/${SECONDARY_LV_NAME} -> Btrfs zstd:3)
 if [[ "$WITH_SECONDARY_LV" == "true" && "$USE_LVM" == "true" ]]; then
-    SEC_UPPER="$(tr '[:lower:]' '[:upper:]' <<< "$SEC_FSTYPE")"
-    rvdk_prog 90 "NVMe 4Kn: converging Dual-LVM secondary volume (${VG_NAME}/${SECONDARY_LV_NAME} -> ${SEC_UPPER})..."
     EXISTING_SEC_DEV="$(blkid -L "$SECONDARY_FS_LABEL" 2>/dev/null || true)"
+    if [[ -z "$EXISTING_SEC_DEV" && "$FORCE_WIPE" == "false" ]]; then
+        if mountpoint -q "$SECONDARY_MOUNT_POINT" 2>/dev/null; then
+            _sec_src="$(findmnt -rn -o SOURCE -M "$SECONDARY_MOUNT_POINT" 2>/dev/null || true)"
+            _sec_src="${_sec_src%%\[*}"
+            if [[ -b "$_sec_src" ]] && rvdk_block_resides_on_disk "$_sec_src" "$NVME_DEV"; then
+                EXISTING_SEC_DEV="$_sec_src"
+            fi
+        elif [[ -b "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" ]] && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" "$NVME_DEV"; then
+            _sec_lv_type="$(blkid -s TYPE -o value "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" 2>/dev/null || true)"
+            case "$_sec_lv_type" in
+                xfs|ext4|btrfs) EXISTING_SEC_DEV="/dev/${VG_NAME}/${SECONDARY_LV_NAME}" ;;
+            esac
+        fi
+    fi
+
     EXISTING_SEC_TYPE=""
     [[ -n "$EXISTING_SEC_DEV" ]] && EXISTING_SEC_TYPE="$(blkid -s TYPE -o value "$EXISTING_SEC_DEV" 2>/dev/null || true)"
+    if [[ "$FORCE_WIPE" == "false" ]]; then
+        case "$EXISTING_SEC_TYPE" in
+            xfs|ext4|btrfs) SEC_FSTYPE="$EXISTING_SEC_TYPE" ;;
+        esac
+    fi
+
+    EFFECTIVE_SEC_LABEL="$SECONDARY_FS_LABEL"
+    EFFECTIVE_SEC_SPEC="LABEL=${SECONDARY_FS_LABEL}"
+    if [[ -n "$EXISTING_SEC_DEV" && "$FORCE_WIPE" == "false" ]]; then
+        _sec_lbl="$(blkid -s LABEL -o value "$EXISTING_SEC_DEV" 2>/dev/null || true)"
+        _sec_uuid="$(blkid -s UUID -o value "$EXISTING_SEC_DEV" 2>/dev/null || true)"
+        if [[ -n "$_sec_lbl" ]]; then
+            EFFECTIVE_SEC_LABEL="$_sec_lbl"
+            EFFECTIVE_SEC_SPEC="LABEL=${_sec_lbl}"
+        elif [[ -n "$_sec_uuid" ]]; then
+            EFFECTIVE_SEC_SPEC="UUID=${_sec_uuid}"
+        fi
+    fi
+
+    SEC_UPPER="$(tr '[:lower:]' '[:upper:]' <<< "$SEC_FSTYPE")"
+    rvdk_prog 90 "NVMe 4Kn: converging Dual-LVM secondary volume (${VG_NAME}/${SECONDARY_LV_NAME} -> ${SEC_UPPER})..."
 
     SEC_BLOCK_DEV=""
     if [[ -n "$EXISTING_SEC_DEV" && "$EXISTING_SEC_TYPE" == "$SEC_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
         SEC_BLOCK_DEV="$EXISTING_SEC_DEV"
-        log_skip "Dual-LVM ${SEC_UPPER} volume '${SECONDARY_FS_LABEL}' already converged at ${SEC_BLOCK_DEV}"
-    elif [[ -b "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" ]] && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" "$NVME_DEV"; then
+        log_skip "Dual-LVM ${SEC_UPPER} volume '${EFFECTIVE_SEC_LABEL}' already converged at ${SEC_BLOCK_DEV}"
+    elif [[ -b "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" ]] \
+         && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" "$NVME_DEV" \
+         && { [[ "$FORCE_WIPE" == "true" ]] || [[ -z "$(blkid -s TYPE -o value "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" 2>/dev/null || true)" ]]; }; then
         umount -f "$SECONDARY_MOUNT_POINT" 2>/dev/null || true
         SEC_BLOCK_DEV="/dev/${VG_NAME}/${SECONDARY_LV_NAME}"
         wipefs -af "$SEC_BLOCK_DEV" >/dev/null 2>&1 || true
@@ -423,6 +515,8 @@ if [[ "$WITH_SECONDARY_LV" == "true" && "$USE_LVM" == "true" ]]; then
             mkfs.ext4 -F -b 4096 -L "$SECONDARY_FS_LABEL" "$SEC_BLOCK_DEV"
         fi
         udevadm settle
+        EFFECTIVE_SEC_LABEL="$SECONDARY_FS_LABEL"
+        EFFECTIVE_SEC_SPEC="LABEL=${SECONDARY_FS_LABEL}"
         log_ok "Formatted existing LV ${SEC_BLOCK_DEV} as ${SEC_UPPER} (${SECONDARY_FS_LABEL})"
     elif vgs "$VG_NAME" >/dev/null 2>&1; then
         VG_TOTAL_EXT="$(vgs --noheadings --nosuffix -o vg_extent_count "$VG_NAME" 2>/dev/null | tr -dc '0-9' || echo 0)"
@@ -454,6 +548,8 @@ if [[ "$WITH_SECONDARY_LV" == "true" && "$USE_LVM" == "true" ]]; then
                 mkfs.ext4 -F -b 4096 -L "$SECONDARY_FS_LABEL" "$SEC_BLOCK_DEV"
             fi
             udevadm settle
+            EFFECTIVE_SEC_LABEL="$SECONDARY_FS_LABEL"
+            EFFECTIVE_SEC_SPEC="LABEL=${SECONDARY_FS_LABEL}"
             log_ok "Formatted ${SEC_BLOCK_DEV} as ${SEC_UPPER} (label: ${SECONDARY_FS_LABEL})"
         fi
     fi
@@ -461,14 +557,14 @@ if [[ "$WITH_SECONDARY_LV" == "true" && "$USE_LVM" == "true" ]]; then
     if [[ -n "$SEC_BLOCK_DEV" ]]; then
         mkdir -p "$SECONDARY_MOUNT_POINT"
         if [[ "$SEC_FSTYPE" == "btrfs" ]]; then
-            FSTAB_SEC="LABEL=${SECONDARY_FS_LABEL}  ${SECONDARY_MOUNT_POINT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=15s  0  2"
+            FSTAB_SEC="${EFFECTIVE_SEC_SPEC}  ${SECONDARY_MOUNT_POINT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=15s  0  2"
         elif [[ "$SEC_FSTYPE" == "xfs" ]]; then
-            FSTAB_SEC="LABEL=${SECONDARY_FS_LABEL}  ${SECONDARY_MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
+            FSTAB_SEC="${EFFECTIVE_SEC_SPEC}  ${SECONDARY_MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
         else
-            FSTAB_SEC="LABEL=${SECONDARY_FS_LABEL}  ${SECONDARY_MOUNT_POINT}  ext4  rw,noatime,nodiratime,data=ordered,nofail,x-systemd.device-timeout=15s  0  2"
+            FSTAB_SEC="${EFFECTIVE_SEC_SPEC}  ${SECONDARY_MOUNT_POINT}  ext4  rw,noatime,nodiratime,data=ordered,nofail,x-systemd.device-timeout=15s  0  2"
         fi
 
-        converge_fstab_entry "$SECONDARY_FS_LABEL" "$SECONDARY_MOUNT_POINT" "$SEC_FSTYPE" "$FSTAB_SEC"
+        converge_fstab_entry "$EFFECTIVE_SEC_SPEC" "$SECONDARY_MOUNT_POINT" "$SEC_FSTYPE" "$FSTAB_SEC"
 
         if ! mountpoint -q "$SECONDARY_MOUNT_POINT"; then
             mount "$SECONDARY_MOUNT_POINT"
