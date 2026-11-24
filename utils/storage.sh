@@ -11,7 +11,7 @@
 #     • autotune    : Usage-driven elastic pool autobalancing across mounted LVs
 #
 # Usage:
-#   rvdk storage [status]
+#   sudo rvdk storage [status]
 #   sudo rvdk storage grow --lv lv_data --gb 100 [--dry-run]
 #   sudo rvdk storage shrink --lv lv_secondary --gb 50 [--dry-run]
 #   sudo rvdk storage autotune [--weights lv_data:1.5,lv_secondary:1.0] [--dry-run]
@@ -155,50 +155,54 @@ main() {
     local weights_csv=""
     local cli_vg=""
 
+    _require_arg() {
+        [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != -* ]] || log_fatal "Option '${1:-}' requires an argument."
+    }
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             status|--status)
                 subcmd="status"; shift ;;
             --lv|-l)
-                target_lv="${2:-}"; shift 2 ;;
+                _require_arg "$@"; target_lv="$2"; shift 2 ;;
             --lv=*)
                 target_lv="${1#*=}"; shift ;;
             --gb)
-                size_gb="${2:-}"; shift 2 ;;
+                _require_arg "$@"; size_gb="$2"; shift 2 ;;
             --gb=*)
                 size_gb="${1#*=}"; shift ;;
             --mb)
-                size_mb="${2:-}"; shift 2 ;;
+                _require_arg "$@"; size_mb="$2"; shift 2 ;;
             --mb=*)
                 size_mb="${1#*=}"; shift ;;
             --tb)
-                size_tb="${2:-}"; shift 2 ;;
+                _require_arg "$@"; size_tb="$2"; shift 2 ;;
             --tb=*)
                 size_tb="${1#*=}"; shift ;;
             --pct-free)
-                pct_free="${2:-}"; shift 2 ;;
+                _require_arg "$@"; pct_free="$2"; shift 2 ;;
             --pct-free=*)
                 pct_free="${1#*=}"; shift ;;
             --vg)
-                cli_vg="${2:-}"; shift 2 ;;
+                _require_arg "$@"; cli_vg="$2"; shift 2 ;;
             --vg=*)
                 cli_vg="${1#*=}"; shift ;;
             --weights)
-                weights_csv="${2:-}"; shift 2 ;;
+                _require_arg "$@"; weights_csv="$2"; shift 2 ;;
             --weights=*)
                 weights_csv="${1#*=}"; shift ;;
             --mount|--mount-point)
-                primary_mount="${2:-}"; shift 2 ;;
+                _require_arg "$@"; primary_mount="$2"; shift 2 ;;
             --nfs-mount|--secondary-mount)
-                secondary_mount="${2:-}"; shift 2 ;;
+                _require_arg "$@"; secondary_mount="$2"; shift 2 ;;
             --dry-run|-n)
                 dry_run="true"; shift ;;
             --high-water)
-                high_water="${2:-75}"; shift 2 ;;
+                _require_arg "$@"; high_water="$2"; shift 2 ;;
             --target-util)
-                target_util="${2:-60}"; shift 2 ;;
+                _require_arg "$@"; target_util="$2"; shift 2 ;;
             --min-reserve-pct)
-                min_reserve_pct="${2:-5}"; shift 2 ;;
+                _require_arg "$@"; min_reserve_pct="$2"; shift 2 ;;
             --no-shrink)
                 allow_shrink="false"; shift ;;
             --distribute-pool)
@@ -317,10 +321,10 @@ main() {
     lv_weight_for() {
         local lv_n="$1"
         if [[ -n "$weights_csv" ]]; then
-            local pair k v old_ifs="$IFS"
-            IFS=','
-            for pair in $weights_csv; do
-                IFS="$old_ifs"
+            local pair k v
+            local -a _pairs=()
+            IFS=',' read -r -a _pairs <<< "$weights_csv"
+            for pair in "${_pairs[@]+"${_pairs[@]}"}"; do
                 k="${pair%%:*}"
                 v="${pair#*:}"
                 if [[ "$k" == "$lv_n" ]]; then
@@ -331,7 +335,6 @@ main() {
                     return 0
                 fi
             done
-            IFS="$old_ifs"
         fi
         case "$lv_n" in
             lv_data|"$primary_lv") echo "1.5" ;;

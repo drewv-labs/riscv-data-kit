@@ -117,6 +117,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$NOPASSWD_SUDO" == "true" && -z "$TARGET_USER" ]]; then
+    log_fatal "--nopasswd requires --user <username> to be specified."
+fi
 if [[ -n "$TARGET_USER" ]] && ! rvdk_validate_username "$TARGET_USER"; then
     log_fatal "Invalid POSIX username format: '${TARGET_USER}'."
 fi
@@ -140,7 +143,7 @@ rvdk_sync_cold_clock
 # 0. Normalize OpenWrt package feeds & pure UCI NTP/dnsmasq servers onto US-first endpoints
 #    Invariant: NEVER touch `/etc/config/network` and NEVER directly awk/sed `/etc/config/*`.
 if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" != "1" && "${RVDK_KEEP_VENDOR_MIRRORS:-false}" != "true" ]]; then
-    OWRT_CN_HOSTS="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn"
+    OWRT_CN_HOSTS="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sohu\\.com|mirrors\\.zju\\.edu\\.cn|mirrors\\.nju\\.edu\\.cn|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirrors\\.shanghaitech\\.edu\\.cn|mirrors\\.hit\\.edu\\.cn|mirrors\\.lzu\\.edu\\.cn|mirrors\\.cqu\\.edu\\.cn|mirrors\\.neusoft\\.edu\\.cn|mirrors\\.xjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn|mirror\\.lzu\\.edu\\.cn|cn\\.archive\\.ubuntu\\.com|hk\\.archive\\.ubuntu\\.com|ftp\\.cn\\.debian\\.org|ftp\\.hk\\.debian\\.org"
     OWRT_SCHEME="http"
     [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/ssl/certs/ca-bundle.crt ]] && OWRT_SCHEME="https"
     OWRT_FEED_CHANGED="false"

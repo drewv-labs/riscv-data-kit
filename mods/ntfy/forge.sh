@@ -233,6 +233,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$SKIP_BUNDLE_SHA" == "true" ]]; then
+    log_warn "SECURITY WARNING: --insecure-skip-sha256 enabled — prebuilt bundle SHA-256 verification is DISABLED!"
+fi
+
 if [[ -n "$NTFY_PASSWORD_FILE" ]]; then
     [[ -r "$NTFY_PASSWORD_FILE" ]] || log_fatal "Cannot read --ntfy-password-file '${NTFY_PASSWORD_FILE}'."
     NTFY_PASSWORD="$(tr -d '\r\n' < "$NTFY_PASSWORD_FILE")"
@@ -300,6 +304,26 @@ run_as_user() {
     fi
 }
 
+run_ntfy_as_user() {
+    if command -v runuser >/dev/null 2>&1; then
+        NTFY_PASSWORD="$NTFY_PASSWORD" runuser -u ntfy -- /usr/bin/ntfy "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        NTFY_PASSWORD="$NTFY_PASSWORD" sudo --preserve-env=NTFY_PASSWORD -u ntfy /usr/bin/ntfy "$@"
+    else
+        NTFY_PASSWORD="$NTFY_PASSWORD" su -s /bin/sh ntfy -c 'exec /usr/bin/ntfy "$@"' -- sh "$@"
+    fi
+}
+
+_ntfy_curl() {
+    local url="$1"
+    shift
+    if [[ "$url" == https://* ]]; then
+        curl --proto '=https' --tlsv1.2 "$@" "$url"
+    else
+        curl "$@" "$url"
+    fi
+}
+
 _NTFY_TMP_ARCHIVE=""
 _NTFY_TMP_EXTRACT=""
 _NTFY_TMP_GO_TGZ=""
@@ -310,7 +334,9 @@ BUILD_DIR="${NTFY_LIB_ROOT}/build"
 INSTALLED_STAMP="${NTFY_LIB_ROOT}/installed.env"
 
 _rvdk_ntfy_cleanup() {
-    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
+    if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
+        declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
+    fi
     [[ -n "$_NTFY_TMP_ARCHIVE" ]] && rm -f "$_NTFY_TMP_ARCHIVE" "${_NTFY_TMP_ARCHIVE}.sha256" 2>/dev/null || true
     [[ -n "$_NTFY_TMP_GO_TGZ" ]] && rm -f "$_NTFY_TMP_GO_TGZ" 2>/dev/null || true
     [[ -n "$_NTFY_TMP_EXTRACT" && -d "$_NTFY_TMP_EXTRACT" ]] && rm -rf "$_NTFY_TMP_EXTRACT" 2>/dev/null || true
@@ -318,7 +344,13 @@ _rvdk_ntfy_cleanup() {
         rm -rf "$BUILD_DIR" 2>/dev/null || true
     fi
 }
-trap '_rvdk_ntfy_cleanup' EXIT INT TERM
+if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+    rvdk_register_cleanup _rvdk_ntfy_cleanup
+elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+    trap '_rvdk_ntfy_cleanup' EXIT
+    trap '_rvdk_ntfy_cleanup; trap - EXIT INT; kill -INT $$' INT
+    trap '_rvdk_ntfy_cleanup; trap - EXIT TERM; kill -TERM $$' TERM
+fi
 
 rvdk_prog_init "ntfy ${NTFY_VERSION}: detecting RISC-V silicon profile..."
 
@@ -383,7 +415,7 @@ ensure_go_toolchain() {
     chmod 0755 "$base_cache" "$go_cache_root" 2>/dev/null || true
 
     local dl_json meta go_ver go_file go_sha
-    dl_json="$(curl -fsSL --retry 3 "https://go.dev/dl/?mode=json")" || log_fatal "Failed to query Go toolchain catalog at https://go.dev/dl/?mode=json"
+    dl_json="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "https://go.dev/dl/?mode=json")" || log_fatal "Failed to query Go toolchain catalog at https://go.dev/dl/?mode=json"
     meta="$(jq -r --arg arch "$GO_HOST_ARCH" '
         [ .[] | select(.stable == true) ][0] as $rel
         | ($rel.files[] | select(.os == "linux" and .arch == $arch and .kind == "archive"))
@@ -404,7 +436,7 @@ ensure_go_toolchain() {
     if [[ "$need_dl" == "true" ]]; then
         log_info "Downloading official Go toolchain ${go_ver} (${go_file})..." >&2
         _NTFY_TMP_GO_TGZ="${cached_tgz}.tmp.$$"
-        curl -fL --retry 3 "https://go.dev/dl/${go_file}" -o "$_NTFY_TMP_GO_TGZ"
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 "https://go.dev/dl/${go_file}" -o "$_NTFY_TMP_GO_TGZ"
         local actual_sha
         actual_sha="$(rvdk_sha256_file "$_NTFY_TMP_GO_TGZ")"
         if [[ "$actual_sha" != "$go_sha" ]]; then
@@ -450,8 +482,8 @@ if [[ "$INSTALLED_VER" == "$NTFY_VERSION" && -f /etc/systemd/system/ntfy.service
     fi
 fi
 
-if [[ -n "$NTFY_USER" ]] && ! command -v openssl >/dev/null 2>&1; then
-    rvdk_apt_ensure openssl
+if [[ -n "$NTFY_USER" ]] && ! command -v python3 >/dev/null 2>&1; then
+    rvdk_apt_ensure python3-minimal
 fi
 
 BINARIES_CHANGED="false"
@@ -461,7 +493,7 @@ else
     mkdir -p /var/lib/rvdk "$NTFY_LIB_ROOT" "$BUNDLE_DIR"
     chmod 0755 /var/lib/rvdk "$NTFY_LIB_ROOT" 2>/dev/null || true
     rvdk_prog 20 "ntfy ${NTFY_VERSION}: verifying archive & download prerequisites..."
-    rvdk_apt_ensure curl ca-certificates zstd openssl
+    rvdk_apt_ensure curl ca-certificates zstd
 
     if [[ "$FORCE_BUILD" == "false" ]]; then
         HAVE_VERIFIED_LOCAL="false"
@@ -490,9 +522,9 @@ else
                 rvdk_prog 32 "ntfy ${NTFY_VERSION}: pulling ${TARGET_SLUG} binary bundle..."
                 log_info "Pulling precompiled ${TARGET_SLUG} bundle from ${BUNDLE_URL}..."
                 _NTFY_TMP_ARCHIVE="$(mktemp /tmp/rvdk-ntfy-bundle.XXXXXX.tar.zst)"
-                if curl -fL --retry 3 "$BUNDLE_URL" -o "$_NTFY_TMP_ARCHIVE" 2>/dev/null; then
+                if _ntfy_curl "$BUNDLE_URL" -fL --retry 3 -o "$_NTFY_TMP_ARCHIVE" 2>/dev/null; then
                     if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" ]]; then
-                        if curl -fsSL --retry 3 "${BUNDLE_URL}.sha256" -o "${_NTFY_TMP_ARCHIVE}.sha256" 2>/dev/null; then
+                        if _ntfy_curl "${BUNDLE_URL}.sha256" -fsSL --retry 3 -o "${_NTFY_TMP_ARCHIVE}.sha256" 2>/dev/null; then
                             EXPECTED_BUNDLE_SHA="$(awk '{print tolower($1); exit}' "${_NTFY_TMP_ARCHIVE}.sha256")"
                         elif [[ "$SKIP_BUNDLE_SHA" != "true" ]]; then
                             rm -f "$_NTFY_TMP_ARCHIVE" "${_NTFY_TMP_ARCHIVE}.sha256"
@@ -865,9 +897,18 @@ if [[ -n "$NTFY_USER" ]]; then
         chmod 0600 "$AUTH_KEY_FILE" 2>/dev/null || true
     fi
 
-    WANT_AUTH_DIGEST="$(printf '%s:%s:%s' "$NTFY_USER" "$NTFY_ROLE" "$NTFY_PASSWORD" \
-        | openssl dgst -sha256 -hmac "$(cat "$AUTH_KEY_FILE")" \
-        | awk '{print tolower($NF)}')"
+    WANT_AUTH_DIGEST="$(
+        _RVDK_NTFY_PW="$NTFY_PASSWORD" python3 - "$AUTH_KEY_FILE" "$NTFY_USER" "$NTFY_ROLE" <<'PY'
+import hashlib, hmac, os, sys
+
+key_path, user, role = sys.argv[1], sys.argv[2], sys.argv[3]
+pw = os.environ["_RVDK_NTFY_PW"]
+with open(key_path, "rb") as fh:
+    key = fh.read().rstrip(b"\n")
+msg = f"{user}:{role}:{pw}".encode("utf-8")
+print(hmac.new(key, msg, hashlib.sha256).hexdigest())
+PY
+    )"
     HAVE_AUTH_DIGEST=""
     [[ -r "$AUTH_STAMP" ]] && HAVE_AUTH_DIGEST="$(awk '{print tolower($1); exit}' "$AUTH_STAMP" 2>/dev/null || true)"
     HAVE_AUTH_DB="true"
@@ -878,10 +919,10 @@ if [[ -n "$NTFY_USER" ]]; then
         if [[ -z "$NTFY_DATABASE_URL" ]]; then
             chown ntfy:ntfy "${NTFY_DATA}"/user.db* 2>/dev/null || true
         fi
-        run_as_user ntfy env NTFY_PASSWORD="$NTFY_PASSWORD" \
-            /usr/bin/ntfy user add --config="$NTFY_CONF" --ignore-exists --role="$NTFY_ROLE" "$NTFY_USER" >/dev/null
-        run_as_user ntfy env NTFY_PASSWORD="$NTFY_PASSWORD" \
-            /usr/bin/ntfy user change-pass --config="$NTFY_CONF" "$NTFY_USER" >/dev/null
+        run_ntfy_as_user \
+            user add --config="$NTFY_CONF" --ignore-exists --role="$NTFY_ROLE" "$NTFY_USER" >/dev/null
+        run_ntfy_as_user \
+            user change-pass --config="$NTFY_CONF" "$NTFY_USER" >/dev/null
         run_as_user ntfy \
             /usr/bin/ntfy user change-role --config="$NTFY_CONF" "$NTFY_USER" "$NTFY_ROLE" >/dev/null
         if [[ -z "$NTFY_DATABASE_URL" && -f "${NTFY_DATA}/user.db" ]]; then

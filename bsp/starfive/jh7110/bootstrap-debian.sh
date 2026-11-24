@@ -12,6 +12,8 @@
 #              - Persists primary wired NIC (eth0/end0) safely, masks sleep targets,
 #                locks U74 max OPP governor, and unlocks SiFive U74 PMU counters.
 #
+# @RVDK_DAY0_ORDER: pre-os
+#
 # Usage:
 #   sudo rvdk bsp [--skip-upgrade] [--full-upgrade] [--debian-suite trixie|unstable] [--with-vendor-repo] [--expose-kallsyms]
 # ==============================================================================
@@ -95,7 +97,7 @@ Options:
   --full-upgrade              Force re-running apt-get full-upgrade even when stamped
   --debian-suite <suite>      Target Debian suite (trixie|unstable; default: trixie)
   --with-vendor-repo          Retain StarFive legacy Debian vendor repository if keyring exists
-  --expose-kallsyms           Set kernel.kptr_restrict=1 for perf symbol profiling
+  --expose-kallsyms           Set kernel.kptr_restrict to 0 (exposes kernel symbols for perf; weakens KASLR)
   --keep-mirrors              Preserve existing APT mirror configuration
   --no-apt-update             Skip redundant apt-get update calls
   --noprogbar                 Disable persistent bottom progress bar

@@ -200,7 +200,7 @@ Day-0 / OS / BSP Stage Flags:
       --skip-locale        Skip en_US.UTF-8 locale generation (OS stage)
       --skip-net-guard     Skip rvdk-net-guard IPv4 IP-options & MPTCP lockdown (OS stage)
       --distro <flavor>    Override APT OS flavor (debian|ubuntu|bianbu|auto) (OS stage)
-      --expose-kallsyms    Set kernel.kptr_restrict=1 for perf symbol profiling (BSP stage)
+      --expose-kallsyms    Set kernel.kptr_restrict to 0 (exposes kernel symbols for perf; weakens KASLR)
       --skip-upgrade       Skip initial full-upgrade on JH7110 Debian (BSP stage)
       --full-upgrade       Force apt-get full-upgrade re-run on JH7110 Debian (BSP stage)
       --debian-suite <s>   Target Debian suite on JH7110 (trixie|unstable) (BSP stage)
@@ -403,7 +403,7 @@ if [[ "${1:-}" == "quirk" || "${1:-}" == "quirks" ]]; then
         else
             for bd in "${LOCAL_ROOT}"/boards/*/*; do
                 [[ -d "${bd}/quirks" ]] || continue
-                print_quirks_for_board "${bd#${LOCAL_ROOT}/boards/}"
+                print_quirks_for_board "${bd#"${LOCAL_ROOT}"/boards/}"
             done
         fi
         exit 0
@@ -707,10 +707,22 @@ if [[ "$WANT_SUB_HELP" == "true" ]]; then
             exec bash "${LOCAL_ROOT}/os/bootstrap-apt.sh" --help
             ;;
         deeptune)
-            if [[ -f "${LOCAL_ROOT}/bsp/eswin/eic7700x/deeptune.sh" ]]; then
-                exec bash "${LOCAL_ROOT}/bsp/eswin/eic7700x/deeptune.sh" --help
+            _dt_help_args=()
+            [[ -n "$CLI_SOC" ]]   && _dt_help_args+=("--soc" "$CLI_SOC")
+            [[ -n "$CLI_BOARD" ]] && _dt_help_args+=("--board" "$CLI_BOARD")
+            [[ -n "$CLI_OS" ]]    && _dt_help_args+=("--os" "$CLI_OS")
+            if [[ ! -r "${RVDK_KIT_CACHE_FILE:-/etc/rvdk/kit.env}" || ${#_dt_help_args[@]} -gt 0 ]]; then
+                _dt_help_args=("--no-cache" ${_dt_help_args[@]+"${_dt_help_args[@]}"})
             fi
-            print_cli_help
+            rvdk_kit_resolve ${_dt_help_args[@]+"${_dt_help_args[@]}"} || true
+
+            _dt_help_printed="false"
+            while IFS= read -r _dt_help_script; do
+                [[ -n "$_dt_help_script" ]] || continue
+                bash "$_dt_help_script" --help
+                _dt_help_printed="true"
+            done < <(rvdk_collect_deeptune_scripts "$LOCAL_ROOT")
+            [[ "$_dt_help_printed" == "true" ]] || print_cli_help
             exit 0
             ;;
         postgresql)
@@ -773,7 +785,7 @@ if [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
 
     DT_LAYERS=()
     while IFS= read -r s; do
-        [[ -n "$s" ]] && DT_LAYERS+=("${s#${LOCAL_ROOT}/}")
+        [[ -n "$s" ]] && DT_LAYERS+=("${s#"${LOCAL_ROOT}"/}")
     done < <(rvdk_collect_deeptune_scripts "$LOCAL_ROOT")
     LAYERS_STR="$(IFS=' -> '; echo "${DT_LAYERS[*]:-none}")"
 
@@ -821,6 +833,12 @@ if [[ -z "${RVDK_APT_STAMP_FILE:-}" ]]; then
     export RVDK_APT_STAMP_FILE="$_RVDK_OWN_APT_STAMP"
 fi
 
+_rvdk_cleanup_own_apt_stamp() {
+    if [[ -n "${_RVDK_OWN_APT_STAMP:-}" ]]; then
+        rm -f "$_RVDK_OWN_APT_STAMP" 2>/dev/null || true
+    fi
+}
+
 sync_apt_stamp() {
     if [[ -n "${RVDK_APT_STAMP_FILE:-}" && -f "$RVDK_APT_STAMP_FILE" ]]; then
         export RVDK_NO_APT_UPDATE="1"
@@ -838,7 +856,24 @@ if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
     fi
 fi
 
+if [[ -n "$_RVDK_OWN_APT_STAMP" ]]; then
+    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+        rvdk_register_cleanup _rvdk_cleanup_own_apt_stamp
+    fi
+fi
+
 rvdk_prog_init "${MODULE} (${BOARD_PATH:-$SOC_PATH})"
+
+if [[ -n "$_RVDK_OWN_APT_STAMP" ]] && ! declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+    case "$(trap -p EXIT 2>/dev/null || true)" in
+        *rvdk_prog_cleanup*) ;;
+        '')
+            trap '_rvdk_cleanup_own_apt_stamp' EXIT
+            [[ -z "$(trap -p INT 2>/dev/null || true)" ]] && trap '_rvdk_cleanup_own_apt_stamp; trap - INT; kill -INT $$' INT
+            [[ -z "$(trap -p TERM 2>/dev/null || true)" ]] && trap '_rvdk_cleanup_own_apt_stamp; trap - TERM; kill -TERM $$' TERM
+            ;;
+    esac
+fi
 log_rvdk "Kit: board=${BOARD_PATH:-generic} | soc=${SOC_PATH} | os=${OS_ID} (${RVDK_KIT_SOURCE:-probed}) | Module: ${MODULE}"
 
 # Execute collected DeepTune layers (`os/deeptune.sh` -> `bsp/<soc>/deeptune.sh` -> `boards/<board>/deeptune.sh`)
@@ -884,7 +919,7 @@ run_kit_deeptune() {
         local l_next=$(( base_pct + (span_pct * (idx + 1)) / count ))
         local l_span=$(( l_next - l_base ))
         (( l_span < 1 )) && l_span=1
-        local rel="${s#${LOCAL_ROOT}/}"
+        local rel="${s#"${LOCAL_ROOT}"/}"
         rel_layers+=("$rel")
 
         local layer_args=("--tune" "$tune_label")
@@ -945,6 +980,12 @@ run_addon_tail() {
     fi
 }
 
+bsp_requests_pre_os_order() {
+    local script_path="$1"
+    [[ -r "$script_path" ]] || return 1
+    awk '/^#[[:space:]]*@RVDK_DAY0_ORDER:[[:space:]]*pre-os([[:space:]]|$)/ { found=1; exit } END { exit !found }' "$script_path" 2>/dev/null
+}
+
 # 5. Dispatch Module (Use `bash`, not `exec bash`, so standalone progress bar EXIT trap tears down cleanly)
 case "$MODULE" in
     day0)
@@ -955,11 +996,10 @@ case "$MODULE" in
         else
             S1_SPAN=55; S2_BASE=55; S2_SPAN=45
         fi
-        # StarFive JH7110 Debian: run BSP repo fix prior to generic OS apt calls
-        if [[ "$SOC_PATH" == "starfive/jh7110" && "$OS_ID" == "debian" ]]; then
-            BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
-            OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
-            log_rvdk "Stage 1/2: Silicon BSP & APT Repo Migration (${BSP_SCRIPT})..."
+        OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
+        BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
+        if bsp_requests_pre_os_order "$BSP_SCRIPT"; then
+            log_rvdk "Stage 1/2: Silicon BSP Pre-OS Hardening (${BSP_SCRIPT})..."
             RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$BSP_SCRIPT" \
                 ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
                 ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
@@ -969,8 +1009,6 @@ case "$MODULE" in
                 ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
                 ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
         else
-            OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
-            BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
             log_rvdk "Stage 1/2: OS Normalization & IPv4 IP-Options / MPTCP Guard (${OS_SCRIPT})..."
             RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" \
                 ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \

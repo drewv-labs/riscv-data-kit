@@ -124,8 +124,15 @@ normalize_pkg_mirrors_early() {
     [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/ssl/certs/ca-bundle.crt ]] && scheme="https"
 
     if command -v apt-get >/dev/null 2>&1; then
-        local changed="false" f rendered bname backup_dir="/var/lib/rvdk/backups/apt"
-        for f in /etc/apt/sources.list $(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null); do
+        local src_files=() f
+        [[ -f /etc/apt/sources.list ]] && src_files+=("/etc/apt/sources.list")
+        if [[ -d /etc/apt/sources.list.d ]]; then
+            while IFS= read -r f; do
+                [[ -n "$f" ]] && src_files+=("$f")
+            done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null | sort)
+        fi
+        local changed="false" rendered bname backup_dir="/var/lib/rvdk/backups/apt"
+        for f in ${src_files[@]+"${src_files[@]}"}; do
             [[ -f "$f" ]] || continue
             rendered="$(sed -E \
                 -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g" \

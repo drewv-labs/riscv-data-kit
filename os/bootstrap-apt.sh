@@ -664,16 +664,42 @@ if [[ "$NOPASSWD_SUDO" == "true" ]]; then
         log_skip "Passwordless sudo already active at ${SUDOERS_FILE}"
     else
         mkdir -p /etc/sudoers.d
+        _TMP_SUDO_CLEANUP=""
+        _rvdk_cleanup_tmp_sudo() {
+            if [[ -n "${_TMP_SUDO_CLEANUP:-}" ]]; then
+                rm -f "$_TMP_SUDO_CLEANUP" 2>/dev/null || true
+                _TMP_SUDO_CLEANUP=""
+            fi
+        }
+        if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+            rvdk_register_cleanup _rvdk_cleanup_tmp_sudo
+        elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+            trap '_rvdk_cleanup_tmp_sudo' EXIT
+            trap '_rvdk_cleanup_tmp_sudo; trap - INT; kill -INT $$' INT
+            trap '_rvdk_cleanup_tmp_sudo; trap - TERM; kill -TERM $$' TERM
+        fi
+        [[ -z "${_RVDK_TMPFILES+x}" ]] && _RVDK_TMPFILES=()
+
         TMP_SUDO="$(mktemp "/etc/sudoers.d/.010_${TARGET_USER}.rvdk.XXXXXX")"
-        printf '%s\n' "$SUDOERS_RULE" > "$TMP_SUDO"
-        chmod 0440 "$TMP_SUDO"
-        chown root:root "$TMP_SUDO"
+        _TMP_SUDO_CLEANUP="$TMP_SUDO"
+        _RVDK_TMPFILES+=("$TMP_SUDO")
+
+        if ! printf '%s\n' "$SUDOERS_RULE" > "$TMP_SUDO" \
+            || ! chmod 0440 "$TMP_SUDO" \
+            || ! chown root:root "$TMP_SUDO"; then
+            _rvdk_cleanup_tmp_sudo
+            log_fatal "Failed to stage sudoers temp file ${TMP_SUDO}!"
+        fi
 
         if visudo -cf "$TMP_SUDO" >/dev/null 2>&1; then
-            mv -f "$TMP_SUDO" "$SUDOERS_FILE"
+            if ! mv -f "$TMP_SUDO" "$SUDOERS_FILE"; then
+                _rvdk_cleanup_tmp_sudo
+                log_fatal "Failed to install ${SUDOERS_FILE}!"
+            fi
+            _TMP_SUDO_CLEANUP=""
             log_ok "Configured passwordless sudo in ${SUDOERS_FILE}"
         else
-            rm -f "$TMP_SUDO"
+            _rvdk_cleanup_tmp_sudo
             log_fatal "Generated sudoers rule failed visudo syntax validation!"
         fi
     fi

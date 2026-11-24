@@ -262,9 +262,22 @@ _rvdk_prog_on_winch() {
     _rvdk_prog_render
 }
 
+_rvdk_prog_register_cleanup() {
+    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+        rvdk_register_cleanup rvdk_prog_cleanup
+    elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+        trap 'rvdk_prog_cleanup' EXIT
+        trap 'rvdk_prog_cleanup; trap - EXIT INT; kill -INT $$' INT
+        trap 'rvdk_prog_cleanup; trap - EXIT TERM; kill -TERM $$' TERM
+    fi
+}
+
 rvdk_prog_init() {
     local init_label="${1:-Initializing...}"
     local esc="$_RVDK_ESC"
+
+    # Always register cleanup (even on --noprogbar / non-TTY) so _RVDK_OWN_APT_STAMP is reaped
+    _rvdk_prog_register_cleanup
 
     if [[ "${RVDK_NO_PROGBAR:-0}" == "1" || "${NO_PROGBAR:-0}" == "1" ]]; then
         return 0
@@ -314,9 +327,6 @@ rvdk_prog_init() {
         export RVDK_PROGBAR_SESSION="1"
         local scroll_end=$(( _RVDK_PROG_ROWS - 1 ))
         _rvdk_prog_out $'\n'"${esc}[1A${esc}7${esc}[1;${scroll_end}r${esc}8"
-        trap 'rvdk_prog_cleanup' EXIT
-        trap 'rvdk_prog_cleanup; trap - INT; kill -INT $$' INT
-        trap 'rvdk_prog_cleanup; trap - TERM; kill -TERM $$' TERM
         trap '_rvdk_prog_on_winch' WINCH
         _rvdk_prog_render
     fi
@@ -369,6 +379,8 @@ rvdk_prog_cleanup() {
     if [[ -n "${_RVDK_OWN_APT_STAMP:-}" ]]; then
         rm -f "${_RVDK_OWN_APT_STAMP}" 2>/dev/null || true
     fi
-    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
+    if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
+        declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
+    fi
     return "$rc"
 }

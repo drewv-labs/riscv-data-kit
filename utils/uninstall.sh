@@ -17,9 +17,14 @@
 #       Removes everything above PLUS restores preserved vendor configuration
 #       backups under `/var/lib/rvdk/backups/{apt,dns,ntp,openwrt,registries}`
 #       (unless `--no-restore-backups` is passed), removes `/etc/rvdk/`,
-#       `/var/lib/rvdk/`, and all RVDK-authored systemd/procd tuning units,
-#       sysctl/modprobe/journald/APT drop-ins, and `rvdk-net-guard` nftables
-#       rules, then reloads `systemd`, `fw4` (OpenWrt), and `sysctl`.
+#       OS/BSP state under `/var/lib/rvdk/`, and all OS/BSP RVDK-authored
+#       systemd/procd tuning units, sysctl/modprobe/journald/APT drop-ins, and
+#       `rvdk-net-guard` nftables rules, then reloads `systemd`, `fw4` (OpenWrt),
+#       and `sysctl`. Preserves live workload service drop-ins and caches
+#       (`89-rvdk-io-uring.conf`, `90-rvdk-pg18-hugepages.conf`,
+#       `90-rvdk-tailscale-forwarding.conf`, `90-rvdk-stateful.conf`,
+#       `rvdk-local-pgdg.list`, `/var/lib/rvdk/pgdg-riscv64`,
+#       `/var/lib/rvdk/ntfy-riscv64`) unless `--include-workloads` is passed.
 #
 #   • Hard Safety Boundary (NEVER touched even with `--purge`):
 #       Provisioned POSIX users, SSH keys, `/etc/hostname`, primary NIC configs
@@ -29,7 +34,7 @@
 #       `tailscaled`).
 #
 # Usage:
-#   sudo rvdk uninstall [--purge] [--no-restore-backups] [--dry-run] [-y|--yes]
+#   sudo rvdk uninstall [--purge] [--include-workloads] [--no-restore-backups] [--dry-run] [-y|--yes]
 #   curl -fsSL https://rvdk.drewv-labs.dev/utils/uninstall.sh | sudo bash -s -- [--purge] [-y]
 # ==============================================================================
 
@@ -91,10 +96,18 @@ Usage:
 Options:
   --purge                Also restore preserved vendor config backups under
                          /var/lib/rvdk/backups/, remove /etc/rvdk (kit.env,
-                         deeptune.env, config.env), /var/lib/rvdk, and all
-                         RVDK-managed sysctl/modprobe/systemd/fw4/APT drop-ins
-                         (`apt purge` semantics). Note: default OS login
+                         deeptune.env, config.env), OS/BSP state in
+                         /var/lib/rvdk, and OS/BSP sysctl/modprobe/systemd/fw4/APT
+                         drop-ins (`apt purge` semantics). Preserves workload
+                         tuning drop-ins and caches by default unless
+                         --include-workloads is passed. Note: default OS login
                          MOTD/banner headers are restored in both modes.
+  --include-workloads    During --purge, also remove workload tuning drop-ins
+                         and caches (89-rvdk-io-uring.conf,
+                         90-rvdk-pg18-hugepages.conf,
+                         90-rvdk-tailscale-forwarding.conf,
+                         90-rvdk-stateful.conf, rvdk-local-pgdg.list,
+                         /var/lib/rvdk/pgdg-riscv64, /var/lib/rvdk/ntfy-riscv64)
   --no-restore-backups   During --purge, skip restoring /var/lib/rvdk/backups/*
                          and leave current APT/DNS/NTP/UCI configs in place
   -n, --dry-run          Preview every path, backup, and unit that would be
@@ -114,6 +127,7 @@ main() {
     rvdk_log_init "RVDK:UNINSTALL"
 
     local purge="false"
+    local include_workloads="false"
     local restore_backups="true"
     local dry_run="false"
     local skip_confirm="false"
@@ -122,6 +136,7 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --purge|purge)         purge="true"; shift ;;
+            --include-workloads)   include_workloads="true"; shift ;;
             --no-restore-backups)  restore_backups="false"; shift ;;
             --restore-backups)     restore_backups="true"; shift ;;
             -n|--dry-run)          dry_run="true"; shift ;;
@@ -130,6 +145,10 @@ main() {
             *)                     log_fatal "Unknown option: $1 (see --help)" ;;
         esac
     done
+
+    if [[ "$include_workloads" == "true" && "$purge" != "true" ]]; then
+        log_warn "--include-workloads only applies when combined with --purge."
+    fi
 
     if [[ "$dry_run" != "true" ]]; then
         local script_self="${BASH_SOURCE[0]:-}"
@@ -173,10 +192,16 @@ main() {
 
     local mode_desc="Standard Uninstall (restoring default login header; preserving /etc/rvdk, ${state_root} & active tuning)"
     if [[ "$purge" == "true" ]]; then
-        if [[ "$restore_backups" == "true" ]]; then
-            mode_desc="Full Purge (restoring login header & ${backup_root}, removing engine, caches, /etc/rvdk, ${state_root} & RVDK drop-ins)"
+        if [[ "$include_workloads" == "true" ]]; then
+            if [[ "$restore_backups" == "true" ]]; then
+                mode_desc="Full Purge + Workloads (restoring login header & ${backup_root}, removing engine, caches, /etc/rvdk, ${state_root}, OS/BSP & workload drop-ins)"
+            else
+                mode_desc="Full Purge + Workloads (restoring login header without config backup restore; removing engine, caches, /etc/rvdk, ${state_root}, OS/BSP & workload drop-ins)"
+            fi
+        elif [[ "$restore_backups" == "true" ]]; then
+            mode_desc="Full Purge (restoring login header & ${backup_root}, removing engine, caches, /etc/rvdk & OS/BSP drop-ins; preserving workload tuning/caches)"
         else
-            mode_desc="Full Purge (restoring login header without config backup restore; removing engine, caches, /etc/rvdk, ${state_root} & RVDK drop-ins)"
+            mode_desc="Full Purge (restoring login header without config backup restore; removing engine, caches, /etc/rvdk & OS/BSP drop-ins; preserving workload tuning/caches)"
         fi
     fi
 
@@ -187,7 +212,11 @@ main() {
         if [[ "$skip_confirm" != "true" ]]; then
             if [[ -t 1 && -r /dev/tty ]]; then
                 local prompt_msg="Remove RVDK CLI, engine, and caches, and restore default login header (keeping /etc/rvdk & tuning)?"
-                [[ "$purge" == "true" ]] && prompt_msg="PURGE RVDK CLI, engine, /etc/rvdk, ${state_root}, and all RVDK tuning drop-ins?"
+                if [[ "$purge" == "true" && "$include_workloads" == "true" ]]; then
+                    prompt_msg="PURGE RVDK CLI, engine, /etc/rvdk, ${state_root}, and ALL OS/BSP & workload tuning drop-ins?"
+                elif [[ "$purge" == "true" ]]; then
+                    prompt_msg="PURGE RVDK CLI, engine, /etc/rvdk, OS/BSP state in ${state_root}, and OS/BSP tuning drop-ins (preserving workload tuning/caches)?"
+                fi
                 printf "\033[1;33m[CONFIRM]\033[0m %s [y/N]: " "$prompt_msg"
                 local reply=""
                 read -r reply < /dev/tty || true
@@ -496,8 +525,6 @@ main() {
 
             local sc_file
             for sc_file in \
-                /etc/sysctl.d/89-rvdk-io-uring.conf \
-                /etc/sysctl.d/90-rvdk-*.conf \
                 /etc/sysctl.d/95-rvdk-deeptune.conf \
                 /etc/sysctl.d/99-rvdk-net-guard.conf \
                 /etc/sysctl.d/99-cve-2026-98432-tcp.conf \
@@ -514,20 +541,46 @@ main() {
                 fi
             done
 
+            local w_sc_file
+            for w_sc_file in \
+                /etc/sysctl.d/89-rvdk-io-uring.conf \
+                /etc/sysctl.d/90-rvdk-pg18-hugepages.conf \
+                /etc/sysctl.d/90-rvdk-tailscale-forwarding.conf; do
+                if [[ -e "$w_sc_file" || -L "$w_sc_file" ]]; then
+                    if [[ "$include_workloads" == "true" ]]; then
+                        remove_path "$w_sc_file"
+                        sysctl_dirty="true"
+                    else
+                        log_skip "Preserved workload sysctl ${w_sc_file} (pass '--include-workloads' to purge)"
+                    fi
+                fi
+            done
+
             local mp_file
             for mp_file in \
                 /etc/modprobe.d/85-rvdk-os-deeptune.conf \
                 /etc/modprobe.d/90-rvdk-*.conf \
-                /etc/needrestart/conf.d/90-rvdk-stateful.conf \
                 /etc/apt/preferences.d/nosnap.pref \
                 /etc/apt/apt.conf.d/90-p550-bsp-protect \
                 /etc/apt/apt.conf.d/90-starfive-bsp-protect \
                 /etc/apt/apt.conf.d/90-spacemit-bsp-protect \
                 /etc/apt/apt.conf.d/90-sifive-fu740-bsp-protect \
                 /etc/apt/apt.conf.d/90-ultrarisc-bsp-protect \
-                /etc/apt/apt.conf.d/90-tenstorrent-bsp-protect \
-                /etc/apt/sources.list.d/rvdk-local-pgdg.list; do
+                /etc/apt/apt.conf.d/90-tenstorrent-bsp-protect; do
                 [[ -e "$mp_file" || -L "$mp_file" ]] && remove_path "$mp_file"
+            done
+
+            local w_dropin
+            for w_dropin in \
+                /etc/needrestart/conf.d/90-rvdk-stateful.conf \
+                /etc/apt/sources.list.d/rvdk-local-pgdg.list; do
+                if [[ -e "$w_dropin" || -L "$w_dropin" ]]; then
+                    if [[ "$include_workloads" == "true" ]]; then
+                        remove_path "$w_dropin"
+                    else
+                        log_skip "Preserved workload drop-in ${w_dropin} (pass '--include-workloads' to purge)"
+                    fi
+                fi
             done
 
             if [[ "$restore_backups" == "true" ]]; then
@@ -538,7 +591,31 @@ main() {
         fi
 
         remove_path "/etc/rvdk"
-        remove_path "$state_root"
+        if [[ "$include_workloads" == "true" || -L "$state_root" ]]; then
+            remove_path "$state_root"
+        elif [[ -d "$state_root" ]]; then
+            local st_entry st_base preserved_workloads="false"
+            for st_entry in "${state_root}/"*; do
+                [[ -e "$st_entry" || -L "$st_entry" ]] || continue
+                st_base="$(basename "$st_entry")"
+                case "$st_base" in
+                    pgdg-riscv64|ntfy-riscv64)
+                        log_skip "Preserved workload cache ${st_entry} (pass '--include-workloads' to purge)"
+                        preserved_workloads="true"
+                        ;;
+                    *)
+                        remove_path "$st_entry"
+                        ;;
+                esac
+            done
+            if [[ "$preserved_workloads" == "false" ]]; then
+                if [[ "$dry_run" == "true" ]]; then
+                    log_info "[DRY-RUN] Would remove directory if empty: ${state_root}"
+                else
+                    rmdir "$state_root" 2>/dev/null && log_ok "Removed ${state_root}" || true
+                fi
+            fi
+        fi
 
         if [[ "$dry_run" != "true" && "$os_type" == "Linux" ]]; then
             if [[ "$systemd_dirty" == "true" ]] && command -v systemctl >/dev/null 2>&1; then

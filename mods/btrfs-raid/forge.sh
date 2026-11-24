@@ -141,6 +141,94 @@ fi
 
 btrfs device scan >/dev/null 2>&1 || true
 
+_btrfs_profile_min_disks() {
+    case "$1" in
+        raid10|raid1c4) printf '4\n' ;;
+        raid1c3)        printf '3\n' ;;
+        raid1|raid0)    printf '2\n' ;;
+        single)         printf '1\n' ;;
+        *)              log_fatal "Unsupported Btrfs profile '${1}'." ;;
+    esac
+}
+
+_btrfs_ensure_unmounted() {
+    local arr_name="$1"
+    local mnt="$2"
+    shift 2 || true
+    local -a mnt_targets=()
+    local d _desc_mnt _sorted_mnt
+
+    [[ -n "$mnt" ]] && mnt_targets+=("$mnt")
+    for d in "$@"; do
+        [[ -n "$d" && -b "$d" ]] || continue
+        while IFS= read -r _desc_mnt; do
+            [[ -n "$_desc_mnt" && "$_desc_mnt" == /* ]] && mnt_targets+=("$_desc_mnt")
+        done < <(lsblk -rn -o MOUNTPOINT "$d" 2>/dev/null || true)
+    done
+
+    if (( ${#mnt_targets[@]} > 0 )); then
+        while IFS= read -r _sorted_mnt; do
+            [[ -n "$_sorted_mnt" ]] || continue
+            if mountpoint -q "$_sorted_mnt" 2>/dev/null; then
+                umount "$_sorted_mnt" 2>/dev/null || true
+            fi
+        done < <(printf '%s\n' "${mnt_targets[@]}" | awk '!seen[$0]++ { printf "%d\t%s\n", length($0), $0 }' | sort -rn -k1,1 | cut -f2-)
+    fi
+
+    if [[ -n "$mnt" ]] && mountpoint -q "$mnt" 2>/dev/null; then
+        log_fatal "Cannot proceed on '${arr_name}': mountpoint '${mnt}' is still mounted/busy."
+    fi
+    for d in "$@"; do
+        [[ -n "$d" && -b "$d" ]] || continue
+        while IFS= read -r _desc_mnt; do
+            [[ -z "$_desc_mnt" ]] && continue
+            log_fatal "Cannot proceed on '${arr_name}': disk ${d} still has active/busy mount '${_desc_mnt}'."
+        done < <(lsblk -rn -o MOUNTPOINT "$d" 2>/dev/null || true)
+    done
+}
+
+_btrfs_converge_fstab_entry() {
+    local spec="$1"
+    local mnt="$2"
+    local entry="$3"
+    local fstab_file="${4:-/etc/fstab}"
+    local want_fstab=""
+
+    if [[ -s "$fstab_file" ]]; then
+        want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
+            BEGIN { replaced = 0 }
+            /^[[:space:]]*#/ || NF < 2 { print; next }
+            {
+                m = $2
+                while (length(m) > 1 && substr(m, length(m), 1) == "/") {
+                    m = substr(m, 1, length(m) - 1)
+                }
+                if ($1 == sp || m == mp) {
+                    if (!replaced) {
+                        print line
+                        replaced = 1
+                    }
+                    next
+                }
+                print
+            }
+            END { if (!replaced) print line }
+        ' "$fstab_file")"
+    else
+        want_fstab="$entry"
+    fi
+
+    if [[ -f "$fstab_file" ]] && printf '%s\n' "$want_fstab" | cmp -s - "$fstab_file" 2>/dev/null; then
+        log_skip "${spec} already in ${fstab_file}"
+    else
+        printf '%s\n' "$want_fstab" | rvdk_atomic_write "$fstab_file" 0644
+        if [[ "$fstab_file" == "/etc/fstab" ]]; then
+            systemctl daemon-reload
+        fi
+        log_ok "Added ${spec} to ${fstab_file}"
+    fi
+}
+
 for (( i=0; i<ARRAY_COUNT; i++ )); do
     # Single-pass jq extraction for all per-array scalar & list fields
     _ARR_FIELDS=()
@@ -157,7 +245,8 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
         ((.min_bytes // 0) | tostring),
         ((.max_bytes // 0) | tostring),
         ((.devices // []) | map(tostring) | join("\u001f")),
-        ((.subdirs // []) | map(tostring) | join("\u001f"))
+        ((.subdirs // []) | map(tostring) | join("\u001f")),
+        ((.devices // []) | length | tostring)
     ' <<< "$RAID_ARRAYS_JSON")
 
     ARR_NAME="${_ARR_FIELDS[0]:-array_${i}}"
@@ -170,6 +259,7 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
     ARR_MAX_B="${_ARR_FIELDS[7]:-0}"
     ARR_DEVS_RAW="${_ARR_FIELDS[8]:-}"
     ARR_SUBDIRS_RAW="${_ARR_FIELDS[9]:-}"
+    ARR_EXPLICIT_DEVS_CNT="${_ARR_FIELDS[10]:-0}"
 
     [[ -z "$ARR_LABEL" || ! "$ARR_LABEL" =~ ^[A-Za-z0-9._-]+$ ]] && log_fatal "Invalid or missing Btrfs label '${ARR_LABEL}' on array '${ARR_NAME}'."
     [[ -z "$ARR_MOUNT" || "$ARR_MOUNT" != /* || "$ARR_MOUNT" == "/" ]] && log_fatal "Invalid mountpoint '${ARR_MOUNT}' on array '${ARR_NAME}'."
@@ -204,17 +294,26 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
         fi
         log_skip "${ARR_NAME} volume '${EFFECTIVE_ARR_LABEL}' already exists on ${EXISTING_DEV}"
     else
-        [[ "$FORCE_WIPE_RAID" == "true" ]] && { umount -f "$ARR_MOUNT" 2>/dev/null || true; }
         CANDIDATE_DISKS=()
 
-        if [[ -n "$ARR_DEVS_RAW" ]]; then
+        if [[ -n "$ARR_DEVS_RAW" ]] || (( ARR_EXPLICIT_DEVS_CNT > 0 )); then
             IFS=$'\x1f' read -r -a _explicit_devs <<< "$ARR_DEVS_RAW"
+            (( ${#_explicit_devs[@]} > 0 )) || log_fatal "${ARR_NAME}: explicit .devices[] contains an empty device entry."
             for explicit_dev in "${_explicit_devs[@]}"; do
-                [[ -n "$explicit_dev" ]] && CANDIDATE_DISKS+=("$explicit_dev")
+                [[ -n "$explicit_dev" ]] || log_fatal "${ARR_NAME}: explicit .devices[] contains an empty device entry."
+                [[ -b "$explicit_dev" ]] || log_fatal "${ARR_NAME}: explicit device '${explicit_dev}' is not a valid block device."
+                _canon_dev="$(readlink -f "$explicit_dev")"
+                [[ -b "$_canon_dev" ]] || log_fatal "${ARR_NAME}: explicit device '${explicit_dev}' resolved to invalid block device '${_canon_dev}'."
+                _dup_dev="false"
+                for _seen_dev in ${CANDIDATE_DISKS[@]+"${CANDIDATE_DISKS[@]}"}; do
+                    if [[ "$_seen_dev" == "$_canon_dev" ]]; then
+                        _dup_dev="true"
+                        break
+                    fi
+                done
+                [[ "$_dup_dev" == "false" ]] && CANDIDATE_DISKS+=("$_canon_dev")
             done
-        fi
-
-        if (( ${#CANDIDATE_DISKS[@]} == 0 )); then
+        else
             while IFS= read -r line; do
                 [[ -z "$line" ]] && continue
                 d_path="$(awk '{print $1}' <<< "$line")"
@@ -222,12 +321,20 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
                 d_type="$(awk '{print $3}' <<< "$line")"
                 [[ "$d_type" != "disk" ]] && continue
                 [[ "$d_path" == /dev/nvme* || "$d_path" == /dev/mmcblk* || "$d_path" == /dev/zram* ]] && continue
+                d_path="$(readlink -f "$d_path" 2>/dev/null || echo "$d_path")"
                 rvdk_device_backs_os_or_swap "$d_path" && continue
                 if [[ "$FORCE_WIPE_RAID" == "false" ]] && ! rvdk_disk_is_blank "$d_path"; then
                     continue
                 fi
                 if (( d_size >= ARR_MIN_B && d_size <= ARR_MAX_B )); then
-                    CANDIDATE_DISKS+=("$d_path")
+                    _dup_dev="false"
+                    for _seen_dev in ${CANDIDATE_DISKS[@]+"${CANDIDATE_DISKS[@]}"}; do
+                        if [[ "$_seen_dev" == "$d_path" ]]; then
+                            _dup_dev="true"
+                            break
+                        fi
+                    done
+                    [[ "$_dup_dev" == "false" ]] && CANDIDATE_DISKS+=("$d_path")
                 fi
             done < <(lsblk -b -dn -o PATH,SIZE,TYPE)
 
@@ -236,13 +343,26 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
             fi
         fi
 
+        _min_disks="$(_btrfs_profile_min_disks "$ARR_PROFILE")"
+        if (( ${#CANDIDATE_DISKS[@]} < _min_disks )); then
+            log_fatal "${ARR_NAME}: Btrfs profile '${ARR_PROFILE}' requires at least ${_min_disks} unique disk(s); got ${#CANDIDATE_DISKS[@]} (${CANDIDATE_DISKS[*]:-none})."
+        fi
+
         for d in "${CANDIDATE_DISKS[@]}"; do
             rvdk_assert_device_safe_to_wipe "$d" "$FORCE_WIPE_RAID" "$ARR_LABEL"
         done
 
+        if [[ "$FORCE_WIPE_RAID" == "true" ]]; then
+            _btrfs_ensure_unmounted "$ARR_NAME" "$ARR_MOUNT" "${CANDIDATE_DISKS[@]}"
+        fi
+
         log_info "Formatting native Btrfs (${ARR_PROFILE}) '${ARR_LABEL}' across: ${CANDIDATE_DISKS[*]}"
         for d in "${CANDIDATE_DISKS[@]}"; do
-            wipefs -af "$d" >/dev/null 2>&1 || true
+            while IFS= read -r _part; do
+                [[ -n "$_part" && -b "$_part" ]] || continue
+                wipefs -af "$_part" >/dev/null
+            done < <(lsblk -rn -o PATH,TYPE "$d" 2>/dev/null | awk '$2 == "part" {print $1}' || true)
+            wipefs -af "$d" >/dev/null
         done
         mkfs.btrfs -f -L "$ARR_LABEL" -d "$ARR_PROFILE" -m "$ARR_PROFILE" "${CANDIDATE_DISKS[@]}"
         btrfs device scan >/dev/null 2>&1 || true
@@ -260,28 +380,7 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
     else
         FSTAB_RAID="${EFFECTIVE_ARR_SPEC}  ${ARR_MOUNT}  ${ARR_FSTYPE}  rw,noatime,nofail,x-systemd.device-timeout=30s  0  2"
     fi
-    CUR_FSTAB=""
-    [[ -f /etc/fstab ]] && CUR_FSTAB="$(cat /etc/fstab)"
-    WANT_FSTAB="$(awk -v sp="$EFFECTIVE_ARR_SPEC" -v mp="$ARR_MOUNT" -v line="$FSTAB_RAID" '
-        /^[[:space:]]*#/ || NF < 2 { print; next }
-        {
-            m = $2
-            while (length(m) > 1 && substr(m, length(m), 1) == "/") {
-                m = substr(m, 1, length(m) - 1)
-            }
-            if ($1 == sp || m == mp) next
-            print
-        }
-        END { print line }
-    ' <<< "$CUR_FSTAB")"
-
-    if [[ -f /etc/fstab ]] && printf '%s\n' "$WANT_FSTAB" | cmp -s - /etc/fstab 2>/dev/null; then
-        log_skip "${EFFECTIVE_ARR_SPEC} already in /etc/fstab"
-    else
-        printf '%s\n' "$WANT_FSTAB" | rvdk_atomic_write /etc/fstab 0644
-        systemctl daemon-reload
-        log_ok "Added ${EFFECTIVE_ARR_SPEC} to /etc/fstab"
-    fi
+    _btrfs_converge_fstab_entry "$EFFECTIVE_ARR_SPEC" "$ARR_MOUNT" "$FSTAB_RAID"
 
     if ! mountpoint -q "$ARR_MOUNT"; then
         mount "$ARR_MOUNT"

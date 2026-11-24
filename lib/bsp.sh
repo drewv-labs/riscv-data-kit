@@ -134,6 +134,101 @@ EOF
     fi
 }
 
+_RVDK_BSP_TMP_MNT="${_RVDK_BSP_TMP_MNT:-}"
+
+_rvdk_bsp_cleanup_tmp_mnt() {
+    if [[ -n "${_RVDK_BSP_TMP_MNT:-}" && -d "${_RVDK_BSP_TMP_MNT}" ]]; then
+        if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "${_RVDK_BSP_TMP_MNT}" 2>/dev/null; then
+            umount "${_RVDK_BSP_TMP_MNT}" 2>/dev/null || umount -l "${_RVDK_BSP_TMP_MNT}" 2>/dev/null || true
+        else
+            umount "${_RVDK_BSP_TMP_MNT}" 2>/dev/null || true
+        fi
+        rmdir "${_RVDK_BSP_TMP_MNT}" 2>/dev/null || true
+    fi
+    _RVDK_BSP_TMP_MNT=""
+}
+
+# Strip commit=<10+s> mount options ONLY from active root ext4 entries ($2 == "/" && $3 == "ext4").
+# Falls back to "defaults" if commit=... was the sole mount option.
+_rvdk_bsp_strip_fstab_commit() {
+    awk '{
+        if ($1 !~ /^#/ && NF >= 4 && $2 == "/" && $3 == "ext4") {
+            n = split($4, opts, ",")
+            out_opts = ""
+            changed = 0
+            for (i = 1; i <= n; i++) {
+                if (opts[i] ~ /^commit=[0-9][0-9]+$/) {
+                    changed = 1
+                    continue
+                }
+                if (opts[i] == "") continue
+                out_opts = (out_opts == "" ? opts[i] : out_opts "," opts[i])
+            }
+            if (changed) {
+                if (out_opts == "") out_opts = "defaults"
+                $4 = out_opts
+            }
+        }
+        print
+    }'
+}
+
+# Parse one `lsblk -P -b -o PATH,TYPE,FSTYPE,SIZE,LABEL` line safely without `eval`.
+# Sets: _RVDK_LSBLK_PATH, _RVDK_LSBLK_TYPE, _RVDK_LSBLK_FSTYPE, _RVDK_LSBLK_SIZE, _RVDK_LSBLK_LABEL
+_rvdk_bsp_parse_lsblk_line() {
+    local rest="${1:-}"
+    _RVDK_LSBLK_PATH=""
+    _RVDK_LSBLK_TYPE=""
+    _RVDK_LSBLK_FSTYPE=""
+    _RVDK_LSBLK_SIZE=""
+    _RVDK_LSBLK_LABEL=""
+
+    local pair_re='^([A-Za-z_][A-Za-z0-9_]*)="(([^"\\]|\\.)*)"[[:space:]]*(.*)$'
+    while [[ -n "$rest" ]]; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [[ -z "$rest" ]] && break
+        if [[ "$rest" =~ $pair_re ]]; then
+            local k="${BASH_REMATCH[1]}"
+            local v="${BASH_REMATCH[2]}"
+            rest="${BASH_REMATCH[4]}"
+            case "$k" in
+                PATH)   _RVDK_LSBLK_PATH="$v" ;;
+                TYPE)   _RVDK_LSBLK_TYPE="$v" ;;
+                FSTYPE) _RVDK_LSBLK_FSTYPE="$v" ;;
+                SIZE)   _RVDK_LSBLK_SIZE="$v" ;;
+                LABEL)  _RVDK_LSBLK_LABEL="$v" ;;
+            esac
+        else
+            break
+        fi
+    done
+}
+
+_rvdk_bsp_select_root_part() {
+    local dev_path="$1"
+    local best_pref="" best_size_dev="" best_size=0
+    local _line p_lbl_lc
+
+    while IFS= read -r _line; do
+        [[ -z "$_line" ]] && continue
+        _rvdk_bsp_parse_lsblk_line "$_line"
+        [[ "$_RVDK_LSBLK_TYPE" == "part" && "$_RVDK_LSBLK_FSTYPE" == "ext4" ]] || continue
+        [[ "$_RVDK_LSBLK_SIZE" =~ ^[0-9]+$ ]] || _RVDK_LSBLK_SIZE=0
+        (( _RVDK_LSBLK_SIZE >= 268435456 )) || continue
+        p_lbl_lc="$(tr '[:upper:]' '[:lower:]' <<< "${_RVDK_LSBLK_LABEL:-}")"
+        case "$p_lbl_lc" in
+            boot|bootfs|opi_boot|armbi_boot|efi) continue ;;
+            opi_root|armbi_root|rootfs|cloudimg-rootfs|rvdk_*_root) best_pref="$_RVDK_LSBLK_PATH" ;;
+        esac
+        if (( _RVDK_LSBLK_SIZE > best_size )); then
+            best_size="$_RVDK_LSBLK_SIZE"
+            best_size_dev="$_RVDK_LSBLK_PATH"
+        fi
+    done < <(lsblk -P -b -o PATH,TYPE,FSTYPE,SIZE,LABEL "$dev_path" 2>/dev/null || true)
+
+    printf '%s\n' "${best_pref:-$best_size_dev}"
+}
+
 # Converge non-colliding ext4 rootfs labels (`rvdk_sd_root` vs `rvdk_emmc_root`)
 # and repair duplicate UUIDs across dual-populated SD + eMMC SBCs.
 rvdk_bsp_converge_mmc_root_labels() {
@@ -164,12 +259,14 @@ rvdk_bsp_converge_mmc_root_labels() {
                 fi
             fi
         fi
-        if [[ -f /etc/fstab ]] && grep -Eq '^[[:space:]]*[^#].*[[:space:]]/[[:space:]]+ext4[[:space:]].*commit=[0-9]{2,}' /etc/fstab 2>/dev/null; then
+        if [[ -f /etc/fstab ]] && grep -Eq '^[[:space:]]*[^#[:space:]]+[[:space:]]+/[[:space:]]+ext4[[:space:]]+[^[:space:]]*commit=[0-9]{2,}' /etc/fstab 2>/dev/null; then
             local _fstab_clean
-            _fstab_clean="$(sed -E '/^[[:space:]]*#/! s/,commit=[0-9]{2,}//g; /^[[:space:]]*#/! s/commit=[0-9]{2,},//g' /etc/fstab)"
-            printf '%s\n' "$_fstab_clean" | rvdk_atomic_write /etc/fstab 0644
-            mount -o remount,commit=5 / 2>/dev/null || true
-            live_durability+=("-commit=600")
+            _fstab_clean="$(_rvdk_bsp_strip_fstab_commit < /etc/fstab)"
+            if ! printf '%s\n' "$_fstab_clean" | cmp -s - /etc/fstab 2>/dev/null; then
+                printf '%s\n' "$_fstab_clean" | rvdk_atomic_write /etc/fstab 0644
+                mount -o remount,commit=5 / 2>/dev/null || true
+                live_durability+=("-commit=600")
+            fi
         fi
         if (( ${#live_durability[@]} > 0 )); then
             log_ok "Hardened live ext4 rootfs durability on ${live_root} (${live_durability[*]})"
@@ -210,23 +307,7 @@ rvdk_bsp_converge_mmc_root_labels() {
             live_fstype="$(blkid -s TYPE -o value "$live_root" 2>/dev/null || true)"
             [[ "$live_fstype" == "ext4" ]] && root_part="$live_root"
         else
-            local best_pref="" best_size_dev="" best_size=0
-            local p_path p_type p_fs p_sz p_lbl p_lbl_lc
-            while IFS=' ' read -r p_path p_type p_fs p_sz p_lbl; do
-                [[ "$p_type" == "part" && "$p_fs" == "ext4" ]] || continue
-                [[ "$p_sz" =~ ^[0-9]+$ ]] || p_sz=0
-                (( p_sz >= 268435456 )) || continue
-                p_lbl_lc="$(tr '[:upper:]' '[:lower:]' <<< "${p_lbl:-}")"
-                case "$p_lbl_lc" in
-                    boot|bootfs|opi_boot|armbi_boot|efi) continue ;;
-                    opi_root|armbi_root|rootfs|cloudimg-rootfs|rvdk_*_root) best_pref="$p_path" ;;
-                esac
-                if (( p_sz > best_size )); then
-                    best_size="$p_sz"
-                    best_size_dev="$p_path"
-                fi
-            done < <(lsblk -ln -b -o PATH,TYPE,FSTYPE,SIZE,LABEL "/dev/${mmc_name}" 2>/dev/null || true)
-            root_part="${best_pref:-$best_size_dev}"
+            root_part="$(_rvdk_bsp_select_root_part "/dev/${mmc_name}")"
         fi
 
         [[ -n "$root_part" && -b "$root_part" ]] || continue
@@ -249,21 +330,22 @@ rvdk_bsp_converge_mmc_root_labels() {
                     local new_uuid=""
                     new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
                     tune2fs -U "$new_uuid" "$root_part" >/dev/null
-                    local tmp_mnt=""
-                    tmp_mnt="$(mktemp -d "/tmp/rvdk_mmc_uuid.XXXXXX")"
-                    if mount "$root_part" "$tmp_mnt" 2>/dev/null; then
+                    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+                        rvdk_register_cleanup _rvdk_bsp_cleanup_tmp_mnt
+                    fi
+                    _RVDK_BSP_TMP_MNT="$(mktemp -d "/tmp/rvdk_mmc_uuid.XXXXXX")"
+                    if mount "$root_part" "$_RVDK_BSP_TMP_MNT" 2>/dev/null; then
                         local rel_cfg
                         for rel_cfg in etc/fstab boot/orangepiEnv.txt boot/armbianEnv.txt boot/env_k1-x.txt boot/spacemit/env_k1-x.txt boot/extlinux/extlinux.conf boot/efi/extlinux.conf; do
-                            if [[ -f "${tmp_mnt}/${rel_cfg}" ]] && grep -qF "$peer_uuid" "${tmp_mnt}/${rel_cfg}" 2>/dev/null; then
+                            if [[ -f "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" ]] && grep -qF "$peer_uuid" "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 2>/dev/null; then
                                 local _peer_rewritten
-                                _peer_rewritten="$(sed "s|${peer_uuid}|${new_uuid}|g" "${tmp_mnt}/${rel_cfg}")"
-                                printf '%s\n' "$_peer_rewritten" | rvdk_atomic_write "${tmp_mnt}/${rel_cfg}" 0644
+                                _peer_rewritten="$(sed "s|${peer_uuid}|${new_uuid}|g" "${_RVDK_BSP_TMP_MNT}/${rel_cfg}")"
+                                printf '%s\n' "$_peer_rewritten" | rvdk_atomic_write "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 0644
                             fi
                         done
                         sync
-                        umount "$tmp_mnt" 2>/dev/null || true
                     fi
-                    rmdir "$tmp_mnt" 2>/dev/null || true
+                    _rvdk_bsp_cleanup_tmp_mnt
                     log_ok "De-collided duplicate ${mmc_kind} ext4 UUID on ${root_part} -> ${new_uuid}"
                 fi
             fi

@@ -48,6 +48,8 @@ IGNORED_DIRS = {
     "_site",
     "dist",
     "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
     "graphify-out",
     "skills",
 }
@@ -92,6 +94,11 @@ FORBIDDEN_BLEED_PATTERNS: Sequence[tuple[str, re.Pattern[str], bool]] = (
     ("Downstream project bleed (Pigeoneer)", re.compile(r"\bpigeoneer\b", re.IGNORECASE), False),
     ("Downstream project bleed (pygeons)", re.compile(r"\bpygeons\b", re.IGNORECASE), False),
     ("Downstream project bleed (HamStak)", re.compile(r"\bhamstak\b", re.IGNORECASE), False),
+    ("Downstream project bleed (AdaLovespace)", re.compile(r"\bada[-_]?lovespace\b", re.IGNORECASE), True),
+    ("Downstream project bleed (DarkSilicon)", re.compile(r"\bdark[-_]?silicon\b", re.IGNORECASE), False),
+    ("Downstream project bleed (Poggerbox)", re.compile(r"\bpogger[-_]?box\b", re.IGNORECASE), False),
+    ("Downstream project bleed (CodaBox)", re.compile(r"\bcoda[-_]?box\b", re.IGNORECASE), False),
+    ("Downstream project bleed (CoffeeCan)", re.compile(r"\bcoffee[-_]?can\b", re.IGNORECASE), False),
     ("Personal workstation hostname (ZedBook)", re.compile(r"\bzedbook\b", re.IGNORECASE), False),
     ("Personal shipping note", re.compile(r"stuck in chicago", re.IGNORECASE), False),
     ("Downstream ADMIN_USER env bleed", re.compile(r"\bADMIN_USER\b"), False),
@@ -207,7 +214,15 @@ def check_manifests(repo_root: Path) -> list[str]:
                 if eff_mode in ("raw", "uboot_ext4"):
                     if spec.get("fallback_url") and not spec.get("fallback_sha256"):
                         errors.append(f"{rel}: media.{med_key} defines 'fallback_url' without 'fallback_sha256'")
-                    if not spec.get("sha256") and not spec.get("fallback_sha256"):
+                    has_image = "image" in spec
+                    if has_image:
+                        if not isinstance(spec.get("image"), str) or not spec["image"].strip():
+                            errors.append(f"{rel}: media.{med_key}.image must be a non-empty string")
+                        if not spec.get("sha256"):
+                            errors.append(
+                                f"{rel}: media.{med_key} ({eff_mode}) declares 'image' without pinned 'sha256'"
+                            )
+                    if not has_image and not spec.get("sha256") and not spec.get("fallback_sha256"):
                         errors.append(
                             f"{rel}: media.{med_key} ({eff_mode}) requires pinned 'sha256' (or 'fallback_sha256')"
                         )

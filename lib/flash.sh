@@ -93,8 +93,19 @@ _rvdk_dev_priv() {
     fi
 }
 
-_RVDK_FLASH_TMP_MNT=""
+_RVDK_FLASH_TMP_MNT="${_RVDK_FLASH_TMP_MNT:-}"
+_RVDK_FLASH_PART_FILE="${_RVDK_FLASH_PART_FILE:-}"
+_RVDK_FLASH_BOOT0_SYS="${_RVDK_FLASH_BOOT0_SYS:-}"
+
 _rvdk_flash_cleanup() {
+    if [[ -n "${_RVDK_FLASH_BOOT0_SYS:-}" && -f "${_RVDK_FLASH_BOOT0_SYS}" ]]; then
+        printf '1\n' | _rvdk_run_priv tee "${_RVDK_FLASH_BOOT0_SYS}" >/dev/null 2>&1 || true
+        _RVDK_FLASH_BOOT0_SYS=""
+    fi
+    if [[ -n "${_RVDK_FLASH_PART_FILE:-}" && -f "${_RVDK_FLASH_PART_FILE}" ]]; then
+        rm -f "${_RVDK_FLASH_PART_FILE}" 2>/dev/null || true
+        _RVDK_FLASH_PART_FILE=""
+    fi
     if [[ -n "${_RVDK_FLASH_TMP_MNT:-}" && -d "${_RVDK_FLASH_TMP_MNT}" ]]; then
         if [[ -d "${_RVDK_FLASH_TMP_MNT}/boot" ]]; then
             _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}/boot" 2>/dev/null || true
@@ -105,8 +116,62 @@ _rvdk_flash_cleanup() {
             _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
         fi
         rmdir "${_RVDK_FLASH_TMP_MNT}" 2>/dev/null || true
+        _RVDK_FLASH_TMP_MNT=""
     fi
-    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
+    if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
+        declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
+    fi
+}
+
+_rvdk_flash_register_cleanup() {
+    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+        rvdk_register_cleanup _rvdk_flash_cleanup
+    elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+        trap '_rvdk_flash_cleanup' EXIT
+        trap '_rvdk_flash_cleanup; trap - EXIT INT; kill -INT $$' INT
+        trap '_rvdk_flash_cleanup; trap - EXIT TERM; kill -TERM $$' TERM
+    fi
+}
+
+_rvdk_flash_curl() {
+    local url="$1"
+    shift
+    if [[ "$url" == https://* ]]; then
+        curl --proto '=https' --tlsv1.2 "$@" "$url"
+    else
+        curl "$@" "$url"
+    fi
+}
+
+_rvdk_flash_strip_fstab_commit() {
+    awk '{
+        if ($1 !~ /^#/ && NF >= 4 && $2 == "/" && $3 == "ext4") {
+            n = split($4, opts, ",")
+            out_opts = ""
+            changed = 0
+            for (i = 1; i <= n; i++) {
+                if (opts[i] ~ /^commit=[0-9][0-9]+$/) {
+                    changed = 1
+                    continue
+                }
+                if (opts[i] == "") continue
+                out_opts = (out_opts == "" ? opts[i] : out_opts "," opts[i])
+            }
+            if (changed) {
+                if (out_opts == "") out_opts = "defaults"
+                $4 = out_opts
+            }
+        }
+        print
+    }'
+}
+
+_rvdk_udev_settle() {
+    if command -v udevadm >/dev/null 2>&1; then
+        _rvdk_run_priv udevadm settle 2>/dev/null || sleep 1
+    else
+        sleep 1
+    fi
 }
 
 rvdk_flash_list() {
@@ -188,8 +253,11 @@ _rvdk_flash_verify_sha256() {
     elif [[ "$allow_remote_sha" == "true" ]]; then
         if [[ ! -s "$sha_file" && -n "$remote_sha_url" ]]; then
             log_info "Fetching same-origin SHA-256 sidecar (${remote_sha_url}) (--allow-remote-sha256)..."
-            if ! curl -fsSL --retry 3 "$remote_sha_url" -o "${sha_file}.tmp"; then
+            _rvdk_flash_register_cleanup
+            _RVDK_TMPFILES+=("${sha_file}.tmp")
+            if ! _rvdk_flash_curl "$remote_sha_url" -fsSL --retry 3 -o "${sha_file}.tmp"; then
                 rm -f "${sha_file}.tmp"
+                declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1 && _rvdk_untrack_tmpfile "${sha_file}.tmp"
                 if [[ "$skip_sha" == "true" ]]; then
                     log_warn "SHA-256 manifest unavailable at ${remote_sha_url}; proceeding ONLY because --insecure-skip-sha256 was set."
                     return 0
@@ -197,6 +265,7 @@ _rvdk_flash_verify_sha256() {
                 log_fatal "Fail-closed security check: unable to fetch SHA-256 digest from ${remote_sha_url}. Supply --sha256 <hex> or --insecure-skip-sha256."
             fi
             mv -f "${sha_file}.tmp" "$sha_file"
+            declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1 && _rvdk_untrack_tmpfile "${sha_file}.tmp"
             chown "$owner_user" "$sha_file" 2>/dev/null || true
         fi
         if [[ -s "$sha_file" ]]; then
@@ -370,24 +439,34 @@ _rvdk_harden_ext4_superblock() {
     if [[ -n "$debugfs_bin" && -x "$debugfs_bin" ]]; then
         local cur_fstab=""
         cur_fstab="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "cat /etc/fstab" "$root_slice" 2>/dev/null || true)"
-        if grep -Eq '^[[:space:]]*[^#].*[[:space:]]/[[:space:]]+ext4[[:space:]].*commit=[0-9]{2,}' <<< "$cur_fstab"; then
-            local tmp_fstab tmp_fcmds
-            tmp_fstab="$(mktemp "/tmp/rvdk_fstab.XXXXXX")"
-            tmp_fcmds="$(mktemp "/tmp/rvdk_fcmds.XXXXXX")"
-            sed -E '/^[[:space:]]*#/! s/,commit=[0-9]{2,}//g; /^[[:space:]]*#/! s/commit=[0-9]{2,},//g' <<< "$cur_fstab" > "$tmp_fstab"
-            cat <<EOF > "$tmp_fcmds"
+        if grep -Eq '^[[:space:]]*[^#[:space:]]+[[:space:]]+/[[:space:]]+ext4[[:space:]]+[^[:space:]]*commit=[0-9]{2,}' <<< "$cur_fstab"; then
+            local stripped_fstab=""
+            stripped_fstab="$(_rvdk_flash_strip_fstab_commit <<< "$cur_fstab")"
+            if [[ "$stripped_fstab" != "$cur_fstab" ]]; then
+                _rvdk_flash_register_cleanup
+                local tmp_fstab tmp_fcmds
+                tmp_fstab="$(mktemp "/tmp/rvdk_fstab.XXXXXX")"
+                tmp_fcmds="$(mktemp "/tmp/rvdk_fcmds.XXXXXX")"
+                _RVDK_TMPFILES+=("$tmp_fstab" "$tmp_fcmds")
+                printf '%s\n' "$stripped_fstab" > "$tmp_fstab"
+                cat <<EOF > "$tmp_fcmds"
 rm /etc/fstab
 write ${tmp_fstab} /etc/fstab
 sif /etc/fstab uid 0
 sif /etc/fstab gid 0
 sif /etc/fstab mode 0100644
 EOF
-            chmod 0644 "$tmp_fstab" "$tmp_fcmds"
-            if _rvdk_dev_priv "$root_slice" "$debugfs_bin" -w -f "$tmp_fcmds" "$root_slice" >/dev/null 2>&1; then
-                sb_changed="true"
-                notes+=("-commit=600")
+                chmod 0644 "$tmp_fstab" "$tmp_fcmds"
+                if _rvdk_dev_priv "$root_slice" "$debugfs_bin" -w -f "$tmp_fcmds" "$root_slice" >/dev/null 2>&1; then
+                    sb_changed="true"
+                    notes+=("-commit=600")
+                fi
+                rm -f "$tmp_fstab" "$tmp_fcmds"
+                if declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                    _rvdk_untrack_tmpfile "$tmp_fstab"
+                    _rvdk_untrack_tmpfile "$tmp_fcmds"
+                fi
             fi
-            rm -f "$tmp_fstab" "$tmp_fcmds"
         fi
     fi
 
@@ -430,10 +509,12 @@ _rvdk_seed_ext4_rtc_floor() {
         if grep -q "Type: directory" <<< "$has_etc" \
            || grep -q "Type: directory" <<< "$has_usr_lib" \
            || grep -q "Type: directory" <<< "$has_timesync"; then
+            _rvdk_flash_register_cleanup
             local tmp_rtc tmp_empty tmp_cmds
             tmp_rtc="$(mktemp "/tmp/rvdk_rtc.XXXXXX")"
             tmp_empty="$(mktemp "/tmp/rvdk_ts.XXXXXX")"
             tmp_cmds="$(mktemp "/tmp/rvdk_dbg.XXXXXX")"
+            _RVDK_TMPFILES+=("$tmp_rtc" "$tmp_empty" "$tmp_cmds")
             printf '%s\n' "$utc_now" > "$tmp_rtc"
             : > "$tmp_empty"
             : > "$tmp_cmds"
@@ -480,6 +561,11 @@ EOF
                 seeded="true"
             fi
             rm -f "$tmp_rtc" "$tmp_empty" "$tmp_cmds"
+            if declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                _rvdk_untrack_tmpfile "$tmp_rtc"
+                _rvdk_untrack_tmpfile "$tmp_empty"
+                _rvdk_untrack_tmpfile "$tmp_cmds"
+            fi
         fi
     fi
 
@@ -572,8 +658,9 @@ _rvdk_flash_postprocess_raw() {
     fi
 
     # Linux post-flash processing (partition re-read, UUID/PARTUUID de-collision, eMMC boot0 SPL, RTC floor, e2label)
+    _rvdk_flash_register_cleanup
     _rvdk_run_priv partprobe "$block_dev" 2>/dev/null || _rvdk_run_priv blockdev --rereadpt "$block_dev" 2>/dev/null || true
-    command -v udevadm >/dev/null 2>&1 && _rvdk_run_priv udevadm settle 2>/dev/null || sleep 1
+    _rvdk_udev_settle
 
     local p_node
     for p_node in "${block_dev}"*; do
@@ -590,7 +677,7 @@ _rvdk_flash_postprocess_raw() {
             new_mbr_id="0x$(od -An -N4 -tx4 /dev/urandom 2>/dev/null | tr -d '[:space:]' || printf '7276646b')"
             if _rvdk_run_priv sfdisk --disk-id "$block_dev" "$new_mbr_id" >/dev/null 2>&1; then
                 _rvdk_run_priv partprobe "$block_dev" 2>/dev/null || _rvdk_run_priv blockdev --rereadpt "$block_dev" 2>/dev/null || true
-                command -v udevadm >/dev/null 2>&1 && _rvdk_run_priv udevadm settle 2>/dev/null || sleep 1
+                _rvdk_udev_settle
                 log_ok "Assigned unique MBR disk identifier on ${block_dev}: ${new_mbr_id} (de-colliding PARTUUID)"
             fi
         fi
@@ -714,10 +801,16 @@ _rvdk_flash_postprocess_raw() {
                 local boot0_dev="${block_dev}boot0"
                 local boot0_sys
                 boot0_sys="/sys/block/$(basename "$boot0_dev")/force_ro"
-                [[ -f "$boot0_sys" ]] && printf '0\n' | _rvdk_run_priv tee "$boot0_sys" >/dev/null
+                if [[ -f "$boot0_sys" ]]; then
+                    _RVDK_FLASH_BOOT0_SYS="$boot0_sys"
+                    printf '0\n' | _rvdk_run_priv tee "$boot0_sys" >/dev/null
+                fi
                 _rvdk_run_priv dd if="${uboot_dir}/bootinfo_emmc.bin" of="$boot0_dev" bs=512 seek=0 conv=notrunc,fsync status=none
                 _rvdk_run_priv dd if="${uboot_dir}/FSBL.bin" of="$boot0_dev" bs=512 seek=1 conv=notrunc,fsync status=none
-                [[ -f "$boot0_sys" ]] && printf '1\n' | _rvdk_run_priv tee "$boot0_sys" >/dev/null
+                if [[ -f "$boot0_sys" ]]; then
+                    printf '1\n' | _rvdk_run_priv tee "$boot0_sys" >/dev/null
+                    _RVDK_FLASH_BOOT0_SYS=""
+                fi
                 log_ok "Programmed SpacemiT/Ky eMMC BootROM SPL (${boot0_dev} <- bootinfo_emmc.bin + FSBL.bin)"
             else
                 log_warn "Could not find bootinfo_emmc.bin + FSBL.bin for ${block_dev}boot0; verify eMMC SPL before rebooting."
@@ -1070,6 +1163,8 @@ PY
     # ==========================================================================
     # 2. RESOLVE IMAGE & FAIL-CLOSED SHA-256 VERIFICATION
     # ==========================================================================
+    _rvdk_flash_register_cleanup
+
     if [[ -n "$image_path" ]]; then
         image_path="${image_path/#\~/$REAL_HOME}"
         [[ ! -f "$image_path" ]] && log_fatal "Custom image file not found: ${image_path}"
@@ -1096,23 +1191,33 @@ PY
             log_ok "Found cached upstream image: ${image_path}"
         else
             log_info "Downloading ${primary_url}..."
-            if curl -fL --retry 3 -C - "$primary_url" -o "${image_path}.part"; then
+            _RVDK_FLASH_PART_FILE="${image_path}.part"
+            if _rvdk_flash_curl "$primary_url" -fL --retry 3 -C - -o "${image_path}.part"; then
                 mv -f "${image_path}.part" "$image_path"
+                _RVDK_FLASH_PART_FILE=""
                 chown "$REAL_USER" "$image_path" 2>/dev/null || true
                 log_ok "Cached ${image_path}"
             elif [[ -n "$fallback_url" ]]; then
                 rm -f "${image_path}.part" 2>/dev/null || true
+                _RVDK_FLASH_PART_FILE=""
                 log_warn "Primary mirror unreachable; falling back to ${fallback_url}..."
                 image_path="${cache_dir}/$(basename "$fallback_url")"
                 sha_path="${image_path}.sha256"
                 active_url="$fallback_url"
                 active_pinned_sha="${cli_sha256:-$fallback_sha}"
-                curl -fL --retry 3 -C - "$fallback_url" -o "${image_path}.part"
+                _RVDK_FLASH_PART_FILE="${image_path}.part"
+                if ! _rvdk_flash_curl "$fallback_url" -fL --retry 3 -C - -o "${image_path}.part"; then
+                    rm -f "${image_path}.part" 2>/dev/null || true
+                    _RVDK_FLASH_PART_FILE=""
+                    log_fatal "Failed to download ${fallback_url}."
+                fi
                 mv -f "${image_path}.part" "$image_path"
+                _RVDK_FLASH_PART_FILE=""
                 chown "$REAL_USER" "$image_path" 2>/dev/null || true
                 log_ok "Cached fallback image ${image_path}"
             else
                 rm -f "${image_path}.part" 2>/dev/null || true
+                _RVDK_FLASH_PART_FILE=""
                 log_fatal "Failed to download ${primary_url}."
             fi
         fi
@@ -1146,7 +1251,6 @@ PY
     # ==========================================================================
     # 3. EXECUTE FLASH STRATEGY (raw vs uboot_ext4)
     # ==========================================================================
-    trap '_rvdk_flash_cleanup' EXIT INT TERM
 
     local need_sudo="true"
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then

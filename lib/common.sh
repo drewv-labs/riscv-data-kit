@@ -24,6 +24,12 @@ RVDK_MIN_VALID_EPOCH=1767225600
 if [[ -z "${_RVDK_TMPFILES+x}" ]]; then
     _RVDK_TMPFILES=()
 fi
+if [[ -z "${_RVDK_CLEANUP_HOOKS+x}" ]]; then
+    _RVDK_CLEANUP_HOOKS=()
+fi
+_RVDK_CLEANUP_RUNNING="${_RVDK_CLEANUP_RUNNING:-0}"
+_RVDK_CLEANUP_TRAP_SET="${_RVDK_CLEANUP_TRAP_SET:-0}"
+_RVDK_TRAP_SUBSHELL="${_RVDK_TRAP_SUBSHELL:-${BASH_SUBSHELL:-0}}"
 
 rvdk_log_init() {
     _RVDK_LOG_TAG="${1:-RVDK}"
@@ -44,6 +50,137 @@ _rvdk_cleanup_tmpfiles() {
     _RVDK_TMPFILES=()
 }
 
+_rvdk_untrack_tmpfile() {
+    local target="${1:-}"
+    [[ -n "$target" ]] || return 0
+    local -a kept=()
+    local _tf
+    for _tf in ${_RVDK_TMPFILES[@]+"${_RVDK_TMPFILES[@]}"}; do
+        [[ -n "$_tf" && "$_tf" != "$target" ]] && kept+=("$_tf")
+    done
+    if [[ ${#kept[@]} -gt 0 ]]; then
+        _RVDK_TMPFILES=("${kept[@]}")
+    else
+        _RVDK_TMPFILES=()
+    fi
+}
+
+_rvdk_push_cleanup_hook() {
+    local fn="${1:-}"
+    [[ "$fn" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    local existing
+    for existing in ${_RVDK_CLEANUP_HOOKS[@]+"${_RVDK_CLEANUP_HOOKS[@]}"}; do
+        [[ "$existing" == "$fn" ]] && return 0
+    done
+    _RVDK_CLEANUP_HOOKS+=("$fn")
+    return 0
+}
+
+_rvdk_run_cleanup_hooks() {
+    local rc=$?
+    if [[ "${_RVDK_CLEANUP_RUNNING:-0}" == "1" ]]; then
+        return "$rc"
+    fi
+    _RVDK_CLEANUP_RUNNING=1
+
+    if [[ -n "${_RVDK_CLEANUP_HOOKS+x}" ]]; then
+        local -a _hooks=()
+        local _h
+        for _h in ${_RVDK_CLEANUP_HOOKS[@]+"${_RVDK_CLEANUP_HOOKS[@]}"}; do
+            _hooks+=("$_h")
+        done
+        local i hook
+        for (( i = ${#_hooks[@]} - 1; i >= 0; i-- )); do
+            hook="${_hooks[$i]:-}"
+            if [[ -n "$hook" ]] && declare -F "$hook" >/dev/null 2>&1; then
+                "$hook" || true
+            fi
+        done
+    fi
+
+    _rvdk_cleanup_tmpfiles || true
+    return "$rc"
+}
+
+_rvdk_on_signal() {
+    local sig="${1:-TERM}"
+    local sig_rc=130
+    if [[ "$sig" == "TERM" ]]; then
+        sig_rc=143
+    fi
+    _rvdk_run_cleanup_hooks || true
+    trap - "$sig"
+    kill -s "$sig" "${BASHPID:-$$}" 2>/dev/null || kill "-${sig}" "$$" 2>/dev/null || exit "$sig_rc"
+}
+
+_rvdk_reset_subshell_trap_state() {
+    local cur_subshell="${BASH_SUBSHELL:-0}"
+    if (( cur_subshell > 0 )) && [[ "${_RVDK_TRAP_SUBSHELL:-0}" != "$cur_subshell" ]]; then
+        _RVDK_CLEANUP_HOOKS=()
+        _RVDK_TMPFILES=()
+        _RVDK_CLEANUP_RUNNING=0
+        _RVDK_CLEANUP_TRAP_SET=0
+        _RVDK_TRAP_SUBSHELL="$cur_subshell"
+    fi
+}
+
+_rvdk_install_cleanup_trap() {
+    local force_install="${1:-false}"
+    local cur_subshell="${BASH_SUBSHELL:-0}"
+    _rvdk_reset_subshell_trap_state
+
+    local trap_fn_re="^trap -- '([A-Za-z_][A-Za-z0-9_]*)' EXIT\$"
+    if [[ "${_RVDK_CLEANUP_TRAP_SET:-0}" == "1" ]]; then
+        if (( cur_subshell == 0 )); then
+            local cur_exit_trap=""
+            cur_exit_trap="$(trap -p EXIT 2>/dev/null || true)"
+            if [[ "$cur_exit_trap" == *"_rvdk_run_cleanup_hooks"* ]]; then
+                return 0
+            fi
+            if [[ "$cur_exit_trap" =~ $trap_fn_re ]]; then
+                local ext_fn="${BASH_REMATCH[1]}"
+                if [[ "$ext_fn" != "_rvdk_run_cleanup_hooks" && "$ext_fn" != "_rvdk_cleanup_tmpfiles" ]] && declare -F "$ext_fn" >/dev/null 2>&1; then
+                    _rvdk_push_cleanup_hook "$ext_fn" || true
+                fi
+            elif [[ -n "$cur_exit_trap" && "$force_install" != "true" ]]; then
+                return 0
+            fi
+        else
+            return 0
+        fi
+    elif (( cur_subshell == 0 )); then
+        local pre_exit_trap=""
+        pre_exit_trap="$(trap -p EXIT 2>/dev/null || true)"
+        if [[ -n "$pre_exit_trap" ]]; then
+            if [[ "$pre_exit_trap" =~ $trap_fn_re ]]; then
+                local pre_fn="${BASH_REMATCH[1]}"
+                if [[ "$pre_fn" != "_rvdk_run_cleanup_hooks" && "$pre_fn" != "_rvdk_cleanup_tmpfiles" ]] && declare -F "$pre_fn" >/dev/null 2>&1; then
+                    _rvdk_push_cleanup_hook "$pre_fn" || true
+                fi
+            elif [[ "$force_install" != "true" ]]; then
+                return 0
+            fi
+        fi
+    fi
+
+    _RVDK_CLEANUP_TRAP_SET=1
+    _RVDK_TRAP_SUBSHELL="$cur_subshell"
+    trap '_rvdk_run_cleanup_hooks' EXIT
+    trap '_rvdk_on_signal INT' INT
+    trap '_rvdk_on_signal TERM' TERM
+    return 0
+}
+
+# Register an idempotent cleanup hook to run in LIFO order on EXIT/INT/TERM.
+# Usage: rvdk_register_cleanup <fn_name>
+rvdk_register_cleanup() {
+    local fn="${1:-}"
+    [[ -n "$fn" ]] || return 1
+    _rvdk_reset_subshell_trap_state
+    _rvdk_push_cleanup_hook "$fn" || return 1
+    _rvdk_install_cleanup_trap "true"
+}
+
 # Atomically write stdin to <target_path> via same-directory temp file + mv -f.
 # Usage: rvdk_atomic_write <target_path> <octal_mode> [<owner:group>]
 rvdk_atomic_write() {
@@ -51,29 +188,31 @@ rvdk_atomic_write() {
     local file_mode="${2:-0644}"
     local owner_group="${3:-}"
 
+    if [[ -d "$target_path" ]]; then
+        log_err "rvdk_atomic_write: target '${target_path}' is a directory"
+        return 1
+    fi
+
     local dir base tmp_file
     dir="$(dirname "$target_path")"
     base="$(basename "$target_path")"
     mkdir -p "$dir"
 
-    if [[ "${_RVDK_TMP_TRAP_SET:-0}" != "1" ]]; then
-        _RVDK_TMP_TRAP_SET="1"
-        if [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
-            trap '_rvdk_cleanup_tmpfiles' EXIT
-            trap '_rvdk_cleanup_tmpfiles; trap - INT; kill -INT $$' INT
-            trap '_rvdk_cleanup_tmpfiles; trap - TERM; kill -TERM $$' TERM
-        fi
-    fi
+    _rvdk_install_cleanup_trap "false"
 
     tmp_file="$(mktemp "${dir}/.${base}.rvdk.XXXXXX")"
     _RVDK_TMPFILES+=("$tmp_file")
 
-    cat > "$tmp_file"
-    chmod "$file_mode" "$tmp_file"
-    if [[ -n "$owner_group" ]]; then
-        chown "$owner_group" "$tmp_file"
+    if ! cat > "$tmp_file" \
+        || ! chmod "$file_mode" "$tmp_file" \
+        || { [[ -n "$owner_group" ]] && ! chown "$owner_group" "$tmp_file"; } \
+        || ! mv -f "$tmp_file" "$target_path"; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        _rvdk_untrack_tmpfile "$tmp_file"
+        return 1
     fi
-    mv -f "$tmp_file" "$target_path"
+    _rvdk_untrack_tmpfile "$tmp_file"
+    return 0
 }
 
 # Escalate to root via sudo if EUID != 0 (while allowing unprivileged -h/--help inspection)
@@ -211,8 +350,7 @@ rvdk_kv_load() {
         [[ "$allowed_list" == *" ${key} "* ]] || continue
 
         if [[ "$preserve" == "true" ]]; then
-            local _cur_set=""
-            eval "_cur_set=\"\${${key}:-}\""
+            local _cur_set="${!key:-}"
             if [[ -n "$_cur_set" ]]; then
                 continue
             fi

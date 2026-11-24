@@ -202,6 +202,8 @@ SECONDARY_MOUNT_POINT="$(rvdk_normalize_mount_path "$SECONDARY_MOUNT_POINT")"
 [[ "$SECONDARY_LV_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || log_fatal "Invalid --secondary-lv '${SECONDARY_LV_NAME}'."
 
 [[ ! -b "$NVME_DEV" ]] && log_fatal "NVMe block device not found: ${NVME_DEV}"
+NVME_DEV="$(readlink -f "$NVME_DEV")"
+[[ ! -b "$NVME_DEV" ]] && log_fatal "NVMe block device not found after canonicalization: ${NVME_DEV}"
 if rvdk_device_backs_os_or_swap "$NVME_DEV"; then
     log_fatal "Safety Interlock: ${NVME_DEV} backs a critical OS filesystem or active SWAP! Aborting."
 fi
@@ -314,8 +316,68 @@ if [[ -z "$EXISTING_FS_DEV" || "$EXISTING_FS_TYPE" != "$NVME_FSTYPE" || "$FORCE_
     rvdk_assert_device_safe_to_wipe "$NVME_DEV" "$FORCE_WIPE" "${FS_LABEL},${EFFECTIVE_PRI_LABEL},${SECONDARY_FS_LABEL},RVDK_NVME,RVDK_SECONDARY,NFS_VAULT"
 fi
 
+_nvme_ensure_unmounted() {
+    local dev_scope="$1"
+    shift || true
+    local -a mnt_targets=()
+    local mp _desc_mnt _sorted_mnt
+
+    for mp in "$@"; do
+        [[ -n "$mp" ]] && mnt_targets+=("$mp")
+    done
+
+    if [[ -n "$dev_scope" && -b "$dev_scope" ]]; then
+        while IFS= read -r _desc_mnt; do
+            [[ -n "$_desc_mnt" && "$_desc_mnt" == /* ]] && mnt_targets+=("$_desc_mnt")
+        done < <(lsblk -rn -o MOUNTPOINT "$dev_scope" 2>/dev/null || true)
+    fi
+
+    if (( ${#mnt_targets[@]} > 0 )); then
+        while IFS= read -r _sorted_mnt; do
+            [[ -n "$_sorted_mnt" ]] || continue
+            if mountpoint -q "$_sorted_mnt" 2>/dev/null; then
+                umount "$_sorted_mnt" 2>/dev/null || true
+            fi
+        done < <(printf '%s\n' "${mnt_targets[@]}" | awk '!seen[$0]++ { printf "%d\t%s\n", length($0), $0 }' | sort -rn -k1,1 | cut -f2-)
+    fi
+
+    for mp in "$@"; do
+        [[ -n "$mp" ]] || continue
+        if mountpoint -q "$mp" 2>/dev/null; then
+            log_fatal "Cannot proceed: mountpoint '${mp}' is still mounted/busy."
+        fi
+    done
+
+    if [[ -n "$dev_scope" && -b "$dev_scope" ]]; then
+        while IFS= read -r _desc_mnt; do
+            [[ -z "$_desc_mnt" ]] && continue
+            log_fatal "Cannot proceed: ${dev_scope} still has busy/mounted descendant '${_desc_mnt}'."
+        done < <(lsblk -rn -o MOUNTPOINT "$dev_scope" 2>/dev/null || true)
+    fi
+}
+
+_nvme_deactivate_vg_if_exists() {
+    local vg="$1"
+    if command -v vgs >/dev/null 2>&1 && vgs "$vg" >/dev/null 2>&1; then
+        if [[ "$USE_LVM" == "true" ]] || rvdk_vg_exclusively_on_disk "$vg" "$NVME_DEV"; then
+            if ! vgchange -an "$vg"; then
+                log_fatal "Failed to deactivate LVM Volume Group '${vg}' before modifying ${NVME_DEV}."
+            fi
+        fi
+    fi
+}
+
+_nvme_wipe_partitions() {
+    local dev="$1" _part
+    while IFS= read -r _part; do
+        [[ -n "$_part" && -b "$_part" ]] || continue
+        wipefs -af "$_part" >/dev/null
+    done < <(lsblk -rn -o PATH,TYPE "$dev" 2>/dev/null | awk '$2 == "part" {print $1}' || true)
+}
+
 # 2. Verify or Convert to Native 4096-Byte (4Kn) Hardware LBA Sectors (ms:0 ONLY)
 rvdk_prog 35 "NVMe 4Kn: checking 4096B LBA sector geometry..."
+[[ -r "/sys/block/${NVME_SHORT}/queue/logical_block_size" ]] || log_fatal "Target --device '${NVME_DEV}' is not a whole block device (missing /sys/block/${NVME_SHORT}/queue/logical_block_size)."
 CUR_LBA="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
 if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_WIPE" == "false" ]]; then
     if [[ "$CUR_LBA" == "4096" ]]; then
@@ -325,9 +387,8 @@ if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_
     fi
 else
     if [[ "$CUR_LBA" != "4096" || "$FORCE_WIPE" == "true" ]]; then
-        umount -f "$MOUNT_POINT" 2>/dev/null || true
-        umount -f "$SECONDARY_MOUNT_POINT" 2>/dev/null || true
-        vgchange -an "$VG_NAME" 2>/dev/null || true
+        _nvme_ensure_unmounted "$NVME_DEV" "$MOUNT_POINT" "$SECONDARY_MOUNT_POINT"
+        _nvme_deactivate_vg_if_exists "$VG_NAME"
 
         # Strictly require ms:0 (zero out-of-band metadata bytes) so Linux block layer never rejects T10-DIF LBA formats
         LBA_4K_IDX="$(nvme id-ns "$NVME_DEV" 2>/dev/null | awk '/lbads:12/ && /ms:0([[:space:]]|$)/ {print $2}' | tr -dc '0-9' | head -n1 || true)"
@@ -357,22 +418,24 @@ if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_
     TARGET_BLOCK_DEV="$EXISTING_FS_DEV"
     log_skip "${FSTYPE_UPPER} volume '${EFFECTIVE_PRI_LABEL}' already converged at ${TARGET_BLOCK_DEV}"
 else
-    umount -f "$MOUNT_POINT" 2>/dev/null || true
-
     if [[ "$USE_LVM" == "true" && -b "/dev/${VG_NAME}/${LV_NAME}" && "$FORCE_WIPE" == "false" ]] \
        && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${LV_NAME}" "$NVME_DEV" \
        && [[ -z "$(blkid -s TYPE -o value "/dev/${VG_NAME}/${LV_NAME}" 2>/dev/null || true)" ]]; then
         TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
+        _nvme_ensure_unmounted "$TARGET_BLOCK_DEV" "$MOUNT_POINT"
         log_warn "Formatting uninitialized LVM volume ${TARGET_BLOCK_DEV} as ${NVME_FSTYPE}..."
-        wipefs -af "$TARGET_BLOCK_DEV" >/dev/null 2>&1 || true
+        wipefs -af "$TARGET_BLOCK_DEV" >/dev/null
     elif [[ "$USE_LVM" == "true" ]]; then
-        umount -f "$SECONDARY_MOUNT_POINT" 2>/dev/null || true
+        _nvme_ensure_unmounted "$NVME_DEV" "$MOUNT_POINT" "$SECONDARY_MOUNT_POINT"
+        _nvme_deactivate_vg_if_exists "$VG_NAME"
         log_info "Building LVM Volume Group (${VG_NAME}/${LV_NAME} @ ${EFFECTIVE_PRI_PCT}) on ${NVME_DEV}..."
         if vgs "$VG_NAME" >/dev/null 2>&1; then
-            vgremove -ff -y "$VG_NAME" 2>/dev/null || true
+            vgremove -ff -y "$VG_NAME"
         fi
-        pvremove -ff -y "$NVME_DEV" 2>/dev/null || true
-        for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+        if pvs "$NVME_DEV" >/dev/null 2>&1; then
+            pvremove -ff -y "$NVME_DEV"
+        fi
+        _nvme_wipe_partitions "$NVME_DEV"
         wipefs -af "$NVME_DEV"
         partprobe "$NVME_DEV" 2>/dev/null || true
 
@@ -382,14 +445,20 @@ else
         TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
         log_ok "Created LVM Logical Volume ${TARGET_BLOCK_DEV} (${EFFECTIVE_PRI_PCT})"
     else
+        _nvme_ensure_unmounted "$NVME_DEV" "$MOUNT_POINT" "$SECONDARY_MOUNT_POINT"
+        _nvme_deactivate_vg_if_exists "$VG_NAME"
         log_info "Creating GPT partition layout on ${NVME_DEV}..."
-        for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+        _nvme_wipe_partitions "$NVME_DEV"
         wipefs -af "$NVME_DEV"
         parted -s "$NVME_DEV" mklabel gpt
         parted -s -a optimal "$NVME_DEV" mkpart primary "$NVME_FSTYPE" 1MiB 100%
         partprobe "$NVME_DEV" 2>/dev/null || true
         udevadm settle && sleep 2
-        TARGET_BLOCK_DEV="${NVME_DEV}p1"
+        if [[ "$NVME_DEV" =~ [0-9]$ ]]; then
+            TARGET_BLOCK_DEV="${NVME_DEV}p1"
+        else
+            TARGET_BLOCK_DEV="${NVME_DEV}1"
+        fi
     fi
 
     rvdk_prog 70 "NVMe 4Kn: mkfs.${NVME_FSTYPE} (${FS_LABEL})..."
@@ -410,28 +479,41 @@ converge_fstab_entry() {
     local mnt="$2"
     local fstype="$3"
     local entry="$4"
-    local cur_fstab="" want_fstab=""
+    local fstab_file="${5:-/etc/fstab}"
+    local want_fstab=""
 
-    [[ -f /etc/fstab ]] && cur_fstab="$(cat /etc/fstab)"
-    want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
-        /^[[:space:]]*#/ || NF < 2 { print; next }
-        {
-            m = $2
-            while (length(m) > 1 && substr(m, length(m), 1) == "/") {
-                m = substr(m, 1, length(m) - 1)
+    if [[ -s "$fstab_file" ]]; then
+        want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
+            BEGIN { replaced = 0 }
+            /^[[:space:]]*#/ || NF < 2 { print; next }
+            {
+                m = $2
+                while (length(m) > 1 && substr(m, length(m), 1) == "/") {
+                    m = substr(m, 1, length(m) - 1)
+                }
+                if ($1 == sp || m == mp) {
+                    if (!replaced) {
+                        print line
+                        replaced = 1
+                    }
+                    next
+                }
+                print
             }
-            if ($1 == sp || m == mp) next
-            print
-        }
-        END { print line }
-    ' <<< "$cur_fstab")"
-
-    if [[ -f /etc/fstab ]] && printf '%s\n' "$want_fstab" | cmp -s - /etc/fstab 2>/dev/null; then
-        log_skip "${mnt} (${fstype}) already in /etc/fstab"
+            END { if (!replaced) print line }
+        ' "$fstab_file")"
     else
-        printf '%s\n' "$want_fstab" | rvdk_atomic_write /etc/fstab 0644
-        systemctl daemon-reload
-        log_ok "Persisted ${spec} -> ${mnt} (${fstype}) in /etc/fstab"
+        want_fstab="$entry"
+    fi
+
+    if [[ -f "$fstab_file" ]] && printf '%s\n' "$want_fstab" | cmp -s - "$fstab_file" 2>/dev/null; then
+        log_skip "${mnt} (${fstype}) already in ${fstab_file}"
+    else
+        printf '%s\n' "$want_fstab" | rvdk_atomic_write "$fstab_file" 0644
+        if [[ "$fstab_file" == "/etc/fstab" ]]; then
+            systemctl daemon-reload
+        fi
+        log_ok "Persisted ${spec} -> ${mnt} (${fstype}) in ${fstab_file}"
     fi
 }
 
@@ -502,9 +584,9 @@ if [[ "$WITH_SECONDARY_LV" == "true" && "$USE_LVM" == "true" ]]; then
     elif [[ -b "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" ]] \
          && rvdk_block_resides_on_disk "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" "$NVME_DEV" \
          && { [[ "$FORCE_WIPE" == "true" ]] || [[ -z "$(blkid -s TYPE -o value "/dev/${VG_NAME}/${SECONDARY_LV_NAME}" 2>/dev/null || true)" ]]; }; then
-        umount -f "$SECONDARY_MOUNT_POINT" 2>/dev/null || true
         SEC_BLOCK_DEV="/dev/${VG_NAME}/${SECONDARY_LV_NAME}"
-        wipefs -af "$SEC_BLOCK_DEV" >/dev/null 2>&1 || true
+        _nvme_ensure_unmounted "$SEC_BLOCK_DEV" "$SECONDARY_MOUNT_POINT"
+        wipefs -af "$SEC_BLOCK_DEV" >/dev/null
         if [[ "$SEC_FSTYPE" == "btrfs" ]]; then
             mkfs.btrfs -f -L "$SECONDARY_FS_LABEL" "$SEC_BLOCK_DEV"
             btrfs device scan >/dev/null 2>&1 || true

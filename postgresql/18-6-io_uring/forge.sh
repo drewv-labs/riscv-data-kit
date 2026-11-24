@@ -94,6 +94,14 @@ if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
     fi
 fi
 
+if ! declare -F rvdk_validate_abs_path >/dev/null 2>&1; then
+    rvdk_validate_abs_path() {
+        local p="${1:-}"
+        [[ -n "$p" && "$p" != *$'\n'* && "$p" != *$'\r'* ]] || return 1
+        [[ "$p" =~ ^/[A-Za-z0-9._/-]+$ && ! "$p" =~ (^|/)\.\.(/|$) ]]
+    }
+fi
+
 rvdk_log_init "RVDK:PG18"
 
 usage() {
@@ -191,6 +199,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$SKIP_BUNDLE_SHA" == "true" ]]; then
+    log_warn "SECURITY WARNING: --insecure-skip-sha256 enabled — prebuilt bundle SHA-256 verification is DISABLED!"
+fi
+
 DATA_MOUNT="$(rvdk_resolve_data_mount "$EXPLICIT_DATA_MOUNT")"
 
 # Validate optional tablespace specifications upfront
@@ -233,17 +245,39 @@ run_as_user() {
 }
 
 _PG_TMP_ARCHIVE=""
+_PG_TMP_KEY=""
+_PG_MIGRATING_DIR=""
 _PG_BUILD_ACTIVE="false"
 PG_LIB_ROOT="/var/lib/rvdk/pgdg-riscv64"
 BUILD_DIR="${PG_LIB_ROOT}/build"
 _rvdk_pg_cleanup() {
-    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
+    if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
+        declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
+    fi
     [[ -n "$_PG_TMP_ARCHIVE" ]] && rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256" 2>/dev/null || true
+    [[ -n "$_PG_TMP_KEY" ]] && rm -f "$_PG_TMP_KEY" 2>/dev/null || true
+    [[ -n "$_PG_MIGRATING_DIR" && -d "$_PG_MIGRATING_DIR" ]] && rm -rf "$_PG_MIGRATING_DIR" 2>/dev/null || true
     if [[ "$_PG_BUILD_ACTIVE" == "true" && "$KEEP_BUILD_DIR" != "true" && -d "$BUILD_DIR" ]]; then
         rm -rf "$BUILD_DIR" 2>/dev/null || true
     fi
 }
-trap '_rvdk_pg_cleanup' EXIT INT TERM
+if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+    rvdk_register_cleanup _rvdk_pg_cleanup
+elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+    trap '_rvdk_pg_cleanup' EXIT
+    trap '_rvdk_pg_cleanup; trap - EXIT INT; kill -INT $$' INT
+    trap '_rvdk_pg_cleanup; trap - EXIT TERM; kill -TERM $$' TERM
+fi
+
+_pg_curl() {
+    local url="$1"
+    shift
+    if [[ "$url" == https://* ]]; then
+        curl --proto '=https' --tlsv1.2 "$@" "$url"
+    else
+        curl "$@" "$url"
+    fi
+}
 
 rvdk_prog_init "PG 18.6: detecting RISC-V silicon profile..."
 
@@ -352,9 +386,9 @@ else
                 rvdk_prog 35 "PG 18.6: pulling ${TARGET_SLUG} io_uring binary bundle..."
                 log_info "Pulling precompiled ${TARGET_SLUG} bundle from ${BUNDLE_URL}..."
                 _PG_TMP_ARCHIVE="$(mktemp /tmp/rvdk-pg18-bundle.XXXXXX.tar.zst)"
-                if curl -fL --retry 3 "$BUNDLE_URL" -o "$_PG_TMP_ARCHIVE"; then
+                if _pg_curl "$BUNDLE_URL" -fL --retry 3 -o "$_PG_TMP_ARCHIVE"; then
                     if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" ]]; then
-                        if curl -fsSL --retry 3 "${BUNDLE_URL}.sha256" -o "${_PG_TMP_ARCHIVE}.sha256"; then
+                        if _pg_curl "${BUNDLE_URL}.sha256" -fsSL --retry 3 -o "${_PG_TMP_ARCHIVE}.sha256"; then
                             EXPECTED_BUNDLE_SHA="$(awk '{print tolower($1); exit}' "${_PG_TMP_ARCHIVE}.sha256")"
                         elif [[ "$SKIP_BUNDLE_SHA" != "true" ]]; then
                             rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256"
@@ -398,15 +432,17 @@ else
         PGDG_KEY_PATH="/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
         PGDG_EXPECTED_FPR="B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
         install -d -m 0755 /usr/share/postgresql-common/pgdg
-        TMP_KEY="$(mktemp)"
-        curl -fsSL --retry 3 https://www.postgresql.org/media/keys/ACCC4CF8.asc -o "$TMP_KEY"
-        ACTUAL_FPR="$(gpg --batch --with-colons --import-options import-show --dry-run --import "$TMP_KEY" 2>/dev/null | awk -F: '$1 == "fpr" {print toupper($10); exit}')"
+        _PG_TMP_KEY="$(mktemp)"
+        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 https://www.postgresql.org/media/keys/ACCC4CF8.asc -o "$_PG_TMP_KEY"
+        ACTUAL_FPR="$(gpg --batch --with-colons --import-options import-show --dry-run --import "$_PG_TMP_KEY" 2>/dev/null | awk -F: '$1 == "fpr" {print toupper($10); exit}')"
         if [[ "$ACTUAL_FPR" != "$PGDG_EXPECTED_FPR" ]]; then
-            rm -f "$TMP_KEY"
+            rm -f "$_PG_TMP_KEY"
+            _PG_TMP_KEY=""
             log_fatal "PGDG GPG key fingerprint mismatch! Expected ${PGDG_EXPECTED_FPR}, got '${ACTUAL_FPR:-none}'."
         fi
-        rvdk_atomic_write "$PGDG_KEY_PATH" 0644 < "$TMP_KEY"
-        rm -f "$TMP_KEY"
+        rvdk_atomic_write "$PGDG_KEY_PATH" 0644 < "$_PG_TMP_KEY"
+        rm -f "$_PG_TMP_KEY"
+        _PG_TMP_KEY=""
         log_ok "Verified PGDG signing key fingerprint (${PGDG_EXPECTED_FPR})"
 
         CODENAME="$(lsb_release -cs 2>/dev/null || awk -F= '/^VERSION_CODENAME=/ {gsub(/["'\'']/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || echo sid)"
@@ -517,11 +553,26 @@ fi
 CLUSTER_MIGRATED="false"
 if [[ -n "$DATA_MOUNT" ]] && mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
     TARGET_PGDATA="${DATA_MOUNT}/postgresql/${PG_VERSION}/main"
-    if [[ ! -f "${TARGET_PGDATA}/PG_VERSION" ]]; then
+    if [[ -f "${TARGET_PGDATA}/PG_VERSION" ]]; then
+        log_skip "PostgreSQL cluster already initialized at ${TARGET_PGDATA}"
+    else
+        if [[ -e "$TARGET_PGDATA" || -L "$TARGET_PGDATA" ]]; then
+            if [[ -d "$TARGET_PGDATA" && ! -L "$TARGET_PGDATA" && -z "$(ls -A "$TARGET_PGDATA" 2>/dev/null)" ]]; then
+                rmdir "$TARGET_PGDATA"
+            else
+                log_fatal "Target PGDATA '${TARGET_PGDATA}' already exists without PG_VERSION; refusing to overwrite."
+            fi
+        fi
         rvdk_prog 72 "PG 18.6: migrating PGDATA cluster to ${TARGET_PGDATA}..."
         systemctl stop postgresql
-        install -d -m 0700 -o postgres -g postgres "$TARGET_PGDATA"
-        rsync -a "/var/lib/postgresql/${PG_VERSION}/main/" "${TARGET_PGDATA}/"
+        install -d -m 0755 -o postgres -g postgres "${DATA_MOUNT}/postgresql" "$(dirname "$TARGET_PGDATA")"
+        _PG_MIGRATING_DIR="${TARGET_PGDATA}.migrating"
+        rm -rf "$_PG_MIGRATING_DIR"
+        install -d -m 0700 -o postgres -g postgres "$_PG_MIGRATING_DIR"
+        rsync -a --delete "/var/lib/postgresql/${PG_VERSION}/main/" "${_PG_MIGRATING_DIR}/"
+        sync
+        mv "$_PG_MIGRATING_DIR" "$TARGET_PGDATA"
+        _PG_MIGRATING_DIR=""
         CLUSTER_MIGRATED="true"
         log_ok "Migrated PostgreSQL cluster to ${TARGET_PGDATA}"
     fi

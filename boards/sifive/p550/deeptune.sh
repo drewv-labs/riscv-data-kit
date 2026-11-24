@@ -32,6 +32,7 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
     else
         log_info()  { printf "\033[1;36m[RVDK:P550-DEEPTUNE]\033[0m %s\n" "$1"; }
         log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
         log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
         rvdk_log_init() { :; }
     fi
@@ -110,12 +111,39 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     fi
 fi
 
+_p550_fusb_converged() {
+    local modprobe_conf="/etc/modprobe.d/90-rvdk-p550-fusb303b.conf"
+    local d
+    [[ -f "$modprobe_conf" && ! -L "$modprobe_conf" ]] || return 1
+    grep -qs '^blacklist fusb303b$' "$modprobe_conf" 2>/dev/null || return 1
+    if awk '$1 == "fusb303b" { found=1 } END { exit !found }' /proc/modules 2>/dev/null; then
+        return 1
+    fi
+    if [[ -d /sys/bus/i2c/drivers/fusb303b ]]; then
+        for d in /sys/bus/i2c/drivers/fusb303b/[0-9]*-*; do
+            [[ -e "$d" ]] && return 1
+        done
+    fi
+    if ps -eo comm 2>/dev/null | awk '$1 ~ /^irq\/[0-9]+-fusb303/ { found=1 } END { exit !found }'; then
+        return 1
+    fi
+    return 0
+}
+
 rvdk_prog_init "P550 Carrier DeepTune: suppressing HF106C front-panel USB-C IRQ..."
 log_info "Converging SiFive Premier P550 Carrier DeepTune (HDMI crashcart preserved)..."
 
 if [[ -n "$FUSB_QUIRK" && -f "$FUSB_QUIRK" ]]; then
+    FUSB_WAS_CONVERGED="false"
+    if _p550_fusb_converged; then
+        FUSB_WAS_CONVERGED="true"
+    fi
     bash "$FUSB_QUIRK" off --quiet ${FORCE_ARG[@]+"${FORCE_ARG[@]}"}
-    log_ok "Disabled & blacklisted HF106C front-panel Type-C controller (fusb303b; restore via 'sudo rvdk quirk fusb on')"
+    if [[ "$FUSB_WAS_CONVERGED" == "true" ]]; then
+        log_skip "HF106C front-panel Type-C controller (fusb303b) already disabled & blacklisted"
+    else
+        log_ok "Disabled & blacklisted HF106C front-panel Type-C controller (fusb303b; restore via 'sudo rvdk quirk fusb on')"
+    fi
 fi
 
 rvdk_prog 100 "P550 Carrier DeepTune complete"

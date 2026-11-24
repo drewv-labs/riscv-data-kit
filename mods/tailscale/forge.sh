@@ -79,7 +79,8 @@ Options:
   --up                         Run `tailscale up` after daemon convergence
   --ssh                        Enable Tailscale SSH (`--ssh`)
   --qr                         Display QR login code during `tailscale up`
-  --authkey <tskey-...>        Authenticate non-interactively via ephemeral file
+  --authkey <tskey-...>        Authenticate non-interactively (prefer --authkey-file or TS_AUTHKEY env)
+  --authkey-file <path>        Read Tailscale authkey from file (avoids argv exposure)
   --advertise-routes <CIDRs>   Comma-separated IPv4/IPv6 subnet routes to advertise
   --exit-node                  Advertise node as a Tailnet exit node
   --accept-routes              Accept subnet routes advertised by peers
@@ -110,12 +111,20 @@ _TS_TMP_EXTRACT=""
 _TS_TMP_TGZ=""
 _TS_KEY_FILE=""
 _rvdk_ts_cleanup() {
-    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
+    if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
+        declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
+    fi
     [[ -n "$_TS_KEY_FILE" ]] && rm -f "$_TS_KEY_FILE" 2>/dev/null || true
     [[ -n "$_TS_TMP_TGZ" ]] && rm -f "$_TS_TMP_TGZ" 2>/dev/null || true
     [[ -n "$_TS_TMP_EXTRACT" && -d "$_TS_TMP_EXTRACT" ]] && rm -rf "$_TS_TMP_EXTRACT" 2>/dev/null || true
 }
-trap '_rvdk_ts_cleanup' EXIT INT TERM
+if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+    rvdk_register_cleanup _rvdk_ts_cleanup
+elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+    trap '_rvdk_ts_cleanup' EXIT
+    trap '_rvdk_ts_cleanup; trap - EXIT INT; kill -INT $$' INT
+    trap '_rvdk_ts_cleanup; trap - EXIT TERM; kill -TERM $$' TERM
+fi
 
 TRACK="${TAILSCALE_TRACK:-stable}"
 TS_PORT="${TAILSCALE_PORT:-41641}"
@@ -123,6 +132,7 @@ REQUESTED_TUN="auto"          # auto | kernel | userspace
 FORCE_REINSTALL="false"
 WANT_UP="false"
 TS_AUTHKEY_VAL="${TS_AUTHKEY:-${TAILSCALE_AUTHKEY:-}}"
+TS_AUTHKEY_FILE="${TS_AUTHKEY_FILE:-${TAILSCALE_AUTHKEY_FILE:-}}"
 TS_SSH="false"
 TS_QR="false"
 TS_ACCEPT_ROUTES="false"
@@ -147,6 +157,7 @@ while [[ $# -gt 0 ]]; do
         --force|--upgrade|--reinstall)  FORCE_REINSTALL="true"; shift ;;
         --up|--login)                   WANT_UP="true"; shift ;;
         --authkey|--auth-key)           _require_arg "$1" "${2:-}"; TS_AUTHKEY_VAL="$2"; WANT_UP="true"; shift 2 ;;
+        --authkey-file|--auth-key-file) _require_arg "$1" "${2:-}"; TS_AUTHKEY_FILE="$2"; WANT_UP="true"; shift 2 ;;
         --ssh)                          TS_SSH="true"; WANT_UP="true"; shift ;;
         --qr)                           TS_QR="true"; WANT_UP="true"; shift ;;
         --accept-routes)                TS_ACCEPT_ROUTES="true"; WANT_UP="true"; shift ;;
@@ -162,6 +173,15 @@ while [[ $# -gt 0 ]]; do
         *)                              log_fatal "Unknown argument: $1 (try --help)" ;;
     esac
 done
+
+if [[ -n "$TS_AUTHKEY_FILE" ]]; then
+    [[ -L "$TS_AUTHKEY_FILE" ]] && log_fatal "--authkey-file '${TS_AUTHKEY_FILE}' must not be a symlink."
+    [[ -f "$TS_AUTHKEY_FILE" && -r "$TS_AUTHKEY_FILE" ]] || log_fatal "Cannot read --authkey-file '${TS_AUTHKEY_FILE}'."
+    TS_AUTHKEY_VAL="$(tr -d '\r\n' < "$TS_AUTHKEY_FILE")"
+    TS_AUTHKEY_VAL="${TS_AUTHKEY_VAL#"${TS_AUTHKEY_VAL%%[![:space:]]*}"}"
+    TS_AUTHKEY_VAL="${TS_AUTHKEY_VAL%"${TS_AUTHKEY_VAL##*[![:space:]]}"}"
+    [[ -n "$TS_AUTHKEY_VAL" ]] || log_fatal "--authkey-file '${TS_AUTHKEY_FILE}' is empty."
+fi
 
 [[ -n "$TS_AUTHKEY_VAL" ]] && WANT_UP="true"
 
@@ -218,7 +238,7 @@ fi
 # 2. Query Latest Official Tailscale Release Metadata
 rvdk_prog 20 "Tailscale: querying ${TRACK} ${TARBALL_ARCH} release metadata..."
 META_URL="https://pkgs.tailscale.com/${TRACK}/?mode=json&os=linux"
-META_JSON="$(curl -fsSL --retry 3 "$META_URL")" || log_fatal "Failed to query ${META_URL}"
+META_JSON="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$META_URL")" || log_fatal "Failed to query ${META_URL}"
 
 TS_VERSION="$(jq -r '.TarballsVersion // .Version // empty' <<< "$META_JSON")"
 TGZ_NAME="$(jq -r ".Tarballs.\"${TARBALL_ARCH}\" // empty" <<< "$META_JSON")"
@@ -243,7 +263,7 @@ else
     CACHED_TGZ="${CACHE_DIR}/${TGZ_NAME}"
 
     rvdk_prog 30 "Tailscale: fetching SHA-256 digest for ${TGZ_NAME}..."
-    EXPECTED_SHA="$(curl -fsSL --retry 3 "$SHA_URL" | awk '{print $1}' | tr -dc '0-9a-fA-F' | tr '[:upper:]' '[:lower:]')"
+    EXPECTED_SHA="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$SHA_URL" | awk '{print $1}' | tr -dc '0-9a-fA-F' | tr '[:upper:]' '[:lower:]')"
     [[ ${#EXPECTED_SHA} -ne 64 ]] && log_fatal "Invalid SHA-256 digest returned from ${SHA_URL}"
 
     NEED_DOWNLOAD="true"
@@ -259,7 +279,7 @@ else
         rvdk_prog 42 "Tailscale: downloading ${TGZ_NAME} (${TARBALL_ARCH})..."
         log_info "Downloading ${TGZ_URL}..."
         _TS_TMP_TGZ="${CACHED_TGZ}.tmp.$$"
-        curl -fL --retry 3 -o "$_TS_TMP_TGZ" "$TGZ_URL"
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 -o "$_TS_TMP_TGZ" "$TGZ_URL"
         ACTUAL_SHA="$(rvdk_sha256_file "$_TS_TMP_TGZ")"
         if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
             rm -f "$_TS_TMP_TGZ"
@@ -360,13 +380,15 @@ fi
 
 # 4. Converge tailscaled.service
 rvdk_prog 85 "Tailscale: converging tailscaled.service (${TUN_MODE})..."
-systemctl daemon-reload
+if [[ "$BINARIES_CHANGED" == "true" ]]; then
+    systemctl daemon-reload
+fi
 systemctl enable tailscaled.service >/dev/null 2>&1 || true
 
 if [[ "$BINARIES_CHANGED" == "true" || "$DEFAULTS_CHANGED" == "true" ]] || ! systemctl is-active --quiet tailscaled.service; then
     systemctl restart tailscaled.service
 else
-    systemctl start tailscaled.service
+    log_skip "tailscaled.service already active and converged (${TUN_MODE})"
 fi
 
 for (( w=0; w<15; w++ )); do

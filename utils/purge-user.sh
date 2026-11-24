@@ -53,6 +53,13 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
         rvdk_sanitize_locale() { export LANG=C LC_ALL=C; }
         rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; }
         rvdk_validate_username() { [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
+        rvdk_normalize_mount_path() {
+            local p="${1:-}"
+            while [[ "$p" != "/" && "$p" == */ ]]; do
+                p="${p%/}"
+            done
+            printf '%s' "$p"
+        }
         rvdk_kv_load() { :; }
         rvdk_atomic_write() {
             local _dst="$1" _mode="${2:-0644}" _owner="${3:-}" _tmp
@@ -82,6 +89,36 @@ Promotes any legacy /home/<target_user>/.rvdk artifacts into system space (/etc/
 user-space directories into the destination user's home, re-owns data files belonging to
 <target_user>'s UID on local mounted volumes (/mnt/*, /srv/*), and deletes <target_user>.
 EOF
+}
+
+# Validate that a normalized source home path strictly targets /home/<user>
+# and rejects /home/, /home/., /home/.., nested paths, or non-/home paths.
+rvdk_purge_validate_src_home() {
+    local raw_home="${1:-}"
+    local norm_home
+    norm_home="$(rvdk_normalize_mount_path "$raw_home")"
+    [[ -n "$norm_home" ]] || return 1
+    [[ "$norm_home" =~ ^/home/[^/]+$ && "$norm_home" != "/home/." && "$norm_home" != "/home/.." ]]
+}
+
+# Verify that base_dir and every relative path component under it are free of symlinks
+# and contain no '.' or '..' traversal segments.
+rvdk_purge_path_is_symlink_free() {
+    local base_dir="$1"
+    local rel_path="${2:-}"
+    [[ -n "$base_dir" && ! -L "$base_dir" ]] || return 1
+    [[ -z "$rel_path" ]] && return 0
+
+    local cur="$base_dir" seg
+    local -a segs=()
+    IFS='/' read -r -a segs <<< "$rel_path"
+    for seg in ${segs[@]+"${segs[@]}"}; do
+        [[ -z "$seg" ]] && continue
+        [[ "$seg" == "." || "$seg" == ".." ]] && return 1
+        cur="${cur}/${seg}"
+        [[ ! -L "$cur" ]] || return 1
+    done
+    return 0
 }
 
 main() {
@@ -134,7 +171,7 @@ main() {
                 ;;
             --extra-dotdir|--migrate-dotdir)
                 [[ -z "${2:-}" || "${2:-}" == --* ]] && log_fatal "Option '$1' requires a relative directory."
-                extra_dotdirs+=("${2#/}")
+                extra_dotdirs+=("$(rvdk_normalize_mount_path "${2#/}")")
                 shift 2
                 ;;
             --relink-bin)
@@ -197,6 +234,14 @@ main() {
         src_home="$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6 || true)"
     fi
     [[ -z "$src_home" ]] && src_home="/home/${target_user}"
+    src_home="$(rvdk_normalize_mount_path "$src_home")"
+
+    if ! rvdk_purge_validate_src_home "$src_home"; then
+        log_fatal "Safety Interlock: Refusing unsafe source home path '${src_home}' (must match /home/<user>)."
+    fi
+    if [[ -L "$src_home" ]]; then
+        log_fatal "Safety Interlock: Refusing symlinked source home path '${src_home}'."
+    fi
 
     if [[ "$target_exists" == "false" && ! -d "$src_home" ]]; then
         log_skip "User '${target_user}' and ${src_home} are already absent; nothing to purge."
@@ -212,6 +257,7 @@ main() {
     local dest_home
     dest_home="$(getent passwd "$dest_user" 2>/dev/null | cut -d: -f6 || true)"
     [[ -z "$dest_home" ]] && dest_home="/home/${dest_user}"
+    dest_home="$(rvdk_normalize_mount_path "$dest_home")"
 
     log_info "Migrating user-space state from ${src_home} -> ${dest_home} (owner: ${dest_user}:${dest_grp})..."
 
@@ -219,18 +265,20 @@ main() {
     #    (/etc/rvdk, /var/cache/rvdk, /usr/local/share/rvdk/engine) — zero ~/.rvdk in dest_home!
     local sys_engine="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
     local sys_cache="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
-    if [[ -d "${src_home}/.rvdk" ]]; then
-        if [[ -f "${src_home}/.rvdk/config.env" ]] && [[ ! -f /etc/rvdk/config.env || "$overwrite_env" == "true" ]]; then
+    if [[ -d "${src_home}/.rvdk" && ! -L "${src_home}/.rvdk" ]]; then
+        if rvdk_purge_path_is_symlink_free "$src_home" ".rvdk/config.env" && \
+           [[ -f "${src_home}/.rvdk/config.env" && ! -L "${src_home}/.rvdk/config.env" ]] && \
+           [[ ! -f /etc/rvdk/config.env || "$overwrite_env" == "true" ]]; then
             install -d -m 0755 -o root -g root /etc/rvdk
             rvdk_atomic_write /etc/rvdk/config.env 0640 "0:0" < "${src_home}/.rvdk/config.env"
             log_ok "Promoted legacy config.env -> /etc/rvdk/config.env"
         fi
 
-        if [[ -d "${src_home}/.rvdk/cache" ]]; then
+        if [[ -d "${src_home}/.rvdk/cache" && ! -L "${src_home}/.rvdk/cache" ]]; then
             install -d -m 0755 -o root -g root "$sys_cache"
             local cfile cbase
             for cfile in "${src_home}/.rvdk/cache/"*; do
-                [[ -e "$cfile" ]] || continue
+                [[ -e "$cfile" && ! -L "$cfile" ]] || continue
                 cbase="$(basename "$cfile")"
                 if [[ ! -e "${sys_cache}/${cbase}" ]]; then
                     cp -a "$cfile" "${sys_cache}/${cbase}"
@@ -239,7 +287,7 @@ main() {
             done
         fi
 
-        if [[ -d "${src_home}/.rvdk/engine/.git" && ! -d "${sys_engine}/.git" ]]; then
+        if [[ ! -L "${src_home}/.rvdk/engine" && -d "${src_home}/.rvdk/engine/.git" && ! -L "${src_home}/.rvdk/engine/.git" && ! -d "${sys_engine}/.git" ]]; then
             install -d -m 0755 -o root -g root "$(dirname "$sys_engine")"
             chmod 0755 /usr/local /usr/local/share "$(dirname "$sys_engine")" 2>/dev/null || true
             rm -rf "$sys_engine"
@@ -249,6 +297,8 @@ main() {
             chmod 0755 "$sys_engine"
             log_ok "Promoted legacy RVDK engine -> ${sys_engine}"
         fi
+    elif [[ -L "${src_home}/.rvdk" ]]; then
+        log_warn "Skipped symlinked legacy state directory: ${src_home}/.rvdk"
     fi
 
     local bin_link rvdk_target
@@ -267,34 +317,45 @@ main() {
     # 2. Migrate any caller-requested --extra-dotdir directories & --relink-bin symlinks
     local ddir
     for ddir in ${extra_dotdirs[@]+"${extra_dotdirs[@]}"}; do
-        [[ -z "$ddir" || "$ddir" == *".."* ]] && continue
+        [[ -n "$ddir" ]] || continue
+        if ! rvdk_purge_path_is_symlink_free "$src_home" "$ddir"; then
+            log_warn "Skipped unsafe or symlinked extra dotdir: ${src_home}/${ddir}"
+            continue
+        fi
         local s_dir="${src_home}/${ddir}"
         local d_dir="${dest_home}/${ddir}"
-        [[ -d "$s_dir" ]] || continue
+        [[ -d "$s_dir" && ! -L "$s_dir" ]] || continue
+        if ! rvdk_purge_path_is_symlink_free "$dest_home" "$ddir"; then
+            log_warn "Skipped symlinked destination dotdir: ${d_dir}"
+            continue
+        fi
 
         install -d -m 0750 -o "$dest_user" -g "$dest_grp" "$d_dir"
         local entry ebase
         for entry in "${s_dir}/"*; do
-            [[ -e "$entry" ]] || continue
+            [[ -e "$entry" && ! -L "$entry" ]] || continue
             ebase="$(basename "$entry")"
-            if [[ -f "$entry" && "$ebase" == *.env ]]; then
-                if [[ ! -f "${d_dir}/${ebase}" || "$overwrite_env" == "true" ]]; then
+            if [[ -f "$entry" && ! -L "$entry" && "$ebase" == *.env ]]; then
+                if [[ -L "${d_dir}/${ebase}" ]]; then
+                    log_warn "Skipped symlinked destination env file: ${d_dir}/${ebase}"
+                elif [[ ! -f "${d_dir}/${ebase}" || "$overwrite_env" == "true" ]]; then
                     rvdk_atomic_write "${d_dir}/${ebase}" 0640 "${dest_user}:${dest_grp}" < "$entry"
                     log_ok "Migrated ${ddir}/${ebase} -> ${d_dir}/${ebase}"
                 else
                     log_skip "Preserved existing ${d_dir}/${ebase}"
                 fi
-            elif [[ -d "$entry" && -d "${entry}/.git" ]]; then
+            elif [[ -d "$entry" && ! -L "$entry" && -d "${entry}/.git" && ! -L "${entry}/.git" ]]; then
                 if [[ ! -d "${d_dir}/${ebase}/.git" ]]; then
                     cp -a "$entry" "${d_dir}/${ebase}"
                     chown -R "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
                     log_ok "Migrated git tree -> ${d_dir}/${ebase}"
                 fi
-            elif [[ -d "$entry" ]]; then
+            elif [[ -d "$entry" && ! -L "$entry" ]]; then
+                [[ -L "${d_dir}/${ebase}" ]] && continue
                 install -d -m 0750 -o "$dest_user" -g "$dest_grp" "${d_dir}/${ebase}"
                 local subf sbase copied_cnt=0
                 for subf in "${entry}/"*; do
-                    [[ -e "$subf" ]] || continue
+                    [[ -e "$subf" && ! -L "$subf" ]] || continue
                     sbase="$(basename "$subf")"
                     if [[ ! -e "${d_dir}/${ebase}/${sbase}" ]]; then
                         cp -a "$subf" "${d_dir}/${ebase}/${sbase}"
@@ -305,7 +366,7 @@ main() {
                 if (( copied_cnt > 0 )); then
                     log_ok "Migrated ${copied_cnt} item(s) -> ${d_dir}/${ebase}/"
                 fi
-            elif [[ ! -e "${d_dir}/${ebase}" ]]; then
+            elif [[ ! -L "$entry" && ! -e "${d_dir}/${ebase}" ]]; then
                 cp -a "$entry" "${d_dir}/${ebase}"
                 chown -R "${dest_user}:${dest_grp}" "${d_dir}/${ebase}"
             fi
@@ -330,7 +391,7 @@ main() {
     if [[ -n "$target_uid" ]]; then
         local MOUNT_POINT="" SECONDARY_MOUNT_POINT="" NFS_MOUNT_POINT=""
         local env_cand="${RVDK_ENV_FILE:-/etc/rvdk/config.env}"
-        if [[ -r "$env_cand" ]]; then
+        if [[ -f "$env_cand" && ! -L "$env_cand" && -r "$env_cand" ]]; then
             rvdk_kv_load "$env_cand" MOUNT_POINT SECONDARY_MOUNT_POINT NFS_MOUNT_POINT
         fi
         [[ -n "$MOUNT_POINT" ]] && reown_paths+=("$MOUNT_POINT")
@@ -353,7 +414,8 @@ main() {
         local seen_paths=" "
         local vdir
         for vdir in ${reown_paths[@]+"${reown_paths[@]}"}; do
-            [[ -n "$vdir" && -d "$vdir" ]] || continue
+            vdir="$(rvdk_normalize_mount_path "$vdir")"
+            [[ -n "$vdir" && -d "$vdir" && ! -L "$vdir" ]] || continue
             [[ "$vdir" == "/" || "$vdir" == "/home" || "$vdir" == "$src_home" ]] && continue
             [[ "$seen_paths" == *"|${vdir}|"* ]] && continue
             seen_paths="${seen_paths}|${vdir}|"
@@ -384,11 +446,13 @@ main() {
         userdel -f "$target_user"
     fi
 
-    if [[ -d "$src_home" && "$src_home" == /home/* ]]; then
+    if rvdk_purge_validate_src_home "$src_home" && [[ -d "$src_home" && ! -L "$src_home" ]]; then
         rm -rf "$src_home"
     fi
 
     log_ok "Purged user '${target_user}' and removed ${src_home}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main "$@"
+fi

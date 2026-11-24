@@ -66,7 +66,7 @@ Usage: sudo rvdk bsp [--expose-kallsyms] [--no-apt-update] [--noprogbar]
 Layer 2 BSP script: bsp/eswin/eic7700x/bootstrap-ubuntu.sh
 
 Options:
-  --expose-kallsyms    Set kernel.kptr_restrict=1 for perf symbol profiling
+  --expose-kallsyms    Set kernel.kptr_restrict to 0 (exposes kernel symbols for perf; weakens KASLR)
   --no-apt-update      Skip apt-get update calls
   --noprogbar          Disable persistent bottom progress bar
   -h, --help           Show this help message and exit

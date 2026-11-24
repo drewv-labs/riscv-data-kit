@@ -284,13 +284,17 @@ rvdk_kit_resolve() {
     local os_id="${cli_os:-}"
     local os_ver=""
     local os_like=""
-    if [[ -z "$os_id" && -f /etc/os-release ]]; then
-        os_id="$(. /etc/os-release 2>/dev/null && echo "${ID:-unknown}")"
-        os_ver="$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-}")"
-        os_like="$(. /etc/os-release 2>/dev/null && echo "${ID_LIKE:-}")"
-    elif [[ -z "$os_id" && -f /etc/openwrt_release ]]; then
+    if [[ -z "$os_id" && -r /etc/os-release ]]; then
+        local ID="" VERSION_ID="" ID_LIKE=""
+        rvdk_kv_load /etc/os-release ID VERSION_ID ID_LIKE
+        os_id="${ID:-unknown}"
+        os_ver="${VERSION_ID:-}"
+        os_like="${ID_LIKE:-}"
+    elif [[ -z "$os_id" && -r /etc/openwrt_release ]]; then
+        local DISTRIB_RELEASE=""
+        rvdk_kv_load /etc/openwrt_release DISTRIB_RELEASE
         os_id="openwrt"
-        os_ver="$(. /etc/openwrt_release 2>/dev/null && echo "${DISTRIB_RELEASE:-}")"
+        os_ver="${DISTRIB_RELEASE:-}"
     elif [[ -z "$os_id" && "$(uname -s)" == "Darwin" ]]; then
         os_id="macos"
         os_ver="$(sw_vers -productVersion 2>/dev/null || true)"

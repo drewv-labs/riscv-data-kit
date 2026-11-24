@@ -186,35 +186,77 @@ _rvdk_motd_render() {
     fi
 
     kit_out=""
-    # Fast <10ms /bin/sh + awk + sysfs path when /etc/rvdk/kit.env exists (avoids ~95ms bash CLI fork)
+    # Fast <10ms /bin/sh + awk path when /etc/rvdk/kit.env exists (avoids ~95ms bash CLI fork)
     if [ -r /etc/rvdk/kit.env ]; then
         dt_tune=""
         if [ -r /etc/rvdk/deeptune.env ]; then
             dt_tune="$(awk -F= '/^RVDK_TUNE=/ {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' /etc/rvdk/deeptune.env 2>/dev/null)"
         fi
-        eng_dir="/usr/local/share/rvdk/engine"
+        eng_dir="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
 
-        # Direct sysfs / modprobe quirk probes (<1ms, zero subprocesses)
-        p550_fusb=""
-        p550_hdmi=""
-        if [ -d /sys/module/fusb303b ]; then
-            p550_fusb="on"
-        elif [ -f /etc/modprobe.d/90-rvdk-p550-fusb303b.conf ]; then
-            p550_fusb="off"
+        kit_sc=""
+        kit_bd=""
+        kit_oi=""
+        kit_dt_chain=""
+        kit_bd_quirks=""
+        while IFS='=' read -r _k _v || [ -n "$_k" ]; do
+            case "$_k" in
+                RVDK_SOC|RVDK_BOARD|RVDK_OS_ID|RVDK_DEEPTUNE_CHAIN|RVDK_BOARD_QUIRKS)
+                    case "$_v" in
+                        \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
+                        \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+                    esac
+                    case "$_k" in
+                        RVDK_SOC)            kit_sc="$_v" ;;
+                        RVDK_BOARD)          kit_bd="$_v" ;;
+                        RVDK_OS_ID)          kit_oi="$_v" ;;
+                        RVDK_DEEPTUNE_CHAIN) kit_dt_chain="$_v" ;;
+                        RVDK_BOARD_QUIRKS)   kit_bd_quirks="$_v" ;;
+                    esac
+                    ;;
+            esac
+        done < /etc/rvdk/kit.env
+        case "$kit_sc" in *..*|/*) kit_sc="" ;; esac
+        case "$kit_bd" in *..*|/*) kit_bd="" ;; esac
+        case "$kit_oi" in *..*|*/*) kit_oi="" ;; esac
+
+        dt_chain="$kit_dt_chain"
+        if [ -z "$dt_chain" ]; then
+            if [ -f "${eng_dir}/os/deeptune.sh" ] && [ ! -L "${eng_dir}/os/deeptune.sh" ]; then
+                dt_chain="os/deeptune.sh"
+            fi
+            if [ -n "$kit_oi" ] && [ -f "${eng_dir}/os/deeptune-${kit_oi}.sh" ] && [ ! -L "${eng_dir}/os/deeptune-${kit_oi}.sh" ]; then
+                dt_chain="${dt_chain:+${dt_chain} -> }os/deeptune-${kit_oi}.sh"
+            fi
+            if [ -n "$kit_sc" ] && [ -f "${eng_dir}/bsp/${kit_sc}/deeptune.sh" ] && [ ! -L "${eng_dir}/bsp/${kit_sc}/deeptune.sh" ]; then
+                dt_chain="${dt_chain:+${dt_chain} -> }bsp/${kit_sc}/deeptune.sh"
+            fi
+            if [ -n "$kit_bd" ] && [ -f "${eng_dir}/boards/${kit_bd}/deeptune.sh" ] && [ ! -L "${eng_dir}/boards/${kit_bd}/deeptune.sh" ]; then
+                dt_chain="${dt_chain:+${dt_chain} -> }boards/${kit_bd}/deeptune.sh"
+            fi
+            [ -z "$dt_chain" ] && dt_chain="none"
         fi
-        if [ -e /sys/bus/platform/drivers/dw-hdmi-eswin/502a0000.hdmi ] \
-            || [ -e /sys/bus/platform/drivers/es-dc/502c0000.display_control ] \
-            || [ -e /sys/bus/platform/drivers/es_drm/soc:display-subsystem ]; then
-            p550_hdmi="on"
-        elif [ -d /sys/bus/platform/drivers/dw-hdmi-eswin ] || [ -d /sys/bus/platform/drivers/es-dc ]; then
-            p550_hdmi="off"
+
+        bd_quirks="$kit_bd_quirks"
+        if [ -z "$bd_quirks" ] && [ -n "$kit_bd" ]; then
+            if [ -x "${eng_dir}/boards/${kit_bd}/motd-quirks.sh" ]; then
+                bd_quirks="$("${eng_dir}/boards/${kit_bd}/motd-quirks.sh" 2>/dev/null || true)"
+            fi
+            if [ -z "$bd_quirks" ] && [ -d "${eng_dir}/boards/${kit_bd}/quirks" ]; then
+                for _qf in "${eng_dir}/boards/${kit_bd}/quirks"/*.sh; do
+                    [ -f "$_qf" ] || continue
+                    _qn="${_qf##*/}"
+                    _qn="${_qn%.sh}"
+                    bd_quirks="${bd_quirks:+${bd_quirks} }${_qn}"
+                done
+            fi
         fi
+        [ -z "$bd_quirks" ] && bd_quirks="none"
 
         kit_out="$(awk -F= \
             -v tune="$dt_tune" \
-            -v eng="$eng_dir" \
-            -v fusb="$p550_fusb" \
-            -v hdmi="$p550_hdmi" '
+            -v chain="$dt_chain" \
+            -v quirks="$bd_quirks" '
             function unq(s) {
                 sub(/^[^=]*=/, "", s)
                 gsub(/^"|"$/, "", s)
@@ -242,25 +284,13 @@ _rvdk_motd_render() {
                     printf "  • OS (os/)          : %s %s\n", (oi != "" ? oi : "unknown"), ov
                     printf "  • Primary NIC / CPU : %s | %s Harts\n", (pn != "" ? pn : "none"), (ch != "" ? ch : "?")
                     printf "  • Kit Cache File    : /etc/rvdk/kit.env (cached)\n"
-                    chain = "os/deeptune.sh"
-                    if (sc == "eswin/eic7700x" || sc == "spacemit/k1") {
-                        chain = chain " -> bsp/" sc "/deeptune.sh"
-                    }
-                    if (bd == "sifive/p550") {
-                        chain = chain " -> boards/sifive/p550/deeptune.sh"
-                    }
+                    if (chain == "") chain = "none"
                     if (tune != "") {
                         printf "  • DeepTune Chain    : %s (active: %s)\n", chain, tune
                     } else {
                         printf "  • DeepTune Chain    : %s\n", chain
                     }
-                    if (bd == "sifive/p550") {
-                        fs = (fusb != "" ? "fusb=" fusb : "fusb")
-                        hs = (hdmi != "" ? "hdmi=" hdmi : "hdmi")
-                        printf "  • Board Quirks      : %s %s\n", fs, hs
-                    } else {
-                        printf "  • Board Quirks      : none\n"
-                    }
+                    printf "  • Board Quirks      : %s\n", (quirks != "" ? quirks : "none")
                 }
             }
         ' /etc/rvdk/kit.env 2>/dev/null)"
@@ -443,10 +473,12 @@ rvdk_converge_openwrt_motd() {
 
     local want_prof
     want_prof="$(
-        printf '#!/bin/sh\n'
-        printf '# Managed by RVDK (lib/motd.sh)\n'
-        printf 'if [ -n "${PS1:-}" ] && [ -z "${_RVDK_MOTD_SHOWN:-}" ]; then\n'
-        printf '    _RVDK_MOTD_SHOWN=1\n'
+        cat <<'MOTD_PROF_HDR'
+#!/bin/sh
+# Managed by RVDK (lib/motd.sh)
+if [ -n "${PS1:-}" ] && [ -z "${_RVDK_MOTD_SHOWN:-}" ]; then
+    _RVDK_MOTD_SHOWN=1
+MOTD_PROF_HDR
         _rvdk_emit_motd_renderer_body
         printf '    _rvdk_motd_render\n'
         printf 'fi\n'

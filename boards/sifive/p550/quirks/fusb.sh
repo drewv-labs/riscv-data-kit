@@ -68,7 +68,7 @@ done
 
 if [[ "$ACTION" != "status" && $EUID -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "${ORIG_ARGS[@]}"
+        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
         echo "[RVDK:FATAL] Root privileges required for '${ACTION}'." >&2
         exit 1
@@ -77,8 +77,21 @@ fi
 
 log_info()  { [[ "$QUIET" == "true" ]] || printf "\033[1;36m[RVDK:QUIRK:FUSB]\033[0m %s\n" "$1"; }
 log_ok()    { [[ "$QUIET" == "true" ]] || printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+log_skip()  { [[ "$QUIET" == "true" ]] || printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+
+_FUSB_TMPFILES=()
+_fusb_cleanup_tmpfiles() {
+    local _tf
+    for _tf in ${_FUSB_TMPFILES[@]+"${_FUSB_TMPFILES[@]}"}; do
+        [[ -n "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
+    done
+    _FUSB_TMPFILES=()
+}
+trap '_fusb_cleanup_tmpfiles' EXIT
+trap '_fusb_cleanup_tmpfiles; trap - INT; kill -INT $$' INT
+trap '_fusb_cleanup_tmpfiles; trap - TERM; kill -TERM $$' TERM
 
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
@@ -159,7 +172,14 @@ disable_fusb() {
     done < <(bound_i2c_devs)
 
     if [[ ${#bound_list[@]} -gt 0 ]]; then
-        printf '%s\n' "${bound_list[@]}" > "$STATE_CACHE" 2>/dev/null || true
+        local state_dir state_tmp
+        state_dir="$(dirname "$STATE_CACHE")"
+        if mkdir -p "$state_dir" 2>/dev/null && state_tmp="$(mktemp "${state_dir}/.$(basename "$STATE_CACHE").rvdk.XXXXXX" 2>/dev/null)"; then
+            _FUSB_TMPFILES+=("$state_tmp")
+            printf '%s\n' "${bound_list[@]}" > "$state_tmp"
+            chmod 0644 "$state_tmp" 2>/dev/null || true
+            mv -f "$state_tmp" "$STATE_CACHE" 2>/dev/null || rm -f "$state_tmp" 2>/dev/null || true
+        fi
         for dev_id in "${bound_list[@]}"; do
             if [[ -w "${I2C_DRV_DIR}/unbind" ]]; then
                 printf '%s' "$dev_id" > "${I2C_DRV_DIR}/unbind" 2>/dev/null || true
@@ -177,14 +197,25 @@ disable_fusb() {
     fi
 
     if [[ "$EPHEMERAL" == "false" ]]; then
-        cat <<'EOF' > "$MODPROBE_CONF"
+        local conf_dir conf_tmp
+        conf_dir="$(dirname "$MODPROBE_CONF")"
+        mkdir -p "$conf_dir"
+        conf_tmp="$(mktemp "${conf_dir}/.$(basename "$MODPROBE_CONF").rvdk.XXXXXX")"
+        _FUSB_TMPFILES+=("$conf_tmp")
+        cat <<'EOF' > "$conf_tmp"
 # Managed by RVDK (boards/sifive/p550/quirks/fusb.sh)
 # Suppresses out-of-tree front-panel Type-C controller IRQ chatter (irq/*-fusb303b_).
 # Re-enable anytime with: sudo rvdk quirk fusb on
 blacklist fusb303b
 EOF
-        chmod 0644 "$MODPROBE_CONF"
-        log_ok "Persisted boot blacklist in ${MODPROBE_CONF}"
+        chmod 0644 "$conf_tmp"
+        if [[ -f "$MODPROBE_CONF" && ! -L "$MODPROBE_CONF" ]] && cmp -s "$conf_tmp" "$MODPROBE_CONF"; then
+            rm -f "$conf_tmp"
+            log_skip "Boot blacklist already converged (${MODPROBE_CONF})"
+        else
+            mv -f "$conf_tmp" "$MODPROBE_CONF"
+            log_ok "Persisted boot blacklist in ${MODPROBE_CONF}"
+        fi
     else
         log_info "Ephemeral mode (--ephemeral): skipped writing ${MODPROBE_CONF}"
     fi
@@ -200,7 +231,9 @@ enable_fusb() {
         log_ok "Removed boot blacklist ${MODPROBE_CONF}"
     fi
 
-    if modprobe fusb303b 2>/dev/null; then
+    if is_mod_loaded; then
+        log_skip "Kernel module fusb303b already loaded"
+    elif modprobe fusb303b 2>/dev/null; then
         log_ok "Loaded kernel module fusb303b"
     fi
 

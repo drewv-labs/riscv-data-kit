@@ -87,8 +87,21 @@ fi
 
 log_info()  { printf "\033[1;36m[RVDK:QUIRK:HDMI]\033[0m %s\n" "$1"; }
 log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+
+_HDMI_TMPFILES=()
+_hdmi_cleanup_tmpfiles() {
+    local _tf
+    for _tf in ${_HDMI_TMPFILES[@]+"${_HDMI_TMPFILES[@]}"}; do
+        [[ -n "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
+    done
+    _HDMI_TMPFILES=()
+}
+trap '_hdmi_cleanup_tmpfiles' EXIT
+trap '_hdmi_cleanup_tmpfiles; trap - INT; kill -INT $$' INT
+trap '_hdmi_cleanup_tmpfiles; trap - TERM; kill -TERM $$' TERM
 
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
@@ -208,7 +221,12 @@ disable_hdmi() {
             self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
             exec_cmd="/bin/bash ${self_path} off"
         fi
-        cat <<EOF > "$PERSIST_UNIT"
+        local unit_dir unit_tmp unit_changed="false"
+        unit_dir="$(dirname "$PERSIST_UNIT")"
+        mkdir -p "$unit_dir"
+        unit_tmp="$(mktemp "${unit_dir}/.$(basename "$PERSIST_UNIT").rvdk.XXXXXX")"
+        _HDMI_TMPFILES+=("$unit_tmp")
+        cat <<EOF > "$unit_tmp"
 [Unit]
 Description=RVDK SiFive P550 Headless Display/HDMI Suppression
 After=multi-user.target
@@ -221,10 +239,23 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-        chmod 0644 "$PERSIST_UNIT"
-        systemctl daemon-reload
-        systemctl enable rvdk-p550-hdmi-off.service >/dev/null
-        log_ok "Persisted HDMI suppression across reboots (${PERSIST_UNIT})"
+        chmod 0644 "$unit_tmp"
+        if [[ -f "$PERSIST_UNIT" && ! -L "$PERSIST_UNIT" ]] && cmp -s "$unit_tmp" "$PERSIST_UNIT"; then
+            rm -f "$unit_tmp"
+        else
+            mv -f "$unit_tmp" "$PERSIST_UNIT"
+            unit_changed="true"
+        fi
+        if [[ "$unit_changed" == "true" ]]; then
+            systemctl daemon-reload
+            systemctl enable rvdk-p550-hdmi-off.service >/dev/null
+            log_ok "Persisted HDMI suppression across reboots (${PERSIST_UNIT})"
+        elif ! systemctl is-enabled --quiet rvdk-p550-hdmi-off.service 2>/dev/null; then
+            systemctl enable rvdk-p550-hdmi-off.service >/dev/null
+            log_ok "Enabled persistent HDMI suppression (${PERSIST_UNIT})"
+        else
+            log_skip "Persistent HDMI suppression already converged (${PERSIST_UNIT})"
+        fi
     fi
 
     print_status

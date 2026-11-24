@@ -80,6 +80,14 @@ if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
     fi
 fi
 
+if ! declare -F rvdk_validate_abs_path >/dev/null 2>&1; then
+    rvdk_validate_abs_path() {
+        local p="${1:-}"
+        [[ -n "$p" && "$p" != *$'\n'* && "$p" != *$'\r'* ]] || return 1
+        [[ "$p" =~ ^/[A-Za-z0-9._/-]+$ && ! "$p" =~ (^|/)\.\.(/|$) ]]
+    }
+fi
+
 rvdk_log_init "RVDK:NFSv4"
 
 usage() {
@@ -153,7 +161,13 @@ done
 
 DATA_MOUNT="$(rvdk_resolve_data_mount "$EXPLICIT_DATA_MOUNT")"
 DEDICATED_NFS_MOUNT="$(rvdk_normalize_mount_path "$DEDICATED_NFS_MOUNT")"
-[[ -n "$VAULT_PATH_OVERRIDE" ]] && VAULT_PATH_OVERRIDE="$(rvdk_normalize_mount_path "$VAULT_PATH_OVERRIDE")"
+if [[ -n "$VAULT_PATH_OVERRIDE" ]]; then
+    [[ "$VAULT_PATH_OVERRIDE" != *$'\n'* && "$VAULT_PATH_OVERRIDE" != *$'\r'* ]] || log_fatal "Invalid --vault-path (contains newline)."
+    VAULT_PATH_OVERRIDE="$(rvdk_normalize_mount_path "$VAULT_PATH_OVERRIDE")"
+    if [[ -z "$VAULT_PATH_OVERRIDE" || "$VAULT_PATH_OVERRIDE" == "/" ]] || ! rvdk_validate_abs_path "$VAULT_PATH_OVERRIDE"; then
+        log_fatal "Invalid --vault-path '${VAULT_PATH_OVERRIDE}' (must be a safe non-root absolute path)."
+    fi
+fi
 
 if [[ -z "$ALLOW_CIDR" && "$AUTO_SUBNET" == "true" ]]; then
     ALLOW_CIDR="$(rvdk_detect_primary_cidr || true)"
@@ -235,8 +249,23 @@ EXPORT_LINES=()
 ARRAY_COUNT="$(jq 'length' <<< "$RAID_ARRAYS_JSON" 2>/dev/null || echo 0)"
 if [[ "$WITH_RAID" == "true" ]] && (( ARRAY_COUNT > 0 )); then
     for (( i=0; i<ARRAY_COUNT; i++ )); do
-        ARR_MOUNT="$(rvdk_normalize_mount_path "$(jq -r ".[$i].mount" <<< "$RAID_ARRAYS_JSON")")"
-        ARR_FSID="$(jq -r ".[$i].nfs_fsid // $(( (i + 1) * 10 ))" <<< "$RAID_ARRAYS_JSON")"
+        ARR_RAW_MOUNT="$(jq -r "(if (.[$i].mount | type) == \"string\" then .[$i].mount else \"\" end) + \"_\"" <<< "$RAID_ARRAYS_JSON")"
+        ARR_RAW_MOUNT="${ARR_RAW_MOUNT%_}"
+        [[ "$ARR_RAW_MOUNT" != *$'\n'* && "$ARR_RAW_MOUNT" != *$'\r'* ]] || log_fatal "Invalid RAID array mount path at index ${i} (contains newline)."
+        ARR_MOUNT="$(rvdk_normalize_mount_path "$ARR_RAW_MOUNT")"
+        if [[ -z "$ARR_MOUNT" || "$ARR_MOUNT" == "/" ]] || ! rvdk_validate_abs_path "$ARR_MOUNT"; then
+            log_fatal "Invalid RAID array mount path '${ARR_RAW_MOUNT}' at index ${i}."
+        fi
+
+        ARR_FSID="$(jq -r "((.[$i].nfs_fsid // $(( (i + 1) * 10 ))) | tostring) + \"_\"" <<< "$RAID_ARRAYS_JSON")"
+        ARR_FSID="${ARR_FSID%_}"
+        [[ "$ARR_FSID" =~ ^[1-9][0-9]*$ ]] || log_fatal "Invalid nfs_fsid '${ARR_FSID}' at RAID array index ${i} (expected positive integer >= 1)."
+        for _seen_fsid in ${EXPORT_FSIDS[@]+"${EXPORT_FSIDS[@]}"}; do
+            if [[ "$_seen_fsid" == "$ARR_FSID" ]]; then
+                log_fatal "Duplicate nfs_fsid '${ARR_FSID}' in RAID_ARRAYS_JSON (index ${i})."
+            fi
+        done
+
         mkdir -p "$ARR_MOUNT"
         EXPORT_PATHS+=("$ARR_MOUNT")
         EXPORT_FSIDS+=("$ARR_FSID")
@@ -270,16 +299,6 @@ else
     log_info "Export target: rootfs service vault fallback (${FALLBACK_VAULT})"
 fi
 
-mkdir -p /etc/exports.d
-EXPORTS_FILE="/etc/exports.d/rvdk-vaults.exports"
-WANT_EXPORTS="$(printf "%s\n" "${EXPORT_LINES[@]}")"
-
-EXPORTS_CHANGED="false"
-if ! printf "%s\n" "$WANT_EXPORTS" | cmp -s - "$EXPORTS_FILE" 2>/dev/null; then
-    printf "%s\n" "$WANT_EXPORTS" | rvdk_atomic_write "$EXPORTS_FILE" 0644
-    EXPORTS_CHANGED="true"
-fi
-
 CPU_HARTS="$(nproc 2>/dev/null || echo 4)"
 if [[ -n "$NFS_WORKERS_OVERRIDE" && "$NFS_WORKERS_OVERRIDE" =~ ^[0-9]+$ ]] && (( NFS_WORKERS_OVERRIDE > 0 )); then
     GANESHA_WORKERS="$NFS_WORKERS_OVERRIDE"
@@ -301,6 +320,16 @@ IOSchedulingPriority=6"
 
 rvdk_prog 85 "NFSv4 Vault: activating ${NFS_MODE} exports & I/O QoS..."
 if [[ "$NFS_MODE" == "kernel" ]]; then
+    mkdir -p /etc/exports.d
+    EXPORTS_FILE="/etc/exports.d/rvdk-vaults.exports"
+    WANT_EXPORTS="$(printf "%s\n" "${EXPORT_LINES[@]}")"
+
+    EXPORTS_CHANGED="false"
+    if ! printf "%s\n" "$WANT_EXPORTS" | cmp -s - "$EXPORTS_FILE" 2>/dev/null; then
+        printf "%s\n" "$WANT_EXPORTS" | rvdk_atomic_write "$EXPORTS_FILE" 0644
+        EXPORTS_CHANGED="true"
+    fi
+
     QOS_DIR="/etc/systemd/system/nfs-server.service.d"
     QOS_FILE="${QOS_DIR}/90-rvdk-qos.conf"
     QOS_CHANGED="false"

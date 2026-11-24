@@ -233,45 +233,59 @@ fi
 PASSWD_FILE="/etc/mosquitto/passwd"
 AUTH_CHANGED="false"
 if [[ -n "$MQTT_USER" ]]; then
-    # Generate/verify Mosquitto PBKDF2-SHA512 ($7$101$<salt>$<dk>) reading password via env (zero argv exposure)
-    WANT_PASSWD_LINE="$(
+    # Upsert Mosquitto PBKDF2-SHA512 ($7$101$<salt>$<dk>) entry while preserving other users (zero argv exposure)
+    WANT_PASSWD_CONTENT="$(
         _RVDK_MQTT_PW="$MQTT_PASSWORD" python3 - "$PASSWD_FILE" "$MQTT_USER" <<'PY'
 import base64, hashlib, hmac, os, secrets, sys
 
 pw_file, user = sys.argv[1], sys.argv[2]
 pw = os.environ["_RVDK_MQTT_PW"].encode("utf-8")
 iters = 101
-salt = None
-prev_line = None
+prefix = user + ":"
+out_lines = []
+matched_idx = None
+user_line = None
 
 if os.path.isfile(pw_file):
-    try:
-        with open(pw_file, "r", encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if line.startswith(user + ":$7$"):
-                    parts = line.split("$")
-                    if len(parts) == 5:
-                        cand_iters = int(parts[2])
-                        cand_salt = base64.b64decode(parts[3])
-                        cand_dk = base64.b64decode(parts[4])
-                        chk = hashlib.pbkdf2_hmac("sha512", pw, cand_salt, cand_iters, 64)
-                        if hmac.compare_digest(chk, cand_dk):
-                            prev_line = line
-                    break
-    except Exception:
-        pass
+    with open(pw_file, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.rstrip("\r\n")
+            if not line:
+                continue
+            if line.startswith(prefix):
+                if matched_idx is None:
+                    matched_idx = len(out_lines)
+                    out_lines.append(None)
+                    if line.startswith(user + ":$7$"):
+                        try:
+                            parts = line.split("$")
+                            if len(parts) == 5:
+                                cand_iters = int(parts[2])
+                                cand_salt = base64.b64decode(parts[3])
+                                cand_dk = base64.b64decode(parts[4])
+                                chk = hashlib.pbkdf2_hmac("sha512", pw, cand_salt, cand_iters, 64)
+                                if hmac.compare_digest(chk, cand_dk):
+                                    user_line = line
+                        except Exception:
+                            pass
+                continue
+            out_lines.append(line)
 
-if prev_line is not None:
-    print(prev_line)
-else:
+if user_line is None:
     salt = secrets.token_bytes(12)
     dk = hashlib.pbkdf2_hmac("sha512", pw, salt, iters, 64)
-    print(f"{user}:$7${iters}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}")
+    user_line = f"{user}:$7${iters}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+if matched_idx is not None:
+    out_lines[matched_idx] = user_line
+else:
+    out_lines.append(user_line)
+
+print("\n".join(out_lines))
 PY
     )"
-    if [[ ! -f "$PASSWD_FILE" ]] || ! printf '%s\n' "$WANT_PASSWD_LINE" | cmp -s - "$PASSWD_FILE" 2>/dev/null; then
-        printf '%s\n' "$WANT_PASSWD_LINE" | rvdk_atomic_write "$PASSWD_FILE" 0640 root:mosquitto
+    if [[ ! -f "$PASSWD_FILE" ]] || ! printf '%s\n' "$WANT_PASSWD_CONTENT" | cmp -s - "$PASSWD_FILE" 2>/dev/null; then
+        printf '%s\n' "$WANT_PASSWD_CONTENT" | rvdk_atomic_write "$PASSWD_FILE" 0640 root:mosquitto
         AUTH_CHANGED="true"
     fi
     AUTH_LINES="allow_anonymous false

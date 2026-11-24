@@ -40,7 +40,11 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
         rvdk_log_init() { :; }
         rvdk_sanitize_locale() { export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C; }
         rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
-        rvdk_validate_hostname() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || log_fatal "Invalid hostname: $1"; }
+        rvdk_validate_hostname() {
+            local h="${1:-}"
+            [[ ${#h} -ge 1 && ${#h} -le 253 ]] || return 1
+            [[ "$h" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
+        }
         rvdk_sync_cold_clock() { :; }
     fi
 fi
@@ -48,8 +52,13 @@ fi
 rvdk_log_init "RVDK:RV2-EMMC"
 
 _EMMC_TMP_MNT=""
+_EMMC_BOOT0_RO_UNLOCKED=""
 _STOPPED_SVCS=()
 _rvdk_emmc_cleanup() {
+    if [[ -n "${_EMMC_BOOT0_RO_UNLOCKED:-}" && -f "${_EMMC_BOOT0_RO_UNLOCKED}" ]]; then
+        printf '1\n' > "${_EMMC_BOOT0_RO_UNLOCKED}" 2>/dev/null || true
+        _EMMC_BOOT0_RO_UNLOCKED=""
+    fi
     local svc
     for svc in ${_STOPPED_SVCS[@]+"${_STOPPED_SVCS[@]}"}; do
         systemctl start "$svc" 2>/dev/null || true
@@ -128,7 +137,7 @@ main() {
     fi
 
     if [[ -n "$target_hostname" ]]; then
-        rvdk_validate_hostname "$target_hostname"
+        rvdk_validate_hostname "$target_hostname" || log_fatal "Invalid --hostname '${target_hostname}'."
     fi
 
     if [[ "$dry_run" != "true" ]]; then
@@ -299,7 +308,9 @@ main() {
         esac
     fi
 
-    trap '_rvdk_emmc_cleanup' EXIT INT TERM
+    trap '_rvdk_emmc_cleanup' EXIT
+    trap '_rvdk_emmc_cleanup; trap - INT; kill -INT $$' INT
+    trap '_rvdk_emmc_cleanup; trap - TERM; kill -TERM $$' TERM
 
     # --------------------------------------------------------------------------
     # 3. Partition Full eMMC (16 MiB-Aligned MBR) & Format `rvdk_emmc_root`
@@ -318,7 +329,11 @@ main() {
     parted -s "$target_dev" -- mklabel msdos
     parted -s "$target_dev" -- mkpart primary ext4 "${first_sector}s" "${last_sector}s"
     partprobe "$target_dev" 2>/dev/null || blockdev --rereadpt "$target_dev" 2>/dev/null || true
-    command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || sleep 2
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm settle 2>/dev/null || sleep 2
+    else
+        sleep 2
+    fi
 
     local emmc_part="${target_dev}p1"
     [[ ! -b "$emmc_part" ]] && log_fatal "Expected eMMC root partition '${emmc_part}' did not appear after parted."
@@ -480,6 +495,10 @@ main() {
         if [[ -n "$live_uuid" ]] && grep -qF "$live_uuid" "${_EMMC_TMP_MNT}/boot/boot.cmd" 2>/dev/null; then
             sed -i "s|${live_uuid}|${emmc_uuid}|g" "${_EMMC_TMP_MNT}/boot/boot.cmd"
         fi
+        # Vendor Orange Pi RV2 / Ky / SpacemiT U-Boot tooling (nand-sata-install)
+        # generates boot.scr with `-A arm`; U-Boot's `source` command only validates
+        # IH_TYPE_SCRIPT (`-T script`) and ignores ih_arch, so keeping `-A arm`
+        # preserves compatibility with vendor U-Boot images and older mkimage.
         mkimage -C none -A arm -T script -d "${_EMMC_TMP_MNT}/boot/boot.cmd" "${_EMMC_TMP_MNT}/boot/boot.scr" >/dev/null
         log_ok "Compiled target /boot/boot.scr via mkimage"
     fi
@@ -512,11 +531,17 @@ main() {
     if [[ -b "$boot0_dev" ]]; then
         local boot0_ro
         boot0_ro="/sys/block/$(basename "$boot0_dev")/force_ro"
-        [[ -f "$boot0_ro" ]] && printf '0\n' > "$boot0_ro"
+        if [[ -f "$boot0_ro" ]]; then
+            printf '0\n' > "$boot0_ro"
+            _EMMC_BOOT0_RO_UNLOCKED="$boot0_ro"
+        fi
         dd if="${uboot_dir}/bootinfo_emmc.bin" of="$boot0_dev" bs=512 seek=0 conv=notrunc,fsync status=none
         dd if="${uboot_dir}/FSBL.bin" of="$boot0_dev" bs=1 seek=512 conv=notrunc,fsync status=none
         sync
-        [[ -f "$boot0_ro" ]] && printf '1\n' > "$boot0_ro"
+        if [[ -n "${_EMMC_BOOT0_RO_UNLOCKED:-}" && -f "${_EMMC_BOOT0_RO_UNLOCKED}" ]]; then
+            printf '1\n' > "${_EMMC_BOOT0_RO_UNLOCKED}"
+            _EMMC_BOOT0_RO_UNLOCKED=""
+        fi
         log_ok "Programmed eMMC hardware boot0 SPL (${boot0_dev} <- bootinfo_emmc.bin + FSBL.bin)"
     else
         log_warn "Block device ${boot0_dev} not exposed by kernel; writing user-area SPL/U-Boot only."
