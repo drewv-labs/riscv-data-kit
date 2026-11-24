@@ -14,7 +14,7 @@
 #      • Formats `/dev/mmcblk2p1` ext4 with fresh UUID & label `rvdk_emmc_root`
 #      • Clones live SD rootfs via two-pass `rsync` (never killing DHCP/SSH!)
 #      • Rewrites target `/etc/fstab` & `/boot/orangepiEnv.txt` to new eMMC UUID
-#      • Seeds cold-RTC floor (`/etc/fake-hwclock.data` + timesync)
+#      • Seeds cold-RTC floor (`/usr/lib/clock-epoch` + `/etc/fake-hwclock.data` + timesync)
 #      • Programs both `/dev/mmcblk2boot0` & `/dev/mmcblk2` Ky/SpacemiT SPL/ITB
 # ==============================================================================
 
@@ -408,10 +408,14 @@ main() {
     # Force RVDK kit.env refresh on first eMMC boot & seed cold-RTC floor
     rm -f "${_EMMC_TMP_MNT}/etc/rvdk/kit.env" 2>/dev/null || true
     if (( $(date -u +%s 2>/dev/null || echo 0) >= 1767225600 )); then
+        if [[ -d "${_EMMC_TMP_MNT}/usr/lib" && ! -L "${_EMMC_TMP_MNT}/usr/lib" ]]; then
+            touch "${_EMMC_TMP_MNT}/usr/lib/clock-epoch" 2>/dev/null || true
+            chmod 0644 "${_EMMC_TMP_MNT}/usr/lib/clock-epoch" 2>/dev/null || true
+        fi
         date -u '+%Y-%m-%d %H:%M:%S' > "${_EMMC_TMP_MNT}/etc/fake-hwclock.data" 2>/dev/null || true
         chmod 0644 "${_EMMC_TMP_MNT}/etc/fake-hwclock.data" 2>/dev/null || true
         if [[ -d "${_EMMC_TMP_MNT}/var/lib/systemd/timesync" ]]; then
-            : > "${_EMMC_TMP_MNT}/var/lib/systemd/timesync/clock" 2>/dev/null || true
+            touch "${_EMMC_TMP_MNT}/var/lib/systemd/timesync/clock" 2>/dev/null || true
         fi
     fi
 

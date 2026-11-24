@@ -573,14 +573,19 @@ FallbackNTP=time.cloudflare.com time.nist.gov"
         log_ok "Enabled persistent US-first NTP synchronization (systemd-timesyncd.service)"
     fi
 
-    # Refresh fake-hwclock / timesync floor so clean & unclean reboots never regress to factory image build dates
-    if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
-        if (( $(date -u +%s 2>/dev/null || echo 0) >= 1767225600 )); then
+    # Refresh systemd clock-epoch / fake-hwclock / timesync floor so clean & unclean reboots never regress to factory image build dates
+    _now_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+    if [[ "$_now_epoch" =~ ^[0-9]+$ ]] && (( _now_epoch >= 1767225600 )); then
+        if [[ -d /usr/lib && ! -L /usr/lib ]]; then
+            touch /usr/lib/clock-epoch 2>/dev/null || true
+            chmod 0644 /usr/lib/clock-epoch 2>/dev/null || true
+        fi
+        if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
             date -u '+%Y-%m-%d %H:%M:%S' | rvdk_atomic_write /etc/fake-hwclock.data 0644 2>/dev/null || true
         fi
-    fi
-    if [[ -d /var/lib/systemd/timesync ]] && (( $(date -u +%s 2>/dev/null || echo 0) >= 1767225600 )); then
-        : > /var/lib/systemd/timesync/clock 2>/dev/null || true
+        if [[ -d /var/lib/systemd/timesync ]]; then
+            touch /var/lib/systemd/timesync/clock 2>/dev/null || true
+        fi
     fi
 fi
 

@@ -7,10 +7,11 @@
 # executes hardware-interlocked, cryptographically verified media preparation:
 #   • mode = "raw"          : Stream-decompresses (.zst/.xz/.bz2/.gz/raw) to block dev,
 #                             wipes stale backup GPT headers on reused cards, seeds
-#                             cold-RTC clock floor (/etc/fake-hwclock.data + timesync),
-#                             applies deterministic ext4 rootfs labels (rvdk_sd_root /
-#                             rvdk_emmc_root), de-collides dual-media UUID + PARTUUID,
-#                             and provisions SpacemiT/Ky eMMC hardware boot0 SPL.
+#                             cold-RTC clock floor (/usr/lib/clock-epoch +
+#                             /etc/fake-hwclock.data + timesync), applies deterministic
+#                             ext4 rootfs labels (rvdk_sd_root / rvdk_emmc_root),
+#                             de-collides dual-media UUID + PARTUUID, and provisions
+#                             SpacemiT/Ky eMMC hardware boot0 SPL.
 #   • mode = "uboot_ext4"   : Builds U-Boot compatible ext4 stick (-O ^metadata_csum_seed,^orphan_file)
 #   • mode = "sd_bootstrap" : Delegates on-board SD -> eMMC bootstrap to board script
 #
@@ -402,9 +403,10 @@ EOF
     fi
 }
 
-# Seed host UTC timestamp into unmounted ext4 `/etc/fake-hwclock.data`,
-# `/var/lib/systemd/timesync/clock`, and superblock check-time so batteryless
-# RISC-V SBCs boot inside the valid TLS certificate window on first power-on.
+# Seed host UTC timestamp into unmounted ext4 `/usr/lib/clock-epoch` (consumed by
+# systemd PID 1 `clock_apply_epoch` at t=0 even without fake-hwclock or timesyncd),
+# `/etc/fake-hwclock.data`, `/var/lib/systemd/timesync/clock`, and superblock
+# check-time so batteryless RISC-V SBCs boot inside the valid TLS certificate window.
 _rvdk_seed_ext4_rtc_floor() {
     local debugfs_bin="$1"
     local tune2fs_bin="$2"
@@ -414,16 +416,20 @@ _rvdk_seed_ext4_rtc_floor() {
     now_epoch="$(date -u +%s 2>/dev/null || echo 0)"
     [[ "$now_epoch" =~ ^[0-9]+$ ]] && (( now_epoch >= 1767225600 )) || return 0
 
-    local utc_now
+    local utc_now ts_fmt
     utc_now="$(date -u '+%Y-%m-%d %H:%M:%S')"
+    ts_fmt="$(date -u '+%Y%m%d%H%M%S')"
     local seeded="false"
 
     if [[ -n "$debugfs_bin" && -x "$debugfs_bin" ]]; then
-        local has_etc="" has_timesync=""
+        local has_etc="" has_usr_lib="" has_timesync=""
         has_etc="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "stat /etc" "$root_slice" 2>/dev/null || true)"
+        has_usr_lib="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "stat /usr/lib" "$root_slice" 2>/dev/null || true)"
         has_timesync="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "stat /var/lib/systemd/timesync" "$root_slice" 2>/dev/null || true)"
 
-        if grep -q "Inode:" <<< "$has_etc" || grep -q "Inode:" <<< "$has_timesync"; then
+        if grep -q "Type: directory" <<< "$has_etc" \
+           || grep -q "Type: directory" <<< "$has_usr_lib" \
+           || grep -q "Type: directory" <<< "$has_timesync"; then
             local tmp_rtc tmp_empty tmp_cmds
             tmp_rtc="$(mktemp "/tmp/rvdk_rtc.XXXXXX")"
             tmp_empty="$(mktemp "/tmp/rvdk_ts.XXXXXX")"
@@ -431,22 +437,42 @@ _rvdk_seed_ext4_rtc_floor() {
             printf '%s\n' "$utc_now" > "$tmp_rtc"
             : > "$tmp_empty"
             : > "$tmp_cmds"
-            if grep -q "Inode:" <<< "$has_etc"; then
+            if grep -q "Type: directory" <<< "$has_usr_lib"; then
+                cat <<EOF >> "$tmp_cmds"
+rm /usr/lib/clock-epoch
+write ${tmp_empty} /usr/lib/clock-epoch
+sif /usr/lib/clock-epoch uid 0
+sif /usr/lib/clock-epoch gid 0
+sif /usr/lib/clock-epoch mode 0100644
+sif /usr/lib/clock-epoch mtime ${ts_fmt}
+sif /usr/lib/clock-epoch ctime ${ts_fmt}
+EOF
+            fi
+            if grep -q "Type: directory" <<< "$has_etc"; then
                 cat <<EOF >> "$tmp_cmds"
 rm /etc/fake-hwclock.data
 write ${tmp_rtc} /etc/fake-hwclock.data
 sif /etc/fake-hwclock.data uid 0
 sif /etc/fake-hwclock.data gid 0
 sif /etc/fake-hwclock.data mode 0100644
+sif /etc/fake-hwclock.data mtime ${ts_fmt}
+sif /etc/fake-hwclock.data ctime ${ts_fmt}
 EOF
             fi
-            if grep -q "Inode:" <<< "$has_timesync"; then
+            if grep -q "Type: directory" <<< "$has_timesync"; then
+                local ts_uid="0" ts_gid="0"
+                ts_uid="$(awk '{for(i=1;i<=NF;i++) if($i=="User:") {print $(i+1); exit}}' <<< "$has_timesync" | tr -dc '0-9' || true)"
+                ts_gid="$(awk '{for(i=1;i<=NF;i++) if($i=="Group:") {print $(i+1); exit}}' <<< "$has_timesync" | tr -dc '0-9' || true)"
+                [[ "$ts_uid" =~ ^[0-9]+$ ]] || ts_uid="0"
+                [[ "$ts_gid" =~ ^[0-9]+$ ]] || ts_gid="0"
                 cat <<EOF >> "$tmp_cmds"
 rm /var/lib/systemd/timesync/clock
 write ${tmp_empty} /var/lib/systemd/timesync/clock
-sif /var/lib/systemd/timesync/clock uid 0
-sif /var/lib/systemd/timesync/clock gid 0
+sif /var/lib/systemd/timesync/clock uid ${ts_uid}
+sif /var/lib/systemd/timesync/clock gid ${ts_gid}
 sif /var/lib/systemd/timesync/clock mode 0100644
+sif /var/lib/systemd/timesync/clock mtime ${ts_fmt}
+sif /var/lib/systemd/timesync/clock ctime ${ts_fmt}
 EOF
             fi
             chmod 0644 "$tmp_rtc" "$tmp_empty" "$tmp_cmds"

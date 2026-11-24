@@ -468,11 +468,15 @@ rvdk_sync_cold_clock() {
     if (( remote_epoch >= RVDK_MIN_VALID_EPOCH && remote_epoch > local_epoch )); then
         local skew=$(( remote_epoch - local_epoch ))
         if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
+            if [[ -d /usr/lib && ! -L /usr/lib ]]; then
+                touch /usr/lib/clock-epoch 2>/dev/null || true
+                chmod 0644 /usr/lib/clock-epoch 2>/dev/null || true
+            fi
             if [[ -f /etc/fake-hwclock.data ]] || command -v fake-hwclock >/dev/null 2>&1; then
                 date -u '+%Y-%m-%d %H:%M:%S' > /etc/fake-hwclock.data 2>/dev/null || true
             fi
             if [[ -d /var/lib/systemd/timesync ]]; then
-                : > /var/lib/systemd/timesync/clock 2>/dev/null || true
+                touch /var/lib/systemd/timesync/clock 2>/dev/null || true
             fi
             hwclock --systohc --utc >/dev/null 2>&1 || true
             log_ok "Stepped cold-RTC system clock via HTTP Date (+${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
