@@ -219,9 +219,11 @@ if [[ -z "$ALLOW_CIDR" && "$AUTO_SUBNET" == "true" ]]; then
     [[ -z "$ALLOW_CIDR" ]] && log_fatal "--auto-subnet could not determine an active IPv4 subnet; pass --allow-cidr <CIDR>."
 fi
 if [[ -n "$ALLOW_CIDR" ]]; then
-    if ! ALLOW_CIDR="$(rvdk_normalize_ipv4_cidr "$ALLOW_CIDR")"; then
+    _norm_cidr=""
+    if ! _norm_cidr="$(rvdk_normalize_ipv4_cidr "$ALLOW_CIDR")"; then
         log_fatal "Invalid IPv4 CIDR '${ALLOW_CIDR}'."
     fi
+    ALLOW_CIDR="$_norm_cidr"
 fi
 if [[ -z "$PG_LISTEN" ]]; then
     if [[ -n "$ALLOW_CIDR" ]]; then
@@ -383,6 +385,9 @@ else
                 log_warn "No pinned SHA-256 provided for ${BUNDLE_NAME} (pass --bundle-sha256 or --allow-remote-sha256 to use remote .sha256 sidecar); falling back to verified PGDG source build..."
                 FORCE_BUILD="true"
             else
+                if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" && "$BUNDLE_URL" != https://* ]]; then
+                    log_fatal "Refusing to fetch remote .sha256 sidecar over insecure non-HTTPS URL (${BUNDLE_URL}); use https:// or pass an explicit --bundle-sha256 <hex64> pin."
+                fi
                 rvdk_prog 35 "PG 18.6: pulling ${TARGET_SLUG} io_uring binary bundle..."
                 log_info "Pulling precompiled ${TARGET_SLUG} bundle from ${BUNDLE_URL}..."
                 _PG_TMP_ARCHIVE="$(mktemp /tmp/rvdk-pg18-bundle.XXXXXX.tar.zst)"
@@ -406,7 +411,7 @@ else
                         fi
                         log_ok "Verified bundle SHA-256: ${ACTUAL_BUNDLE_SHA:0:16}..."
                     fi
-                    tar -I zstd -xf "$_PG_TMP_ARCHIVE" -C "$LOCAL_REPO_DIR"
+                    tar --no-same-owner --no-same-permissions -I zstd -xf "$_PG_TMP_ARCHIVE" -C "$LOCAL_REPO_DIR"
                     rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256" "${LOCAL_REPO_DIR}"/*-dbgsym_*.deb
                     _PG_TMP_ARCHIVE=""
                     log_ok "Extracted verified PostgreSQL 18.6 bundle to ${LOCAL_REPO_DIR}"
@@ -580,10 +585,10 @@ else
     TARGET_PGDATA="/var/lib/postgresql/${PG_VERSION}/main"
 fi
 
-# Scale max_wal_size safely so smaller 32GB/64GB partitions never hit ENOSPC
-FS_AVAIL_GIB="$(df -BG --output=avail "$(dirname "$TARGET_PGDATA")" 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 64)"
-[[ -z "$FS_AVAIL_GIB" ]] && FS_AVAIL_GIB=64
-WAL_MAX_GIB=$(( FS_AVAIL_GIB / 5 ))
+# Scale max_wal_size safely from total filesystem capacity so re-runs on a live database never fluctuate
+FS_SIZE_GIB="$(df -BG --output=size "$(dirname "$TARGET_PGDATA")" 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 64)"
+[[ -z "$FS_SIZE_GIB" ]] && FS_SIZE_GIB=64
+WAL_MAX_GIB=$(( FS_SIZE_GIB / 5 ))
 (( WAL_MAX_GIB < 2 )) && WAL_MAX_GIB=2
 (( WAL_MAX_GIB > 16 )) && WAL_MAX_GIB=16
 WAL_MIN_GIB=$(( WAL_MAX_GIB >= 8 ? 2 : 1 ))
@@ -659,9 +664,26 @@ fi
 HBA_FILE="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
 HBA_CHANGED="false"
 if [[ -n "$ALLOW_CIDR" && -f "$HBA_FILE" ]]; then
-    WANT_HBA_RULE="host    all             all             ${ALLOW_CIDR}            scram-sha-256"
-    if ! grep -qxF "$WANT_HBA_RULE" "$HBA_FILE"; then
-        { cat "$HBA_FILE"; printf '%s\n' "$WANT_HBA_RULE"; } | rvdk_atomic_write "$HBA_FILE" 0640 postgres:postgres
+    LEGACY_HBA_RULE="host    all             all             ${ALLOW_CIDR}            scram-sha-256"
+    WANT_HBA_RULE="${LEGACY_HBA_RULE} # RVDK-MANAGED-CIDR"
+    if grep -qxF "$WANT_HBA_RULE" "$HBA_FILE"; then
+        log_skip "pg_hba.conf RVDK CIDR rule already converged (${ALLOW_CIDR})"
+    elif grep -qF '# RVDK-MANAGED-CIDR' "$HBA_FILE"; then
+        awk -v rule="$WANT_HBA_RULE" '
+            /# RVDK-MANAGED-CIDR/ {
+                if (!replaced) {
+                    print rule
+                    replaced = 1
+                }
+                next
+            }
+            { print }
+        ' "$HBA_FILE" | rvdk_atomic_write "$HBA_FILE" 0640 postgres:postgres
+        HBA_CHANGED="true"
+    elif grep -qxF "$LEGACY_HBA_RULE" "$HBA_FILE"; then
+        log_skip "pg_hba.conf rule for ${ALLOW_CIDR} already present"
+    else
+        awk -v rule="$WANT_HBA_RULE" '1; END { print rule }' "$HBA_FILE" | rvdk_atomic_write "$HBA_FILE" 0640 postgres:postgres
         HBA_CHANGED="true"
     fi
 fi

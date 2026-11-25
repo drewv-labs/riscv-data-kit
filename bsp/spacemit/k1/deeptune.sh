@@ -312,6 +312,17 @@ fi
 # ==============================================================================
 rvdk_prog 80 "SpacemiT K1 DeepTune: pinning Cluster 0 (cpu1..3) I/O IRQs & isolating Cluster 1 (cpu4..7)..."
 
+SECONDARY_NIC_CANDIDATES=()
+for _sec_nic in end1 eth1 enP1p1s0; do
+    [[ "$_sec_nic" == "$PRIMARY_NIC" ]] && continue
+    SECONDARY_NIC_CANDIDATES+=("$_sec_nic")
+done
+SECONDARY_NIC_PATTERN="$(IFS='|'; printf '%s' "${SECONDARY_NIC_CANDIDATES[*]}")"
+SECONDARY_IRQ_LINE=""
+if [[ -n "$SECONDARY_NIC_PATTERN" ]]; then
+    SECONDARY_IRQ_LINE="pin_irq \"${SECONDARY_NIC_PATTERN}\" \"2\""$'\n'
+fi
+
 WANT_IRQ_SCRIPT="#!/usr/bin/env bash
 # Managed by RVDK (bsp/spacemit/k1/deeptune.sh)
 # SpacemiT K1 / Ky X1 cache-topology-aware IRQ & RPS affinity across 2x4 X60 clusters:
@@ -331,8 +342,7 @@ pin_irq() {
 }
 
 pin_irq \"${PRIMARY_NIC}\" \"1\"
-pin_irq \"end1|eth1|enP1p1s0\" \"2\"
-pin_irq \"xhci-hcd\" \"3\"
+${SECONDARY_IRQ_LINE}pin_irq \"xhci-hcd\" \"3\"
 pin_irq \"mmc0|mmc2|sdhci\" \"3\"
 
 for nic_dir in /sys/class/net/end* /sys/class/net/eth* /sys/class/net/enP*; do

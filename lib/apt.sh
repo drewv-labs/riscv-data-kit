@@ -29,7 +29,7 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
 fi
 
 _rvdk_apt_log_ok() {
-    if declare -F log_ok >/dev/null 2>&1; then
+    if typeset -f log_ok >/dev/null 2>&1; then
         log_ok "$1"
     else
         printf "\033[1;32m  [OK]\033[0m %s\n" "$1"
@@ -37,7 +37,7 @@ _rvdk_apt_log_ok() {
 }
 
 _rvdk_apt_log_skip() {
-    if declare -F log_skip >/dev/null 2>&1; then
+    if typeset -f log_skip >/dev/null 2>&1; then
         log_skip "$1"
     else
         printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"
@@ -64,8 +64,8 @@ _rvdk_apt_rewrite_stream() {
             -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
             -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
             -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
-            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
-            -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://apt.armbian.com\\2@g" \
+            -e '/^[[:space:]]*#/! s@http://apt\.armbian\.com([[:space:]/]|$)@https://apt.armbian.com\1@g' \
             -e '/^[[:space:]]*#/! s@http://(deb|ftp\.us|ftp\.debian)\.debian\.org/debian([[:space:]/]|$)@https://deb.debian.org/debian\2@g' \
             -e '/^[[:space:]]*#/! s@http://security\.debian\.org/debian-security([[:space:]/]|$)@https://security.debian.org/debian-security\1@g' \
             -e '/^[[:space:]]*#/! s@http://ports\.ubuntu\.com/ubuntu-ports([[:space:]/]|$)@https://ports.ubuntu.com/ubuntu-ports\1@g' \
@@ -78,15 +78,14 @@ _rvdk_apt_rewrite_stream() {
             -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
             -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
             -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
-            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
-            -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://apt.armbian.com\\2@g" \
             "$in_file"
     fi
 }
 
 # Normalize factory CN / plain-HTTP APT mirrors onto canonical US-first signed
 # HTTPS endpoints (deb.debian.org / security.debian.org / ports.ubuntu.com /
-# armbian.chi.auroradev.org), preserving GPG verification and adding missing
+# apt.armbian.com), preserving GPG verification and adding missing
 # Debian `-security` suites when omitted by vendor board images.
 rvdk_apt_normalize_mirrors() {
     local quiet_skip="false"

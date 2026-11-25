@@ -119,12 +119,14 @@ _rvdk_flash_cleanup() {
         _RVDK_FLASH_TMP_MNT=""
     fi
     if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
-        declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
+        if typeset -f _rvdk_cleanup_tmpfiles >/dev/null 2>&1; then
+            _rvdk_cleanup_tmpfiles || true
+        fi
     fi
 }
 
 _rvdk_flash_register_cleanup() {
-    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+    if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
         rvdk_register_cleanup _rvdk_flash_cleanup
     elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
         trap '_rvdk_flash_cleanup' EXIT
@@ -163,6 +165,60 @@ _rvdk_flash_strip_fstab_commit() {
             }
         }
         print
+    }'
+}
+
+_rvdk_flash_rewrite_label_token() {
+    local old_lbl="$1"
+    local new_lbl="$2"
+    RVDK_OLD_LBL="$old_lbl" RVDK_NEW_LBL="$new_lbl" awk '
+    BEGIN {
+        old_val = ENVIRON["RVDK_OLD_LBL"]
+        needle = "LABEL=" old_val
+        repl = "LABEL=" ENVIRON["RVDK_NEW_LBL"]
+        nlen = length(needle)
+    }
+    {
+        if (length(old_val) == 0) {
+            print $0
+            next
+        }
+        s = $0
+        out = ""
+        while ((pos = index(s, needle)) > 0) {
+            out = out substr(s, 1, pos - 1)
+            prev = (length(out) > 0) ? substr(out, length(out), 1) : ""
+            after = substr(s, pos + nlen, 1)
+            prev_ok = (prev == "" || prev ~ /[[:space:]]/ || index(",=\"\047", prev) > 0)
+            after_ok = (after == "" || after ~ /[[:space:]]/ || index(",\"\047", after) > 0)
+            if (prev_ok && after_ok) {
+                out = out repl
+            } else {
+                out = out needle
+            }
+            s = substr(s, pos + nlen)
+        }
+        print out s
+    }'
+}
+
+_rvdk_flash_rewrite_literal() {
+    local old_str="$1"
+    local new_str="$2"
+    RVDK_OLD_STR="$old_str" RVDK_NEW_STR="$new_str" awk '
+    BEGIN {
+        needle = ENVIRON["RVDK_OLD_STR"]
+        repl = ENVIRON["RVDK_NEW_STR"]
+        nlen = length(needle)
+    }
+    {
+        s = $0
+        out = ""
+        while (nlen > 0 && (pos = index(s, needle)) > 0) {
+            out = out substr(s, 1, pos - 1) repl
+            s = substr(s, pos + nlen)
+        }
+        print out s
     }'
 }
 
@@ -206,7 +262,10 @@ PY
 _rvdk_flash_resolve_manifest() {
     local query="$1"
     local boards_root="${_FLASH_REPO_ROOT}/boards"
-    if [[ -f "${boards_root}/${query}/media.json" ]]; then
+    if typeset -f rvdk_normalize_board_id >/dev/null 2>&1; then
+        query="$(rvdk_normalize_board_id "$query")"
+    fi
+    if [[ "$query" != *".."* && -f "${boards_root}/${query}/media.json" ]]; then
         printf '%s\n' "${boards_root}/${query}/media.json"
         return 0
     fi
@@ -214,18 +273,99 @@ _rvdk_flash_resolve_manifest() {
 import glob, json, os, sys
 boards_root, q = sys.argv[1], sys.argv[2].strip().lower()
 aliases = {
+    "p550": "sifive/p550",
     "premier-p550": "sifive/p550",
-    "visionfive2": "starfive/vf2",
+    "hifive-premier-p550": "sifive/p550",
+    "sifive-p550": "sifive/p550",
+    "sifive/p550": "sifive/p550",
+    "sifive/hifive-premier-p550": "sifive/p550",
+    "unmatched": "sifive/unmatched",
+    "unmatchedb": "sifive/unmatched",
+    "unmatched-b": "sifive/unmatched",
+    "fu740": "sifive/unmatched",
+    "hifive-unmatched": "sifive/unmatched",
+    "sifive-unmatched": "sifive/unmatched",
+    "sifive/unmatched": "sifive/unmatched",
+    "megrez": "milkv/megrez",
+    "milkv-megrez": "milkv/megrez",
+    "milkv/megrez": "milkv/megrez",
+    "milk-v/megrez": "milkv/megrez",
+    "starpro64": "pine64/starpro64",
+    "pine64/starpro64": "pine64/starpro64",
+    "vf2-lite": "starfive/vf2-lite",
+    "vf2lite": "starfive/vf2-lite",
     "visionfive2-lite": "starfive/vf2-lite",
-    "orangepi-rv2": "orangepi/rv2",
+    "visionfive-2-lite": "starfive/vf2-lite",
+    "starfive-vf2-lite": "starfive/vf2-lite",
+    "starfive/vf2-lite": "starfive/vf2-lite",
+    "vf2": "starfive/vf2",
+    "visionfive2": "starfive/vf2",
+    "visionfive-2": "starfive/vf2",
+    "starfive-vf2": "starfive/vf2",
+    "starfive/vf2": "starfive/vf2",
+    "starfive/visionfive2": "starfive/vf2",
+    "mars": "milkv/mars",
+    "milkv-mars": "milkv/mars",
+    "milkv/mars": "milkv/mars",
+    "milk-v/mars": "milkv/mars",
+    "rv2": "orangepi/rv2",
     "opirv2": "orangepi/rv2",
-    "orangepi-r2s": "orangepi/r2s",
+    "orangepi-rv2": "orangepi/rv2",
+    "orangepi/rv2": "orangepi/rv2",
+    "r2s": "orangepi/r2s",
     "opir2s": "orangepi/r2s",
+    "orangepi-r2s": "orangepi/r2s",
+    "orangepi/r2s": "orangepi/r2s",
+    "rv": "orangepi/rv",
+    "opirv": "orangepi/rv",
     "orangepi-rv": "orangepi/rv",
-    "bananapi-f3": "bananapi/f3",
+    "orangepi/rv": "orangepi/rv",
+    "f3": "bananapi/f3",
+    "bpif3": "bananapi/f3",
     "bpi-f3": "bananapi/f3",
-    "milkv-jupiter": "milkv/jupiter",
+    "bananapi-f3": "bananapi/f3",
+    "bananapi/f3": "bananapi/f3",
+    "bananapi/bpi-f3": "bananapi/f3",
+    "banana-pi/f3": "bananapi/f3",
+    "cm6": "bananapi/cm6",
+    "bpicm6": "bananapi/cm6",
+    "bpi-cm6": "bananapi/cm6",
+    "bananapi-cm6": "bananapi/cm6",
+    "bananapi/cm6": "bananapi/cm6",
+    "bananapi/bpi-cm6": "bananapi/cm6",
+    "banana-pi/cm6": "bananapi/cm6",
+    "jupiter2": "milkv/jupiter2",
+    "jptr2": "milkv/jupiter2",
     "milkv-jupiter2": "milkv/jupiter2",
+    "milkv/jupiter2": "milkv/jupiter2",
+    "milk-v/jupiter2": "milkv/jupiter2",
+    "jupiter": "milkv/jupiter",
+    "jptr1": "milkv/jupiter",
+    "jupiter1": "milkv/jupiter",
+    "milkv-jupiter": "milkv/jupiter",
+    "milkv/jupiter": "milkv/jupiter",
+    "milk-v/jupiter": "milkv/jupiter",
+    "aibox-k3": "firefly/aibox-k3",
+    "aiboxk3": "firefly/aibox-k3",
+    "firefly-k3": "firefly/aibox-k3",
+    "firefly-aibox-k3": "firefly/aibox-k3",
+    "firefly/aibox-k3": "firefly/aibox-k3",
+    "titan": "milkv/titan",
+    "dp1000": "milkv/titan",
+    "milkv-titan": "milkv/titan",
+    "milkv/titan": "milkv/titan",
+    "milk-v/titan": "milkv/titan",
+    "ultrarisc-titan": "milkv/titan",
+    "ultrarisc/titan": "milkv/titan",
+    "atlantis": "tenstorrent/atlantis",
+    "tt-atlantis": "tenstorrent/atlantis",
+    "ascalon": "tenstorrent/atlantis",
+    "tenstorrent-atlantis": "tenstorrent/atlantis",
+    "tenstorrent/atlantis": "tenstorrent/atlantis",
+    "blackhole": "tenstorrent/blackhole",
+    "tt-blackhole": "tenstorrent/blackhole",
+    "tenstorrent-blackhole": "tenstorrent/blackhole",
+    "tenstorrent/blackhole": "tenstorrent/blackhole",
 }
 target = aliases.get(q, q)
 for p in sorted(glob.glob(os.path.join(boards_root, "*", "*", "media.json"))):
@@ -257,7 +397,9 @@ _rvdk_flash_verify_sha256() {
             _RVDK_TMPFILES+=("${sha_file}.tmp")
             if ! _rvdk_flash_curl "$remote_sha_url" -fsSL --retry 3 -o "${sha_file}.tmp"; then
                 rm -f "${sha_file}.tmp"
-                declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1 && _rvdk_untrack_tmpfile "${sha_file}.tmp"
+                if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                    _rvdk_untrack_tmpfile "${sha_file}.tmp"
+                fi
                 if [[ "$skip_sha" == "true" ]]; then
                     log_warn "SHA-256 manifest unavailable at ${remote_sha_url}; proceeding ONLY because --insecure-skip-sha256 was set."
                     return 0
@@ -265,7 +407,9 @@ _rvdk_flash_verify_sha256() {
                 log_fatal "Fail-closed security check: unable to fetch SHA-256 digest from ${remote_sha_url}. Supply --sha256 <hex> or --insecure-skip-sha256."
             fi
             mv -f "${sha_file}.tmp" "$sha_file"
-            declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1 && _rvdk_untrack_tmpfile "${sha_file}.tmp"
+            if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                _rvdk_untrack_tmpfile "${sha_file}.tmp"
+            fi
             chown "$owner_user" "$sha_file" 2>/dev/null || true
         fi
         if [[ -s "$sha_file" ]]; then
@@ -462,7 +606,7 @@ EOF
                     notes+=("-commit=600")
                 fi
                 rm -f "$tmp_fstab" "$tmp_fcmds"
-                if declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
                     _rvdk_untrack_tmpfile "$tmp_fstab"
                     _rvdk_untrack_tmpfile "$tmp_fcmds"
                 fi
@@ -561,7 +705,7 @@ EOF
                 seeded="true"
             fi
             rm -f "$tmp_rtc" "$tmp_empty" "$tmp_cmds"
-            if declare -F _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+            if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
                 _rvdk_untrack_tmpfile "$tmp_rtc"
                 _rvdk_untrack_tmpfile "$tmp_empty"
                 _rvdk_untrack_tmpfile "$tmp_cmds"
@@ -640,13 +784,13 @@ _rvdk_flash_postprocess_raw() {
         _rvdk_harden_ext4_superblock "$tune2fs_bin" "$e2fsck_bin" "$debugfs_bin" "$root_slice"
 
         if [[ -n "$root_label" && -x "$e2label_bin" ]]; then
-            _rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" "$root_label"
-            local verified_lbl=""
-            verified_lbl="$(_rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" 2>/dev/null | tr -d '[:space:]' || true)"
-            if [[ "$verified_lbl" != "$root_label" ]]; then
-                log_fatal "Failed to verify ext4 label '${root_label}' on ${root_slice} (got '${verified_lbl}')."
+            local cur_mac_lbl=""
+            cur_mac_lbl="$(_rvdk_dev_priv "$root_slice" "$e2label_bin" "$root_slice" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ "$cur_mac_lbl" == "$root_label" ]]; then
+                log_skip "Ext4 rootfs label already '${root_label}' on ${root_slice}"
+            else
+                log_warn "Skipping host e2label on macOS (${root_slice}: '${cur_mac_lbl:-<none>}' -> '${root_label}'): offline /etc/fstab & /boot/* patching is unavailable on macOS. On-target 'sudo rvdk bsp' will converge labels safely."
             fi
-            log_ok "Labeled ext4 rootfs : ${root_slice} -> ${verified_lbl}"
         fi
 
         _rvdk_seed_ext4_rtc_floor "$debugfs_bin" "$tune2fs_bin" "$root_slice"
@@ -727,6 +871,7 @@ _rvdk_flash_postprocess_raw() {
     local need_mount="false"
     [[ "$regen_uuid" == "true" || "$uuid_collision" == "true" ]] && need_mount="true"
     [[ "$emmc_boot0" == "true" && -b "${block_dev}boot0" ]] && need_mount="true"
+    [[ -n "$old_label" && -n "$root_label" && "$old_label" != "$root_label" ]] && need_mount="true"
 
     local new_uuid=""
     if [[ "$regen_uuid" == "true" || "$uuid_collision" == "true" ]]; then
@@ -776,12 +921,40 @@ _rvdk_flash_postprocess_raw() {
             cfg_full="${_RVDK_FLASH_TMP_MNT}/${cfg_rel}"
             [[ -f "$cfg_full" ]] || continue
             if [[ -n "$old_uuid" && -n "$new_uuid" ]] && _rvdk_run_priv grep -qF "$old_uuid" "$cfg_full" 2>/dev/null; then
-                _rvdk_run_priv sed -i "s|${old_uuid}|${new_uuid}|g" "$cfg_full"
-                log_ok "Updated root UUID in target /${cfg_rel}"
+                local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
+                cur_cfg="$(_rvdk_run_priv cat "$cfg_full" 2>/dev/null || true)"
+                if [[ -n "$cur_cfg" ]]; then
+                    new_cfg="$(_rvdk_flash_rewrite_literal "$old_uuid" "$new_uuid" <<< "$cur_cfg")"
+                    if [[ "$new_cfg" != "$cur_cfg" ]]; then
+                        cfg_dir="$(dirname "$cfg_full")"
+                        cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$cfg_full").rvdk.XXXXXX")"
+                        if printf '%s\n' "$new_cfg" | _rvdk_run_priv tee "$cfg_tmp" >/dev/null; then
+                            _rvdk_run_priv chmod --reference="$cfg_full" "$cfg_tmp" 2>/dev/null || _rvdk_run_priv chmod 0644 "$cfg_tmp" 2>/dev/null || true
+                            _rvdk_run_priv mv -f "$cfg_tmp" "$cfg_full"
+                            log_ok "Updated root UUID in target /${cfg_rel}"
+                        else
+                            _rvdk_run_priv rm -f "$cfg_tmp" 2>/dev/null || true
+                        fi
+                    fi
+                fi
             fi
             if [[ -n "$old_label" && -n "$root_label" && "$old_label" != "$root_label" ]] && _rvdk_run_priv grep -qF "LABEL=${old_label}" "$cfg_full" 2>/dev/null; then
-                _rvdk_run_priv sed -i "s|LABEL=${old_label}|LABEL=${root_label}|g" "$cfg_full"
-                log_ok "Updated root LABEL in target /${cfg_rel} (${old_label} -> ${root_label})"
+                local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
+                cur_cfg="$(_rvdk_run_priv cat "$cfg_full" 2>/dev/null || true)"
+                if [[ -n "$cur_cfg" ]]; then
+                    new_cfg="$(_rvdk_flash_rewrite_label_token "$old_label" "$root_label" <<< "$cur_cfg")"
+                    if [[ "$new_cfg" != "$cur_cfg" ]]; then
+                        cfg_dir="$(dirname "$cfg_full")"
+                        cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$cfg_full").rvdk.XXXXXX")"
+                        if printf '%s\n' "$new_cfg" | _rvdk_run_priv tee "$cfg_tmp" >/dev/null; then
+                            _rvdk_run_priv chmod --reference="$cfg_full" "$cfg_tmp" 2>/dev/null || _rvdk_run_priv chmod 0644 "$cfg_tmp" 2>/dev/null || true
+                            _rvdk_run_priv mv -f "$cfg_tmp" "$cfg_full"
+                            log_ok "Updated root LABEL in target /${cfg_rel} (${old_label} -> ${root_label})"
+                        else
+                            _rvdk_run_priv rm -f "$cfg_tmp" 2>/dev/null || true
+                        fi
+                    fi
+                fi
             fi
         done
 
@@ -1076,16 +1249,16 @@ PY
         [[ -z "$disk_info" ]] && log_fatal "Device ${block_dev} does not exist. Check 'diskutil list external physical'."
 
         local is_internal is_removable is_virtual disk_size_line
-        is_internal="$(awk -F': *' '/Device Location:/ {print $2}' <<< "$disk_info" | xargs)"
-        is_removable="$(awk -F': *' '/Removable Media:/ {print $2}' <<< "$disk_info" | xargs)"
-        is_virtual="$(awk -F': *' '/Virtual:/ {print $2}' <<< "$disk_info" | xargs)"
-        media_name="$(awk -F': *' '/Device \/ Media Name:/ {print $2}' <<< "$disk_info" | xargs)"
-        disk_size_line="$(awk -F': *' '/Disk Size:/ {print $2}' <<< "$disk_info" | xargs)"
+        is_internal="$(awk '/^[[:space:]]*Device Location:[[:space:]]*/ { sub(/^[[:space:]]*Device Location:[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit }' <<< "$disk_info")"
+        is_removable="$(awk '/^[[:space:]]*Removable Media:[[:space:]]*/ { sub(/^[[:space:]]*Removable Media:[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit }' <<< "$disk_info")"
+        is_virtual="$(awk '/^[[:space:]]*Virtual:[[:space:]]*/ { sub(/^[[:space:]]*Virtual:[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit }' <<< "$disk_info")"
+        media_name="$(awk '/^[[:space:]]*Device \/ Media Name:[[:space:]]*/ { sub(/^[[:space:]]*Device \/ Media Name:[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit }' <<< "$disk_info")"
+        disk_size_line="$(awk '/^[[:space:]]*Disk Size:[[:space:]]*/ { sub(/^[[:space:]]*Disk Size:[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit }' <<< "$disk_info")"
         disk_bytes="$(grep -oE '\([0-9]+ Bytes\)' <<< "$disk_size_line" | tr -dc '0-9' || echo 0)"
         [[ -z "$disk_bytes" ]] && disk_bytes=0
 
-        if [[ "$is_internal" == "Internal" && "$is_removable" != "Removable" && "$is_virtual" != "Yes" ]]; then
-            log_fatal "Safety Interlock: ${block_dev} (${media_name}) is an INTERNAL non-removable drive! Aborting."
+        if [[ "$is_internal" != "External" || "$is_virtual" == "Yes" || "$is_removable" != "Removable" ]]; then
+            log_fatal "Safety Interlock: ${block_dev} (${media_name:-unknown}) rejected (location=${is_internal:-unknown}, removable=${is_removable:-unknown}, virtual=${is_virtual:-unknown}); requires External, non-Virtual, Removable media! Aborting."
         fi
 
         if [[ "$flash_mode" == "uboot_ext4" ]]; then
@@ -1270,23 +1443,65 @@ PY
         local stage_dir="${cache_dir}/${board_tag}-${medium}-stage"
         mkdir -p "$stage_dir"
         local staged_img="${stage_dir}/${uboot_payload}"
+        local stage_stamp="${staged_img}.rvdk-stage.sha256"
 
         if [[ "$image_path" == "$staged_img" ]]; then
             log_info "Using uncompressed payload at ${staged_img}"
-        elif [[ -f "$staged_img" && "$staged_img" -nt "$image_path" ]]; then
-            log_ok "Reusing decompressed staging payload: ${staged_img}"
         else
-            log_info "Decompressing U-Boot payload to ${staged_img}..."
-            find "$stage_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-            case "$image_path" in
-                *.zst) zstd -dc "$image_path" > "$staged_img" ;;
-                *.xz)  xz -dc "$image_path" > "$staged_img" ;;
-                *.bz2) bzip2 -dc "$image_path" > "$staged_img" ;;
-                *.gz)  gzip -dc "$image_path" > "$staged_img" ;;
-                *)     cp "$image_path" "$staged_img" ;;
-            esac
-            chown -R "$REAL_USER" "$stage_dir" 2>/dev/null || true
-            log_ok "Staged payload: ${staged_img}"
+            local src_sha256 stage_reuse="false"
+            src_sha256="$(rvdk_sha256_file "$image_path")"
+            if [[ -f "$staged_img" ]]; then
+                if [[ -f "$stage_stamp" ]]; then
+                    local rec_src_sha="" rec_staged_sha="" cur_staged_sha=""
+                    read -r rec_src_sha rec_staged_sha _ < "$stage_stamp" || true
+                    if [[ "$rec_src_sha" =~ ^[0-9a-f]{64}$ && "$rec_staged_sha" =~ ^[0-9a-f]{64}$ && "$rec_src_sha" == "$src_sha256" ]]; then
+                        cur_staged_sha="$(rvdk_sha256_file "$staged_img")"
+                        if [[ "$cur_staged_sha" == "$rec_staged_sha" ]]; then
+                            stage_reuse="true"
+                        else
+                            log_warn "Staged payload ${staged_img} failed SHA-256 verification (expected ${rec_staged_sha}, got ${cur_staged_sha}); re-decompressing atomically."
+                        fi
+                    else
+                        log_warn "Staged payload ${staged_img} does not match source archive SHA-256; re-decompressing atomically."
+                    fi
+                else
+                    log_warn "Staged payload ${staged_img} is missing verification sidecar (${stage_stamp}); re-decompressing atomically."
+                fi
+            fi
+
+            if [[ "$stage_reuse" == "true" ]]; then
+                log_ok "Reusing verified decompressed staging payload: ${staged_img}"
+            else
+                log_info "Decompressing U-Boot payload to ${staged_img}..."
+                _rvdk_flash_register_cleanup
+                find "$stage_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+                local tmp_img decomp_rc=0
+                tmp_img="$(mktemp "${staged_img}.tmp.XXXXXX")"
+                _RVDK_TMPFILES+=("$tmp_img")
+                case "$image_path" in
+                    *.zst) zstd -dc "$image_path" > "$tmp_img" || decomp_rc=$? ;;
+                    *.xz)  xz -dc "$image_path" > "$tmp_img" || decomp_rc=$? ;;
+                    *.bz2) bzip2 -dc "$image_path" > "$tmp_img" || decomp_rc=$? ;;
+                    *.gz)  gzip -dc "$image_path" > "$tmp_img" || decomp_rc=$? ;;
+                    *)     cp "$image_path" "$tmp_img" || decomp_rc=$? ;;
+                esac
+                if (( decomp_rc != 0 )); then
+                    rm -f "$tmp_img" 2>/dev/null || true
+                    if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                        _rvdk_untrack_tmpfile "$tmp_img"
+                    fi
+                    log_fatal "Failed to decompress U-Boot payload from ${image_path} (exit ${decomp_rc})."
+                fi
+                mv -f "$tmp_img" "$staged_img"
+                if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                    _rvdk_untrack_tmpfile "$tmp_img"
+                fi
+                local staged_sha256
+                staged_sha256="$(rvdk_sha256_file "$staged_img")"
+                printf '%s %s\n' "$src_sha256" "$staged_sha256" | rvdk_atomic_write "$stage_stamp" 0644
+                chown -R "$REAL_USER" "$stage_dir" 2>/dev/null || true
+                log_ok "Staged payload: ${staged_img}"
+            fi
         fi
 
         [[ "$need_sudo" == "true" ]] && sudo -v

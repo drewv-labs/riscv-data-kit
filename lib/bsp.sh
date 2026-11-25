@@ -56,11 +56,29 @@ rvdk_bsp_protect_dpkg() {
 }
 
 rvdk_bsp_backup_boot_configs() {
-    local cfg
+    local backup_dir="${RVDK_BOOT_BACKUP_DIR:-/var/lib/rvdk/backups/boot}"
+    local cfg encoded backup_path legacy_bak
     for cfg in "$@"; do
-        if [[ -f "$cfg" && ! -f "${cfg}.factory.bak" ]]; then
-            cp -a "$cfg" "${cfg}.factory.bak"
-            log_ok "Backed up factory boot artifact to ${cfg}.factory.bak"
+        [[ -n "$cfg" ]] || continue
+        encoded="${cfg#/}"
+        while [[ "$encoded" == /* ]]; do
+            encoded="${encoded#/}"
+        done
+        encoded="${encoded//\//__}"
+        backup_path="${backup_dir}/${encoded}.orig"
+        legacy_bak="${cfg}.factory.bak"
+
+        if [[ -f "$legacy_bak" && ! -L "$legacy_bak" ]]; then
+            install -d -m 0755 "$backup_dir"
+            if [[ ! -f "$backup_path" ]]; then
+                cp -a "$legacy_bak" "$backup_path"
+                log_ok "Migrated factory boot artifact to ${backup_path}"
+            fi
+            rm -f "$legacy_bak"
+        elif [[ -f "$cfg" && ! -f "$backup_path" ]]; then
+            install -d -m 0755 "$backup_dir"
+            cp -a "$cfg" "$backup_path"
+            log_ok "Backed up factory boot artifact to ${backup_path}"
         fi
     done
 }
@@ -170,6 +188,60 @@ _rvdk_bsp_strip_fstab_commit() {
             }
         }
         print
+    }'
+}
+
+_rvdk_bsp_rewrite_label_token() {
+    local old_lbl="$1"
+    local new_lbl="$2"
+    RVDK_OLD_LBL="$old_lbl" RVDK_NEW_LBL="$new_lbl" awk '
+    BEGIN {
+        old_val = ENVIRON["RVDK_OLD_LBL"]
+        needle = "LABEL=" old_val
+        repl = "LABEL=" ENVIRON["RVDK_NEW_LBL"]
+        nlen = length(needle)
+    }
+    {
+        if (length(old_val) == 0) {
+            print $0
+            next
+        }
+        s = $0
+        out = ""
+        while ((pos = index(s, needle)) > 0) {
+            out = out substr(s, 1, pos - 1)
+            prev = (length(out) > 0) ? substr(out, length(out), 1) : ""
+            after = substr(s, pos + nlen, 1)
+            prev_ok = (prev == "" || prev ~ /[[:space:]]/ || index(",=\"\047", prev) > 0)
+            after_ok = (after == "" || after ~ /[[:space:]]/ || index(",\"\047", after) > 0)
+            if (prev_ok && after_ok) {
+                out = out repl
+            } else {
+                out = out needle
+            }
+            s = substr(s, pos + nlen)
+        }
+        print out s
+    }'
+}
+
+_rvdk_bsp_rewrite_literal() {
+    local old_str="$1"
+    local new_str="$2"
+    RVDK_OLD_STR="$old_str" RVDK_NEW_STR="$new_str" awk '
+    BEGIN {
+        needle = ENVIRON["RVDK_OLD_STR"]
+        repl = ENVIRON["RVDK_NEW_STR"]
+        nlen = length(needle)
+    }
+    {
+        s = $0
+        out = ""
+        while (nlen > 0 && (pos = index(s, needle)) > 0) {
+            out = out substr(s, 1, pos - 1) repl
+            s = substr(s, pos + nlen)
+        }
+        print out s
     }'
 }
 
@@ -330,7 +402,7 @@ rvdk_bsp_converge_mmc_root_labels() {
                     local new_uuid=""
                     new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
                     tune2fs -U "$new_uuid" "$root_part" >/dev/null
-                    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+                    if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
                         rvdk_register_cleanup _rvdk_bsp_cleanup_tmp_mnt
                     fi
                     _RVDK_BSP_TMP_MNT="$(mktemp -d "/tmp/rvdk_mmc_uuid.XXXXXX")"
@@ -339,8 +411,10 @@ rvdk_bsp_converge_mmc_root_labels() {
                         for rel_cfg in etc/fstab boot/orangepiEnv.txt boot/armbianEnv.txt boot/env_k1-x.txt boot/spacemit/env_k1-x.txt boot/extlinux/extlinux.conf boot/efi/extlinux.conf; do
                             if [[ -f "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" ]] && grep -qF "$peer_uuid" "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 2>/dev/null; then
                                 local _peer_rewritten
-                                _peer_rewritten="$(sed "s|${peer_uuid}|${new_uuid}|g" "${_RVDK_BSP_TMP_MNT}/${rel_cfg}")"
-                                printf '%s\n' "$_peer_rewritten" | rvdk_atomic_write "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 0644
+                                _peer_rewritten="$(_rvdk_bsp_rewrite_literal "$peer_uuid" "$new_uuid" < "${_RVDK_BSP_TMP_MNT}/${rel_cfg}")"
+                                if ! printf '%s\n' "$_peer_rewritten" | cmp -s - "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 2>/dev/null; then
+                                    printf '%s\n' "$_peer_rewritten" | rvdk_atomic_write "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 0644
+                                fi
                             fi
                         done
                         sync
@@ -352,10 +426,23 @@ rvdk_bsp_converge_mmc_root_labels() {
         fi
 
         if [[ "$cur_lbl" != "$want_lbl" ]]; then
-            if [[ "$root_part" == "$live_root" && -n "$cur_lbl" && -f /etc/fstab ]] && grep -qF "LABEL=${cur_lbl}" /etc/fstab 2>/dev/null; then
-                local _fstab_lbl
-                _fstab_lbl="$(sed "s|LABEL=${cur_lbl}|LABEL=${want_lbl}|g" /etc/fstab)"
-                printf '%s\n' "$_fstab_lbl" | rvdk_atomic_write /etc/fstab 0644
+            if [[ "$root_part" == "$live_root" && -n "$cur_lbl" ]]; then
+                local live_cfg _lbl_rewritten
+                for live_cfg in \
+                    /etc/fstab \
+                    /boot/extlinux/extlinux.conf \
+                    /boot/efi/extlinux.conf \
+                    /boot/armbianEnv.txt \
+                    /boot/orangepiEnv.txt \
+                    /boot/env_k1-x.txt \
+                    /boot/spacemit/env_k1-x.txt; do
+                    if [[ -f "$live_cfg" ]] && grep -qF "LABEL=${cur_lbl}" "$live_cfg" 2>/dev/null; then
+                        _lbl_rewritten="$(_rvdk_bsp_rewrite_label_token "$cur_lbl" "$want_lbl" < "$live_cfg")"
+                        if ! printf '%s\n' "$_lbl_rewritten" | cmp -s - "$live_cfg" 2>/dev/null; then
+                            printf '%s\n' "$_lbl_rewritten" | rvdk_atomic_write "$live_cfg" 0644
+                        fi
+                    fi
+                done
             fi
             e2label "$root_part" "$want_lbl"
             log_ok "Labeled ${mmc_kind} ext4 rootfs: ${root_part} -> ${want_lbl}"

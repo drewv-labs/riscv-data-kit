@@ -103,6 +103,58 @@ rvdk_vg_exclusively_on_disk() {
     [[ "$found_pv" == "true" ]]
 }
 
+# Query mountpoints for <dev> and all descendants, supporting both `MOUNTPOINTS`
+# (util-linux >= 2.38, multi-mount per node) and legacy `MOUNTPOINT`.
+# Splits multi-line and literal `\n` / `\x0a` separators into one path per line.
+_rvdk_lsblk_mountpoints() {
+    local dev="${1:-}"
+    [[ -n "$dev" ]] || return 0
+
+    local out=""
+    if ! out="$(lsblk -nr -o MOUNTPOINTS "$dev" 2>/dev/null)"; then
+        out="$(lsblk -nr -o MOUNTPOINT "$dev" 2>/dev/null || true)"
+    fi
+    [[ -n "$out" ]] || return 0
+
+    awk '{
+        gsub(/\\x0[aA]/, "\n")
+        gsub(/\\n/, "\n")
+        n = split($0, parts, "\n")
+        for (i = 1; i <= n; i++) {
+            if (parts[i] != "") print parts[i]
+        }
+    }' <<< "$out"
+}
+
+# Parse one `lsblk -P -o PATH,TYPE,FSTYPE,LABEL` line safely without `eval`.
+# Sets: _RVDK_SG_PATH, _RVDK_SG_TYPE, _RVDK_SG_FSTYPE, _RVDK_SG_LABEL
+_rvdk_storage_parse_lsblk_line() {
+    local rest="${1:-}"
+    _RVDK_SG_PATH=""
+    _RVDK_SG_TYPE=""
+    _RVDK_SG_FSTYPE=""
+    _RVDK_SG_LABEL=""
+
+    local pair_re='^([A-Za-z_][A-Za-z0-9_]*)="(([^"\\]|\\.)*)"[[:space:]]*(.*)$'
+    while [[ -n "$rest" ]]; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [[ -z "$rest" ]] && break
+        if [[ "$rest" =~ $pair_re ]]; then
+            local k="${BASH_REMATCH[1]}"
+            local v="${BASH_REMATCH[2]}"
+            rest="${BASH_REMATCH[4]}"
+            case "$k" in
+                PATH)   _RVDK_SG_PATH="$v" ;;
+                TYPE)   _RVDK_SG_TYPE="$v" ;;
+                FSTYPE) _RVDK_SG_FSTYPE="$v" ;;
+                LABEL)  _RVDK_SG_LABEL="$v" ;;
+            esac
+        else
+            break
+        fi
+    done
+}
+
 # Returns 0 if any partition/LV on <dev> backs a critical OS mountpoint or active swap
 rvdk_device_backs_os_or_swap() {
     local dev="$1"
@@ -114,7 +166,7 @@ rvdk_device_backs_os_or_swap() {
                 return 0
                 ;;
         esac
-    done < <(lsblk -nr -o MOUNTPOINT "$dev" 2>/dev/null || true)
+    done < <(_rvdk_lsblk_mountpoints "$dev")
 
     # Cross-check /proc/swaps against child block nodes
     if [[ -r /proc/swaps ]]; then
@@ -131,11 +183,13 @@ rvdk_device_backs_os_or_swap() {
 }
 
 # Assert that <dev> is safe to wipe/format.
-# Usage: rvdk_assert_device_safe_to_wipe <dev> <force_wipe_bool> [allowed_label_csv]
+# Usage: rvdk_assert_device_safe_to_wipe <dev> <force_wipe_bool> [_unused_allowed_labels]
 rvdk_assert_device_safe_to_wipe() {
     local dev="$1"
     local force_wipe="${2:-false}"
-    local allowed_labels=",${3:-},"
+    # Optional 3rd parameter retained for caller compatibility; never bypasses wipe guard when force_wipe != true.
+    local _unused_allowed="${3:-}"
+    : "$_unused_allowed"
 
     [[ -b "$dev" ]] || log_fatal "Block device not found: ${dev}"
 
@@ -153,30 +207,50 @@ rvdk_assert_device_safe_to_wipe() {
     local m
     while IFS= read -r m; do
         [[ -n "$m" ]] && active_mnts+=("$m")
-    done < <(lsblk -nr -o MOUNTPOINT "$dev" 2>/dev/null || true)
+    done < <(_rvdk_lsblk_mountpoints "$dev")
     if [[ ${#active_mnts[@]} -gt 0 ]]; then
         log_fatal "Safety Interlock: ${dev} has mounted filesystem(s) (${active_mnts[*]}). Unmount and pass --force-wipe if you intend to destroy existing data."
     fi
 
-    # Hard Interlock 3 (when force_wipe == false): Refuse if existing non-RVDK filesystem, LVM PV, RAID, ZFS, or LUKS exists
-    local line fstype label
+    # Hard Interlock 3 (when force_wipe == false): Refuse if ANY existing filesystem, LVM PV, RAID, ZFS, or LUKS exists
+    local line node_desc
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        fstype="$(awk '{print $1}' <<< "$line")"
-        label="$(awk '{print $2}' <<< "$line")"
-        [[ -z "$fstype" || "$fstype" == "-" ]] && continue
-        if [[ -n "$label" && "$allowed_labels" == *",${label},"* ]]; then
-            continue
+        _rvdk_storage_parse_lsblk_line "$line"
+        [[ -z "$_RVDK_SG_FSTYPE" || "$_RVDK_SG_FSTYPE" == "-" ]] && continue
+        node_desc="$dev"
+        if [[ -n "$_RVDK_SG_PATH" && "$_RVDK_SG_PATH" != "$dev" ]]; then
+            node_desc="${dev} (${_RVDK_SG_PATH})"
         fi
-        log_fatal "Safety Interlock: ${dev} already contains '${fstype}' signature${label:+ (label=${label})}. Pass --force-wipe to overwrite."
-    done < <(lsblk -nr -o FSTYPE,LABEL "$dev" 2>/dev/null | awk '{print ($1==""?"-":$1), $2}' || true)
+        log_fatal "Safety Interlock: ${node_desc} already contains '${_RVDK_SG_FSTYPE}' signature${_RVDK_SG_LABEL:+ (label=${_RVDK_SG_LABEL})}. Pass --force-wipe to overwrite."
+    done < <(lsblk -P -o PATH,TYPE,FSTYPE,LABEL "$dev" 2>/dev/null || true)
 
-    local blkid_type blkid_lbl
-    blkid_type="$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)"
-    blkid_lbl="$(blkid -s LABEL -o value "$dev" 2>/dev/null || true)"
-    if [[ -n "$blkid_type" ]] && ! [[ -n "$blkid_lbl" && "$allowed_labels" == *",${blkid_lbl},"* ]]; then
-        log_fatal "Safety Interlock: ${dev} contains existing '${blkid_type}' superblock${blkid_lbl:+ (label=${blkid_lbl})}. Pass --force-wipe to overwrite."
-    fi
+    local -a blkid_nodes=("$dev")
+    local _p _seen _existing
+    while IFS= read -r _p; do
+        [[ -n "$_p" ]] || continue
+        _seen="false"
+        for _existing in "${blkid_nodes[@]}"; do
+            if [[ "$_existing" == "$_p" ]]; then
+                _seen="true"
+                break
+            fi
+        done
+        [[ "$_seen" == "false" ]] && blkid_nodes+=("$_p")
+    done < <(lsblk -nr -o PATH "$dev" 2>/dev/null || true)
+
+    local blk_node blkid_type blkid_lbl
+    for blk_node in "${blkid_nodes[@]}"; do
+        blkid_type="$(blkid -s TYPE -o value "$blk_node" 2>/dev/null || true)"
+        blkid_lbl="$(blkid -s LABEL -o value "$blk_node" 2>/dev/null || true)"
+        if [[ -n "$blkid_type" ]]; then
+            node_desc="$dev"
+            if [[ "$blk_node" != "$dev" ]]; then
+                node_desc="${dev} (${blk_node})"
+            fi
+            log_fatal "Safety Interlock: ${node_desc} contains existing '${blkid_type}' superblock${blkid_lbl:+ (label=${blkid_lbl})}. Pass --force-wipe to overwrite."
+        fi
+    done
 }
 
 # Returns 0 only if a whole disk is genuinely blank/unused (no mounts, swap, partitions, holders, or FS magic)
@@ -186,7 +260,7 @@ rvdk_disk_is_blank() {
     rvdk_device_backs_os_or_swap "$dev" && return 1
 
     local m
-    m="$(lsblk -nr -o MOUNTPOINT "$dev" 2>/dev/null | tr -d '[:space:]' || true)"
+    m="$(_rvdk_lsblk_mountpoints "$dev" | tr -d '[:space:]' || true)"
     [[ -n "$m" ]] && return 1
 
     # Reject if child partitions or dm/md holders exist
@@ -205,4 +279,54 @@ rvdk_disk_is_blank() {
         return 1
     fi
     return 0
+}
+
+# Idempotently converge an fstab entry matching <spec> or <mount> in [fstab_file] (default: /etc/fstab).
+# Usage: rvdk_converge_fstab_entry <spec> <mount> <fstype> <entry> [fstab_file]
+rvdk_converge_fstab_entry() {
+    local spec="$1"
+    local mnt="$2"
+    local fstype="$3"
+    local entry="$4"
+    local fstab_file="${5:-/etc/fstab}"
+    local want_fstab=""
+
+    if [[ -s "$fstab_file" ]]; then
+        want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
+            BEGIN {
+                replaced = 0
+                while (length(mp) > 1 && substr(mp, length(mp), 1) == "/") {
+                    mp = substr(mp, 1, length(mp) - 1)
+                }
+            }
+            /^[[:space:]]*#/ || NF < 2 { print; next }
+            {
+                m = $2
+                while (length(m) > 1 && substr(m, length(m), 1) == "/") {
+                    m = substr(m, 1, length(m) - 1)
+                }
+                if ($1 == sp || m == mp) {
+                    if (!replaced) {
+                        print line
+                        replaced = 1
+                    }
+                    next
+                }
+                print
+            }
+            END { if (!replaced) print line }
+        ' "$fstab_file")"
+    else
+        want_fstab="$entry"
+    fi
+
+    if [[ -f "$fstab_file" ]] && printf '%s\n' "$want_fstab" | cmp -s - "$fstab_file" 2>/dev/null; then
+        log_skip "${mnt} (${fstype}) already in ${fstab_file}"
+    else
+        printf '%s\n' "$want_fstab" | rvdk_atomic_write "$fstab_file" 0644
+        if [[ "$fstab_file" == "/etc/fstab" ]] && command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+        fi
+        log_ok "Persisted ${spec} -> ${mnt} (${fstype}) in ${fstab_file}"
+    fi
 }

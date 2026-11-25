@@ -163,7 +163,7 @@ _btrfs_ensure_unmounted() {
         [[ -n "$d" && -b "$d" ]] || continue
         while IFS= read -r _desc_mnt; do
             [[ -n "$_desc_mnt" && "$_desc_mnt" == /* ]] && mnt_targets+=("$_desc_mnt")
-        done < <(lsblk -rn -o MOUNTPOINT "$d" 2>/dev/null || true)
+        done < <(_rvdk_lsblk_mountpoints "$d")
     done
 
     if (( ${#mnt_targets[@]} > 0 )); then
@@ -183,11 +183,15 @@ _btrfs_ensure_unmounted() {
         while IFS= read -r _desc_mnt; do
             [[ -z "$_desc_mnt" ]] && continue
             log_fatal "Cannot proceed on '${arr_name}': disk ${d} still has active/busy mount '${_desc_mnt}'."
-        done < <(lsblk -rn -o MOUNTPOINT "$d" 2>/dev/null || true)
+        done < <(_rvdk_lsblk_mountpoints "$d")
     done
 }
 
 _btrfs_converge_fstab_entry() {
+    if typeset -f rvdk_converge_fstab_entry >/dev/null 2>&1; then
+        rvdk_converge_fstab_entry "$1" "$2" "btrfs" "$3" "${4:-/etc/fstab}"
+        return $?
+    fi
     local spec="$1"
     local mnt="$2"
     local entry="$3"
@@ -196,7 +200,12 @@ _btrfs_converge_fstab_entry() {
 
     if [[ -s "$fstab_file" ]]; then
         want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
-            BEGIN { replaced = 0 }
+            BEGIN {
+                replaced = 0
+                while (length(mp) > 1 && substr(mp, length(mp), 1) == "/") {
+                    mp = substr(mp, 1, length(mp) - 1)
+                }
+            }
             /^[[:space:]]*#/ || NF < 2 { print; next }
             {
                 m = $2
@@ -222,7 +231,7 @@ _btrfs_converge_fstab_entry() {
         log_skip "${spec} already in ${fstab_file}"
     else
         printf '%s\n' "$want_fstab" | rvdk_atomic_write "$fstab_file" 0644
-        if [[ "$fstab_file" == "/etc/fstab" ]]; then
+        if [[ "$fstab_file" == "/etc/fstab" ]] && command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload
         fi
         log_ok "Added ${spec} to ${fstab_file}"
@@ -263,7 +272,9 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
 
     [[ -z "$ARR_LABEL" || ! "$ARR_LABEL" =~ ^[A-Za-z0-9._-]+$ ]] && log_fatal "Invalid or missing Btrfs label '${ARR_LABEL}' on array '${ARR_NAME}'."
     [[ -z "$ARR_MOUNT" || "$ARR_MOUNT" != /* || "$ARR_MOUNT" == "/" ]] && log_fatal "Invalid mountpoint '${ARR_MOUNT}' on array '${ARR_NAME}'."
-    [[ "$ARR_DISKS" =~ ^[0-9]+$ ]] && (( ARR_DISKS > 0 )) || log_fatal "Invalid 'disks' count '${ARR_DISKS}' on array '${ARR_NAME}'."
+    if ! [[ "$ARR_DISKS" =~ ^[0-9]+$ ]] || (( ARR_DISKS <= 0 )); then
+        log_fatal "Invalid 'disks' count '${ARR_DISKS}' on array '${ARR_NAME}'."
+    fi
     [[ "$ARR_MIN_B" =~ ^[0-9]+$ && "$ARR_MAX_B" =~ ^[0-9]+$ ]] || log_fatal "Invalid min_bytes/max_bytes on array '${ARR_NAME}'."
     case "$ARR_PROFILE" in
         raid10|raid1|raid1c3|raid1c4|raid0|single) ;;
@@ -373,7 +384,10 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
     fi
 
     mkdir -p "$ARR_MOUNT"
-    ARR_FSTYPE="$(blkid -s TYPE -o value "$EXISTING_DEV" 2>/dev/null || true)"
+    ARR_FSTYPE=""
+    if [[ -n "$EXISTING_DEV" ]]; then
+        ARR_FSTYPE="$(blkid -s TYPE -o value "$EXISTING_DEV" 2>/dev/null || true)"
+    fi
     [[ -z "$ARR_FSTYPE" ]] && ARR_FSTYPE="btrfs"
     if [[ "$ARR_FSTYPE" == "btrfs" ]]; then
         FSTAB_RAID="${EFFECTIVE_ARR_SPEC}  ${ARR_MOUNT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=30s  0  2"

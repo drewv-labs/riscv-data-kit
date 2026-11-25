@@ -9,16 +9,22 @@
 #
 # Usage:
 #   curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash
-#   curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo zsh
 # ==============================================================================
 
-# Ensure compatibility when invoked via `zsh` or `bash` (including `curl ... | sudo zsh`)
+# Re-exec under bash if invoked via zsh (requires a file path on disk)
 if [[ -n "${ZSH_VERSION:-}" ]]; then
-    emulate -L ksh
-    setopt PIPE_FAIL ERR_RETURN NO_UNSET
-else
-    set -Eeuo pipefail
+    case "${0:-}" in
+        zsh|-zsh|*/zsh|*/-zsh|zsh[0-9]*|*/zsh[0-9]*) ;;
+        *)
+            if [[ -f "${0:-}" ]]; then
+                exec bash "$0" "$@"
+            fi
+            ;;
+    esac
+    printf '[FAIL] %s\n' "This script requires bash. When piping over stdin, run: curl ... | sudo bash" >&2
+    exit 1
 fi
+set -Eeuo pipefail
 
 if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
     SCRIPT_SELF="${BASH_SOURCE[0]}"
@@ -46,7 +52,7 @@ if [[ $EUID -ne 0 ]]; then
     if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
         exec sudo -E bash "$SCRIPT_SELF" "$@"
     else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash" >&2
+        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash" >&2
         exit 1
     fi
 fi
@@ -83,6 +89,77 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
     fi
 fi
 
+if ! typeset -f rvdk_assert_safe_managed_dir >/dev/null 2>&1; then
+    rvdk_assert_safe_managed_dir() {
+        local raw_path="${1:-}"
+        local var_name="${2:-PATH}"
+
+        if [[ -z "$raw_path" || "$raw_path" != /* ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' must be a non-empty absolute path."
+        fi
+        if [[ "$raw_path" =~ [[:cntrl:]] ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' contains control characters."
+        fi
+
+        local norm="$raw_path"
+        while [[ "$norm" == *//* ]]; do
+            norm="${norm//\/\///}"
+        done
+        while [[ "$norm" != "/" && "$norm" == */ ]]; do
+            norm="${norm%/}"
+        done
+
+        if [[ "$norm" == "/" ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' resolves to root '/'."
+        fi
+
+        local comp_count=0 seg rest="${norm#/}"
+        while [[ -n "$rest" ]]; do
+            if [[ "$rest" == */* ]]; then
+                seg="${rest%%/*}"
+                rest="${rest#*/}"
+            else
+                seg="$rest"
+                rest=""
+            fi
+            [[ -z "$seg" ]] && continue
+            if [[ "$seg" == "." || "$seg" == ".." ]]; then
+                log_fatal "Unsafe ${var_name}: '${raw_path}' contains '.' or '..' traversal segment."
+            fi
+            comp_count=$(( comp_count + 1 ))
+        done
+
+        if [[ -L "$raw_path" || -L "$norm" ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' is a symbolic link."
+        fi
+
+        if (( comp_count < 2 )); then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' must have at least 2 path components."
+        fi
+
+        if [[ -n "${REAL_HOME:-}" ]]; then
+            local norm_home="$REAL_HOME"
+            while [[ "$norm_home" == *//* ]]; do
+                norm_home="${norm_home//\/\///}"
+            done
+            while [[ "$norm_home" != "/" && "$norm_home" == */ ]]; do
+                norm_home="${norm_home%/}"
+            done
+            if [[ "$norm" == "$norm_home" ]]; then
+                log_fatal "Unsafe ${var_name}: '${raw_path}' resolves to user home '${norm_home}'."
+            fi
+        fi
+
+        case "$norm" in
+            /usr|/usr/local|/usr/local/share|/var|/var/cache|/var/lib|/etc|/home|/root|/opt|/tmp)
+                log_fatal "Unsafe ${var_name}: '${raw_path}' is a protected system directory."
+                ;;
+        esac
+
+        return 0
+    }
+fi
+
 rvdk_log_init "RVDK:CLI"
 rvdk_sanitize_locale
 rvdk_resolve_caller
@@ -91,6 +168,12 @@ LEGACY_HOME_RVDK="${REAL_HOME}/.rvdk"
 SYS_ETC_DIR="/etc/rvdk"
 CACHE_DIR="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
 ENGINE_DIR="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
+rvdk_assert_safe_managed_dir "$CACHE_DIR" "RVDK_CACHE_DIR"
+rvdk_assert_safe_managed_dir "$ENGINE_DIR" "RVDK_ENGINE_DIR"
+while [[ "$CACHE_DIR" == *//* ]]; do CACHE_DIR="${CACHE_DIR//\/\///}"; done
+while [[ "$CACHE_DIR" != "/" && "$CACHE_DIR" == */ ]]; do CACHE_DIR="${CACHE_DIR%/}"; done
+while [[ "$ENGINE_DIR" == *//* ]]; do ENGINE_DIR="${ENGINE_DIR//\/\///}"; done
+while [[ "$ENGINE_DIR" != "/" && "$ENGINE_DIR" == */ ]]; do ENGINE_DIR="${ENGINE_DIR%/}"; done
 ENGINE_PARENT="$(dirname "$ENGINE_DIR")"
 REPO_URL="${RVDK_REPO_URL:-https://github.com/drewv-labs/riscv-data-kit.git}"
 REPO_BRANCH="${RVDK_BRANCH:-main}"
@@ -132,16 +215,19 @@ normalize_pkg_mirrors_early() {
             done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) 2>/dev/null | sort)
         fi
         local changed="false" rendered bname backup_dir="/var/lib/rvdk/backups/apt"
+        local -a sed_exprs=(
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g"
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g"
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g"
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g"
+            -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://apt.armbian.com\\2@g"
+        )
+        if [[ "$scheme" == "https" ]]; then
+            sed_exprs+=(-e '/^[[:space:]]*#/! s@http://apt\.armbian\.com([[:space:]/]|$)@https://apt.armbian.com\1@g')
+        fi
         for f in ${src_files[@]+"${src_files[@]}"}; do
             [[ -f "$f" ]] || continue
-            rendered="$(sed -E \
-                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian-security([[:space:]/]|$)@${scheme}://security.debian.org/debian-security\\2@g" \
-                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/debian([[:space:]/]|$)@${scheme}://deb.debian.org/debian\\2@g" \
-                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu-ports([[:space:]/]|$)@${scheme}://ports.ubuntu.com/ubuntu-ports\\2@g" \
-                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/ubuntu([[:space:]/]|$)@${scheme}://us.archive.ubuntu.com/ubuntu\\2@g" \
-                -e "/^[[:space:]]*#/! s@https?://(${cn_hosts})/armbian([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\2@g" \
-                -e "/^[[:space:]]*#/! s@https?://apt\\.armbian\\.com([[:space:]/]|$)@${scheme}://armbian.chi.auroradev.org/apt\\1@g" \
-                "$f")"
+            rendered="$(sed -E "${sed_exprs[@]}" "$f")"
             if ! printf '%s\n' "$rendered" | cmp -s - "$f" 2>/dev/null; then
                 mkdir -p "$backup_dir"
                 bname="$(printf '%s' "$f" | sed 's@^/@@; s@/@__@g')"

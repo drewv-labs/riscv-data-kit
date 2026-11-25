@@ -205,6 +205,17 @@ if [[ -f "$LEGACY_MODPROBE" ]]; then
     rm -f "$LEGACY_MODPROBE"
 fi
 
+if [[ -L /etc/systemd/system/eic7700x-thp-tune.service || -f /etc/systemd/system/eic7700x-thp-tune.service ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now eic7700x-thp-tune.service >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/eic7700x-thp-tune.service
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    log_ok "Retired legacy eic7700x-thp-tune.service (superseded by rvdk-thp-tune.service)"
+fi
+
 SOC_AUDIO_MODS=(
     esw_es8328_codec
     snd_soc_hdmi_codec

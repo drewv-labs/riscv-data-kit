@@ -142,14 +142,41 @@ rvdk_bsp_backup_boot_configs \
     /boot/extlinux/extlinux.conf \
     /boot/boot/extlinux/extlinux.conf \
     /boot/efi/extlinux.conf \
-    /etc/default/u-boot \
-    /etc/kernel/postinst.d/zz-u-boot-menu
+    /etc/default/u-boot
+
+if [[ -f /etc/kernel/postinst.d/zz-u-boot-menu ]]; then
+    _uboot_hook_bak="/var/lib/rvdk/backups/boot/etc__kernel__postinst.d__zz-u-boot-menu.orig"
+    install -d -m 0755 /var/lib/rvdk/backups/boot
+    if [[ ! -f "$_uboot_hook_bak" ]]; then
+        if [[ -f /etc/kernel/postinst.d/zz-u-boot-menu.factory.bak ]]; then
+            cp -a /etc/kernel/postinst.d/zz-u-boot-menu.factory.bak "$_uboot_hook_bak"
+        else
+            cp -a /etc/kernel/postinst.d/zz-u-boot-menu "$_uboot_hook_bak"
+        fi
+        log_ok "Backed up factory boot artifact to ${_uboot_hook_bak}"
+    fi
+fi
+rm -f /etc/kernel/postinst.d/zz-u-boot-menu.factory.bak 2>/dev/null || true
 
 # 2. Migrate Legacy StarFive Snapshot / debian-ports / CN Mirrors Over Signed US-First HTTPS
 rvdk_prog 28 "JH7110 BSP: checking APT sources & keyring..."
 SNAPSHOT_MIGRATION="false"
-if grep -rqE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-    SNAPSHOT_MIGRATION="true"
+_snapshot_d_matches=()
+_apt_src_candidates=()
+[[ -e /etc/apt/sources.list || -L /etc/apt/sources.list ]] && _apt_src_candidates+=("/etc/apt/sources.list")
+if [[ -d /etc/apt/sources.list.d ]]; then
+    while IFS= read -r _sf; do
+        [[ -n "$_sf" ]] && _apt_src_candidates+=("$_sf")
+    done < <(find /etc/apt/sources.list.d -maxdepth 1 \( -type f -o -type l \) \( -name '*.list' -o -name '*.sources' \) 2>/dev/null | sort)
+fi
+for _sf in ${_apt_src_candidates[@]+"${_apt_src_candidates[@]}"}; do
+    if [[ -r "$_sf" ]] && awk '!/^[[:space:]]*#/ && /(snapshot\.debian\.org|debian-ports|VF2-Lite)/ { found=1; exit } END { exit !found }' "$_sf" 2>/dev/null; then
+        SNAPSHOT_MIGRATION="true"
+        [[ "$_sf" != "/etc/apt/sources.list" ]] && _snapshot_d_matches+=("$_sf")
+    fi
+done
+
+if [[ "$SNAPSHOT_MIGRATION" == "true" ]]; then
     DEBIAN_KEYRING="/usr/share/keyrings/debian-archive-keyring.gpg"
     if [[ ! -s "$DEBIAN_KEYRING" ]]; then
         log_fatal "Cannot safely migrate legacy StarFive snapshot sources: missing ${DEBIAN_KEYRING}. Install debian-archive-keyring manually before retrying."
@@ -160,6 +187,20 @@ if grep -rqE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list
     if [[ -f /etc/apt/sources.list && ! -f /var/lib/rvdk/backups/apt/etc__apt__sources.list.orig ]]; then
         cp -a /etc/apt/sources.list "/var/lib/rvdk/backups/apt/etc__apt__sources.list.orig" 2>/dev/null || true
     fi
+    for _sf in ${_snapshot_d_matches[@]+"${_snapshot_d_matches[@]}"}; do
+        _sf_bname="${_sf#/}"
+        _sf_bname="${_sf_bname//\//__}"
+        if [[ ! -e "/var/lib/rvdk/backups/apt/${_sf_bname}.orig" && ! -L "/var/lib/rvdk/backups/apt/${_sf_bname}.orig" ]]; then
+            if [[ -L "$_sf" ]]; then
+                cp -L "$_sf" "/var/lib/rvdk/backups/apt/${_sf_bname}.orig" 2>/dev/null || cp -a "$_sf" "/var/lib/rvdk/backups/apt/${_sf_bname}.orig" 2>/dev/null || true
+                rm -f "$_sf"
+            else
+                mv -f "$_sf" "/var/lib/rvdk/backups/apt/${_sf_bname}.orig"
+            fi
+        else
+            rm -f "$_sf"
+        fi
+    done
     rm -f /etc/apt/trusted.gpg.d/debian-ports* 2>/dev/null || true
 
     NEW_SOURCES="deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE} main contrib non-free non-free-firmware"
@@ -167,8 +208,12 @@ if grep -rqE "snapshot\.debian\.org|debian-ports|VF2-Lite" /etc/apt/sources.list
         NEW_SOURCES+=$'\n'"deb [signed-by=${DEBIAN_KEYRING}] https://deb.debian.org/debian ${DEBIAN_SUITE}-updates main contrib non-free non-free-firmware"
         NEW_SOURCES+=$'\n'"deb [signed-by=${DEBIAN_KEYRING}] https://security.debian.org/debian-security ${DEBIAN_SUITE}-security main contrib non-free non-free-firmware"
     fi
-    if [[ "$WITH_VENDOR_REPO" == "true" ]] && [[ -f /etc/apt/trusted.gpg.d/starfive.gpg || -f /usr/share/keyrings/starfive-archive-keyring.gpg ]]; then
-        NEW_SOURCES+=$'\n'"deb https://debianrepo-t.starfivetech.com starfive-debian main"
+    if [[ "$WITH_VENDOR_REPO" == "true" ]]; then
+        if [[ -f /usr/share/keyrings/starfive-archive-keyring.gpg ]]; then
+            NEW_SOURCES+=$'\n'"deb [signed-by=/usr/share/keyrings/starfive-archive-keyring.gpg] https://debianrepo-t.starfivetech.com starfive-debian main"
+        elif [[ -f /etc/apt/trusted.gpg.d/starfive.gpg ]]; then
+            NEW_SOURCES+=$'\n'"deb https://debianrepo-t.starfivetech.com starfive-debian main"
+        fi
     fi
     printf '%s\n' "$NEW_SOURCES" | rvdk_atomic_write /etc/apt/sources.list 0644
 

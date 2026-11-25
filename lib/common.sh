@@ -19,7 +19,8 @@
 _RVDK_COMMON_SH_LOADED=1
 
 _RVDK_LOG_TAG="${_RVDK_LOG_TAG:-RVDK}"
-RVDK_MIN_VALID_EPOCH=1767225600
+RVDK_MIN_VALID_EPOCH="${RVDK_MIN_VALID_EPOCH:-1767225600}"
+RVDK_MAX_VALID_EPOCH="${RVDK_MAX_VALID_EPOCH:-2145916800}"
 
 if [[ -z "${_RVDK_TMPFILES+x}" ]]; then
     _RVDK_TMPFILES=()
@@ -92,7 +93,7 @@ _rvdk_run_cleanup_hooks() {
         local i hook
         for (( i = ${#_hooks[@]} - 1; i >= 0; i-- )); do
             hook="${_hooks[$i]:-}"
-            if [[ -n "$hook" ]] && declare -F "$hook" >/dev/null 2>&1; then
+            if [[ -n "$hook" ]] && typeset -f "$hook" >/dev/null 2>&1; then
                 "$hook" || true
             fi
         done
@@ -131,15 +132,16 @@ _rvdk_install_cleanup_trap() {
 
     local trap_fn_re="^trap -- '([A-Za-z_][A-Za-z0-9_]*)' EXIT\$"
     if [[ "${_RVDK_CLEANUP_TRAP_SET:-0}" == "1" ]]; then
-        if (( cur_subshell == 0 )); then
+        if (( cur_subshell == 0 )) && [[ -n "${BASH_VERSION:-}" ]]; then
             local cur_exit_trap=""
             cur_exit_trap="$(trap -p EXIT 2>/dev/null || true)"
             if [[ "$cur_exit_trap" == *"_rvdk_run_cleanup_hooks"* ]]; then
                 return 0
             fi
             if [[ "$cur_exit_trap" =~ $trap_fn_re ]]; then
-                local ext_fn="${BASH_REMATCH[1]}"
-                if [[ "$ext_fn" != "_rvdk_run_cleanup_hooks" && "$ext_fn" != "_rvdk_cleanup_tmpfiles" ]] && declare -F "$ext_fn" >/dev/null 2>&1; then
+                local ext_fn="${cur_exit_trap#trap -- \'}"
+                ext_fn="${ext_fn%\' EXIT}"
+                if [[ "$ext_fn" != "_rvdk_run_cleanup_hooks" && "$ext_fn" != "_rvdk_cleanup_tmpfiles" ]] && typeset -f "$ext_fn" >/dev/null 2>&1; then
                     _rvdk_push_cleanup_hook "$ext_fn" || true
                 fi
             elif [[ -n "$cur_exit_trap" && "$force_install" != "true" ]]; then
@@ -148,13 +150,14 @@ _rvdk_install_cleanup_trap() {
         else
             return 0
         fi
-    elif (( cur_subshell == 0 )); then
+    elif (( cur_subshell == 0 )) && [[ -n "${BASH_VERSION:-}" ]]; then
         local pre_exit_trap=""
         pre_exit_trap="$(trap -p EXIT 2>/dev/null || true)"
         if [[ -n "$pre_exit_trap" ]]; then
             if [[ "$pre_exit_trap" =~ $trap_fn_re ]]; then
-                local pre_fn="${BASH_REMATCH[1]}"
-                if [[ "$pre_fn" != "_rvdk_run_cleanup_hooks" && "$pre_fn" != "_rvdk_cleanup_tmpfiles" ]] && declare -F "$pre_fn" >/dev/null 2>&1; then
+                local pre_fn="${pre_exit_trap#trap -- \'}"
+                pre_fn="${pre_fn%\' EXIT}"
+                if [[ "$pre_fn" != "_rvdk_run_cleanup_hooks" && "$pre_fn" != "_rvdk_cleanup_tmpfiles" ]] && typeset -f "$pre_fn" >/dev/null 2>&1; then
                     _rvdk_push_cleanup_hook "$pre_fn" || true
                 fi
             elif [[ "$force_install" != "true" ]]; then
@@ -445,11 +448,15 @@ rvdk_validate_hostname() {
 
 rvdk_validate_cidr() {
     local cidr="${1:-}"
-    if [[ ! "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
+    local oct_re='(0|[1-9][0-9]{0,2})'
+    local pfx_re='(0|[1-9][0-9]?)'
+    local cidr_re="^${oct_re}\\.${oct_re}\\.${oct_re}\\.${oct_re}/${pfx_re}\$"
+    if [[ ! "$cidr" =~ $cidr_re ]]; then
         return 1
     fi
-    local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}" o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}" pfx="${BASH_REMATCH[5]}"
-    (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 && pfx <= 32 ))
+    local o1 o2 o3 o4 pfx
+    IFS='./' read -r o1 o2 o3 o4 pfx <<< "$cidr"
+    (( 10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255 && 10#$pfx <= 32 ))
 }
 
 # Normalize IPv4 addr/prefix (e.g. 192.168.1.42/24 -> 192.168.1.0/24) so pg_hba.conf & exports accept it
@@ -498,6 +505,78 @@ rvdk_validate_rel_subdir() {
     [[ "$sub" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]
 }
 
+# Pure assertion guarding managed directories against empty, relative, root,
+# traversal, symlink, shallow (<2 components), $REAL_HOME, or system-root paths.
+# Emits NO stdout, returns 0 when safe, and calls log_fatal on any violation.
+rvdk_assert_safe_managed_dir() {
+    local raw_path="${1:-}"
+    local var_name="${2:-PATH}"
+
+    if [[ -z "$raw_path" || "$raw_path" != /* ]]; then
+        log_fatal "Unsafe ${var_name}: '${raw_path}' must be a non-empty absolute path."
+    fi
+    if [[ "$raw_path" =~ [[:cntrl:]] ]]; then
+        log_fatal "Unsafe ${var_name}: '${raw_path}' contains control characters."
+    fi
+
+    local norm="$raw_path"
+    while [[ "$norm" == *//* ]]; do
+        norm="${norm//\/\///}"
+    done
+    while [[ "$norm" != "/" && "$norm" == */ ]]; do
+        norm="${norm%/}"
+    done
+
+    if [[ "$norm" == "/" ]]; then
+        log_fatal "Unsafe ${var_name}: '${raw_path}' resolves to root '/'."
+    fi
+
+    local comp_count=0 seg rest="${norm#/}"
+    while [[ -n "$rest" ]]; do
+        if [[ "$rest" == */* ]]; then
+            seg="${rest%%/*}"
+            rest="${rest#*/}"
+        else
+            seg="$rest"
+            rest=""
+        fi
+        [[ -z "$seg" ]] && continue
+        if [[ "$seg" == "." || "$seg" == ".." ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' contains '.' or '..' traversal segment."
+        fi
+        comp_count=$(( comp_count + 1 ))
+    done
+
+    if [[ -L "$raw_path" || -L "$norm" ]]; then
+        log_fatal "Unsafe ${var_name}: '${raw_path}' is a symbolic link."
+    fi
+
+    if (( comp_count < 2 )); then
+        log_fatal "Unsafe ${var_name}: '${raw_path}' must have at least 2 path components."
+    fi
+
+    if [[ -n "${REAL_HOME:-}" ]]; then
+        local norm_home="$REAL_HOME"
+        while [[ "$norm_home" == *//* ]]; do
+            norm_home="${norm_home//\/\///}"
+        done
+        while [[ "$norm_home" != "/" && "$norm_home" == */ ]]; do
+            norm_home="${norm_home%/}"
+        done
+        if [[ "$norm" == "$norm_home" ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' resolves to user home '${norm_home}'."
+        fi
+    fi
+
+    case "$norm" in
+        /usr|/usr/local|/usr/local/share|/var|/var/cache|/var/lib|/etc|/home|/root|/opt|/tmp)
+            log_fatal "Unsafe ${var_name}: '${raw_path}' is a protected system directory."
+            ;;
+    esac
+
+    return 0
+}
+
 rvdk_sha256_file() {
     local f="$1"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -511,7 +590,8 @@ rvdk_sha256_file() {
 
 # Parse RFC-7231 / RFC-2822 UTC HTTP Date header ("Wed, 18 Nov 2026 23:24:37 GMT") into Unix epoch
 _rvdk_parse_http_date_epoch() {
-    local hdr="$1"
+    local hdr="${1:-}"
+    [[ -n "$hdr" && "$hdr" != -* && ! "$hdr" =~ [[:cntrl:]] ]] || return 1
     local parsed=""
     parsed="$(date -u -d "$hdr" +%s 2>/dev/null || true)"
     if [[ "$parsed" =~ ^[0-9]+$ ]]; then
@@ -550,14 +630,20 @@ _rvdk_parse_http_date_epoch() {
 
 # Step cold-reset system clocks on batteryless RISC-V SBCs ONLY when local time
 # predates RVDK_MIN_VALID_EPOCH (2026-01-01T00:00:00Z) and no NTP daemon is synced.
-# Strictly monotonic: never touches plain HTTP once valid/synced and never steps backward.
+# Strictly monotonic and quorum-gated: requires >= 2 independent HTTP Date
+# responses within [RVDK_MIN_VALID_EPOCH, RVDK_MAX_VALID_EPOCH] agreeing within 300s.
 rvdk_sync_cold_clock() {
+    local min_epoch="${RVDK_MIN_VALID_EPOCH:-1767225600}"
+    local max_epoch="${RVDK_MAX_VALID_EPOCH:-2145916800}"
+    [[ "$min_epoch" =~ ^[0-9]+$ ]] || min_epoch=1767225600
+    [[ "$max_epoch" =~ ^[0-9]+$ ]] || max_epoch=2145916800
+
     local local_epoch=""
     local_epoch="$(date -u +%s 2>/dev/null || echo 0)"
     [[ "$local_epoch" =~ ^[0-9]+$ ]] || local_epoch=0
 
     # Fast-return without any plain HTTP request if clock is valid or NTP-synchronized
-    if (( local_epoch >= RVDK_MIN_VALID_EPOCH )); then
+    if (( local_epoch >= min_epoch )); then
         return 0
     fi
     if command -v timedatectl >/dev/null 2>&1; then
@@ -578,12 +664,22 @@ rvdk_sync_cold_clock() {
     [[ "${_RVDK_CLOCK_CHECKED:-0}" == "1" ]] && return 0
     _RVDK_CLOCK_CHECKED="1"
 
-    local hdr_date="" probe_url raw_hdr
+    if (( max_epoch < min_epoch )); then
+        log_warn "Cold-RTC sync: invalid epoch bounds [${min_epoch}, ${max_epoch}]; leaving clock unchanged."
+        return 0
+    fi
+
+    local probe_url raw_hdr hdr_date remote_epoch
+    local -a valid_epochs=()
+    local agreed_epoch="" saw_rejected="false"
+
     for probe_url in \
         "http://rvdk.drewv-labs.dev/" \
         "http://deb.debian.org/" \
         "http://connectivitycheck.gstatic.com/generate_204"; do
         raw_hdr=""
+        hdr_date=""
+        remote_epoch=""
         if command -v curl >/dev/null 2>&1; then
             raw_hdr="$(curl -fsSI --connect-timeout 3 --max-time 5 "$probe_url" 2>/dev/null || true)"
         elif command -v wget >/dev/null 2>&1; then
@@ -591,21 +687,77 @@ rvdk_sync_cold_clock() {
         else
             return 0
         fi
-        if [[ -n "$raw_hdr" ]]; then
-            hdr_date="$(awk 'tolower($1) == "date:" { sub(/^[[:space:]]*[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' <<< "$raw_hdr")"
-            [[ -n "$hdr_date" ]] && break
+        [[ -n "$raw_hdr" ]] || continue
+
+        hdr_date="$(awk 'tolower($1) == "date:" { sub(/^[[:space:]]*[Dd][Aa][Tt][Ee]:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' <<< "$raw_hdr")"
+        [[ -n "$hdr_date" ]] || continue
+
+        remote_epoch="$(_rvdk_parse_http_date_epoch "$hdr_date" 2>/dev/null || true)"
+        if [[ ! "$remote_epoch" =~ ^[0-9]+$ ]]; then
+            log_warn "Cold-RTC sync: unparseable HTTP Date header from ${probe_url}; ignoring."
+            saw_rejected="true"
+            continue
         fi
+        if (( remote_epoch < min_epoch || remote_epoch > max_epoch )); then
+            log_warn "Cold-RTC sync: HTTP Date epoch ${remote_epoch} from ${probe_url} outside [${min_epoch}, ${max_epoch}]; ignoring."
+            saw_rejected="true"
+            continue
+        fi
+        if (( remote_epoch <= local_epoch )); then
+            log_warn "Cold-RTC sync: HTTP Date epoch ${remote_epoch} from ${probe_url} is not ahead of local clock (${local_epoch}); ignoring."
+            saw_rejected="true"
+            continue
+        fi
+
+        local prev_epoch diff
+        for prev_epoch in ${valid_epochs[@]+"${valid_epochs[@]}"}; do
+            if (( remote_epoch >= prev_epoch )); then
+                diff=$(( remote_epoch - prev_epoch ))
+            else
+                diff=$(( prev_epoch - remote_epoch ))
+            fi
+            if (( diff <= 300 )); then
+                agreed_epoch=$(( (prev_epoch + remote_epoch) / 2 ))
+                break
+            fi
+        done
+        valid_epochs+=("$remote_epoch")
+        [[ -n "$agreed_epoch" ]] && break
     done
-    [[ -n "$hdr_date" ]] || return 0
 
-    local remote_epoch=""
-    remote_epoch="$(_rvdk_parse_http_date_epoch "$hdr_date" 2>/dev/null || true)"
-    [[ "$remote_epoch" =~ ^[0-9]+$ ]] || return 0
+    if [[ -z "$agreed_epoch" ]]; then
+        if (( ${#valid_epochs[@]} == 1 )); then
+            log_warn "Cold-RTC sync: only 1 valid HTTP Date response received (${valid_epochs[0]}); quorum of 2 agreeing hosts required. Leaving clock unchanged."
+        elif (( ${#valid_epochs[@]} >= 2 )); then
+            log_warn "Cold-RTC sync: HTTP Date responses from ${#valid_epochs[@]} hosts disagreed by >300s; leaving clock unchanged."
+        elif [[ "$saw_rejected" == "true" ]]; then
+            log_warn "Cold-RTC sync: no valid in-range HTTP Date responses received; leaving clock unchanged."
+        fi
+        return 0
+    fi
 
-    # Strictly monotonic forward step past RVDK_MIN_VALID_EPOCH only
-    if (( remote_epoch >= RVDK_MIN_VALID_EPOCH && remote_epoch > local_epoch )); then
-        local skew=$(( remote_epoch - local_epoch ))
-        if date -u -s "@${remote_epoch}" >/dev/null 2>&1 || date -u -s "$hdr_date" >/dev/null 2>&1; then
+    # Strictly monotonic forward step within [min_epoch, max_epoch] with 2-host quorum
+    if (( agreed_epoch >= min_epoch && agreed_epoch <= max_epoch && agreed_epoch > local_epoch )); then
+        local skew=$(( agreed_epoch - local_epoch ))
+        local agreed_utc=""
+        agreed_utc="$(awk -v ts="$agreed_epoch" 'BEGIN {
+            z = int(ts / 86400) + 719468;
+            era = int((z >= 0 ? z : z - 146096) / 146097);
+            doe = z - era * 146097;
+            yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365);
+            y = yoe + era * 400;
+            doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100));
+            mp = int((5 * doy + 2) / 153);
+            d = doy - int((153 * mp + 2) / 5) + 1;
+            m = mp + (mp < 10 ? 3 : -9);
+            y += (m <= 2);
+            rem = ts % 86400;
+            hh = int(rem / 3600);
+            mm = int((rem % 3600) / 60);
+            ss = rem % 60;
+            printf "%04d-%02d-%02d %02d:%02d:%02d", y, m, d, hh, mm, ss;
+        }')"
+        if date -u -s "@${agreed_epoch}" >/dev/null 2>&1 || date -u -s "$agreed_utc" >/dev/null 2>&1; then
             if [[ -d /usr/lib && ! -L /usr/lib ]]; then
                 touch /usr/lib/clock-epoch 2>/dev/null || true
                 chmod 0644 /usr/lib/clock-epoch 2>/dev/null || true
@@ -617,7 +769,7 @@ rvdk_sync_cold_clock() {
                 touch /var/lib/systemd/timesync/clock 2>/dev/null || true
             fi
             hwclock --systohc --utc >/dev/null 2>&1 || true
-            log_ok "Stepped cold-RTC system clock via HTTP Date (+${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+            log_ok "Stepped cold-RTC system clock via 2-host HTTP Date quorum (+${skew}s -> $(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
         fi
     fi
     return 0

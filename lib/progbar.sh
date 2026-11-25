@@ -66,12 +66,13 @@ _rvdk_prog_out() {
     return 0
 }
 
-# Validate RVDK_SUB_STATE confinement (`^(/run/rvdk/|/tmp/rvdk-)[A-Za-z0-9._-]+$`,
+# Validate RVDK_SUB_STATE confinement (`^/run/rvdk/[A-Za-z0-9._-]+$`,
 # root-owned 0700/0755 parent directory, non-symlink target).
 _rvdk_prog_validate_sub_state() {
     local path="${1:-}"
     [[ -n "$path" ]] || return 1
-    [[ "$path" =~ ^(/run/rvdk/|/tmp/rvdk-)[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$path" =~ ^/run/rvdk/[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$path" != "/run/rvdk/." && "$path" != "/run/rvdk/.." ]] || return 1
     [[ ! -L "$path" ]] || return 1
 
     local pdir powner pmode
@@ -263,7 +264,7 @@ _rvdk_prog_on_winch() {
 }
 
 _rvdk_prog_register_cleanup() {
-    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+    if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
         rvdk_register_cleanup rvdk_prog_cleanup
     elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
         trap 'rvdk_prog_cleanup' EXIT
@@ -380,7 +381,7 @@ rvdk_prog_cleanup() {
         rm -f "${_RVDK_OWN_APT_STAMP}" 2>/dev/null || true
     fi
     if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
-        declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
+        typeset -f _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles
     fi
     return "$rc"
 }

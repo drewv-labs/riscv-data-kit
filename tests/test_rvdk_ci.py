@@ -325,3 +325,52 @@ class TestRenderStandaloneScript:
     def test_wrapper_target_escaping_repo_root_is_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="escapes repository root"):
             rvdk_ci.render_standalone_script("# @RVDK_WRAPPER_FILE: ../../etc/passwd\n", tmp_path)
+
+
+class TestWave1SecurityAndIdempotencyInvariants:
+    def test_no_armbian_community_mirror_in_executable_lines(self) -> None:
+        for sh_path in rvdk_ci.collect_sh_files(REPO_ROOT):
+            for lineno, line in enumerate(sh_path.read_text(encoding="utf-8").splitlines(), start=1):
+                stripped = line.lstrip()
+                if stripped.startswith("#"):
+                    continue
+                assert "armbian.chi.auroradev.org" not in line, f"{sh_path}:{lineno}: {line}"
+        assert "https://apt.armbian.com" in (REPO_ROOT / "lib" / "apt.sh").read_text(encoding="utf-8")
+        assert "https://apt.armbian.com" in (REPO_ROOT / "install-cli.sh").read_text(encoding="utf-8")
+
+    def test_nvme_secondary_fs_label_default_fits_xfs_limit(self) -> None:
+        nvme_text = (REPO_ROOT / "mods" / "nvme-4kn" / "forge.sh").read_text(encoding="utf-8")
+        assert 'SECONDARY_FS_LABEL="${CLI_SEC_LABEL:-RVDK_SEC}"' in nvme_text
+        assert 'SECONDARY_FS_LABEL="${CLI_SEC_LABEL:-RVDK_SECONDARY}"' not in nvme_text
+
+    def test_pg18_and_ntfy_bundle_and_wal_hardening(self) -> None:
+        pg_text = (REPO_ROOT / "postgresql" / "18-6-io_uring" / "forge.sh").read_text(encoding="utf-8")
+        ntfy_text = (REPO_ROOT / "mods" / "ntfy" / "forge.sh").read_text(encoding="utf-8")
+
+        assert "df -BG --output=size" in pg_text
+        assert "df -BG --output=avail" not in pg_text
+        assert "tar --no-same-owner --no-same-permissions" in pg_text
+        assert "# RVDK-MANAGED-CIDR" in pg_text
+        assert "Refusing to fetch remote .sha256 sidecar over insecure non-HTTPS URL" in pg_text
+        assert "Refusing to fetch remote .sha256 sidecar over insecure non-HTTPS URL" in ntfy_text
+
+    def test_tailscale_tarball_regex_and_gro_systemd_unit(self) -> None:
+        ts_text = (REPO_ROOT / "mods" / "tailscale" / "forge.sh").read_text(encoding="utf-8")
+        assert r"^tailscale_[0-9A-Za-z._-]+_(riscv64|amd64|arm64|arm)\.tgz$" in ts_text
+        assert "rvdk-tailscale-gro.service" in ts_text
+
+    def test_bootstrap_apt_has_no_static_pub_only_dns_clobber(self) -> None:
+        apt_text = (REPO_ROOT / "os" / "bootstrap-apt.sh").read_text(encoding="utf-8")
+        assert "static_pub_only" not in apt_text
+
+    def test_no_declare_dash_f_in_core_libs_or_entrypoints(self) -> None:
+        targets = [
+            *sorted((REPO_ROOT / "lib").glob("*.sh")),
+            REPO_ROOT / "bootstrap.sh",
+            REPO_ROOT / "install-cli.sh",
+            *sorted((REPO_ROOT / "utils").glob("*.sh")),
+        ]
+        for path in targets:
+            text = path.read_text(encoding="utf-8")
+            assert "declare -F" not in text, f"{path.relative_to(REPO_ROOT)} still uses 'declare -F'"
+

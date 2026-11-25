@@ -144,16 +144,31 @@ rvdk_normalize_board_id() {
     esac
 }
 
+_rvdk_kit_valid_pair() {
+    local val="${1:-}"
+    [[ "$val" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ ]] || return 1
+    [[ "$val" != *..* ]] || return 1
+    local left="${val%%/*}"
+    local right="${val#*/}"
+    [[ -n "$left" && "$left" != "." && "$left" != ".." ]] || return 1
+    [[ -n "$right" && "$right" != "." && "$right" != ".." ]] || return 1
+    [[ "$right" != .* && "$right" != *. ]] || return 1
+    return 0
+}
+
 # Resolve a board query to an existing directory under `${repo_root}/boards/<vendor>/<slug>`
 rvdk_resolve_board_dir() {
     local repo_root="$1"
     local query="$2"
+    [[ -n "$query" ]] || return 1
     local norm
     norm="$(rvdk_normalize_board_id "$query")"
-    if [[ -d "${repo_root}/boards/${norm}" ]]; then
+    if _rvdk_kit_valid_pair "$norm" && [[ -d "${repo_root}/boards/${norm}" ]]; then
         echo "${repo_root}/boards/${norm}"
         return 0
     fi
+    [[ "$query" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || return 1
+    [[ "$query" != "." && "$query" != ".." && "$query" != *..* && "$query" != .* && "$query" != *. ]] || return 1
     local candidate
     for candidate in "${repo_root}"/boards/*/"${query}"; do
         if [[ -d "$candidate" ]]; then
@@ -235,6 +250,10 @@ rvdk_kit_resolve() {
     IFS='|' read -r soc board tag factory_user <<< "$inferred"
 
     if [[ -n "$cli_board" ]]; then
+        if [[ -z "$cli_soc" ]]; then
+            soc=""
+        fi
+        factory_user=""
         board="$(rvdk_normalize_board_id "$cli_board")"
         case "$board" in
             starfive/vf2-lite)          tag="vf2lite"; factory_user="${factory_user:-user}" ;;
@@ -278,8 +297,13 @@ rvdk_kit_resolve() {
     fi
 
     # Reject malformed CLI overrides before persisting
-    [[ -z "$soc"   || "$soc"   =~ ^[a-z0-9_-]+/[a-z0-9._-]+$ ]] || soc=""
-    [[ -z "$board" || "$board" =~ ^[a-z0-9_-]+/[a-z0-9._-]+$ ]] || board=""
+    if [[ -n "$soc" ]] && ! _rvdk_kit_valid_pair "$soc"; then
+        soc=""
+    fi
+    if [[ -n "$board" ]] && ! _rvdk_kit_valid_pair "$board"; then
+        board=""
+        tag=""
+    fi
 
     local os_id="${cli_os:-}"
     local os_ver=""

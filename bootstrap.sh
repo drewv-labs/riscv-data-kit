@@ -15,13 +15,20 @@
 #   sudo rvdk uninstall [--purge] [--dry-run] [-y]
 # ==============================================================================
 
-# Ensure compatibility when invoked via `zsh` or `bash`
+# Re-exec under bash if invoked via zsh (requires a file path on disk)
 if [[ -n "${ZSH_VERSION:-}" ]]; then
-    emulate -L ksh
-    setopt PIPE_FAIL ERR_RETURN NO_UNSET
-else
-    set -Eeuo pipefail
+    case "${0:-}" in
+        zsh|-zsh|*/zsh|*/-zsh|zsh[0-9]*|*/zsh[0-9]*) ;;
+        *)
+            if [[ -f "${0:-}" ]]; then
+                exec bash "$0" "$@"
+            fi
+            ;;
+    esac
+    printf '[FAIL] %s\n' "This script requires bash. When piping over stdin, run: curl ... | sudo bash" >&2
+    exit 1
 fi
+set -Eeuo pipefail
 
 if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
     SCRIPT_SELF="${BASH_SOURCE[0]}"
@@ -93,7 +100,7 @@ _escalate_root_if_needed() {
         if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
             exec sudo -E bash "$SCRIPT_SELF" ${ORIG_ALL_ARGS[@]+"${ORIG_ALL_ARGS[@]}"}
         else
-            echo "[RVDK:FATAL] Run as root or pipe into 'sudo bash' / 'sudo zsh': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
+            echo "[RVDK:FATAL] Run as root or pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
             exit 1
         fi
     fi
@@ -768,7 +775,7 @@ read_saved_tune() {
     fi
     if [[ -n "$sf" ]]; then
         local RVDK_TUNE=""
-        if declare -F rvdk_kv_load >/dev/null 2>&1; then
+        if typeset -f rvdk_kv_load >/dev/null 2>&1; then
             rvdk_kv_load "$sf" RVDK_TUNE
             printf '%s\n' "$RVDK_TUNE"
         else
@@ -857,14 +864,14 @@ if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
 fi
 
 if [[ -n "$_RVDK_OWN_APT_STAMP" ]]; then
-    if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+    if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
         rvdk_register_cleanup _rvdk_cleanup_own_apt_stamp
     fi
 fi
 
 rvdk_prog_init "${MODULE} (${BOARD_PATH:-$SOC_PATH})"
 
-if [[ -n "$_RVDK_OWN_APT_STAMP" ]] && ! declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+if [[ -n "$_RVDK_OWN_APT_STAMP" ]] && ! typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
     case "$(trap -p EXIT 2>/dev/null || true)" in
         *rvdk_prog_cleanup*) ;;
         '')

@@ -196,11 +196,58 @@ for rl_svc in orangepi-ramlog.service armbian-ramlog.service; do
     fi
 done
 
+_RVDK_SYSLOG_SOCKET_SUSPENDED="false"
+_RVDK_RSYSLOG_SUSPENDED="false"
+_RVDK_JOURNALD_SUSPENDED="false"
+_rvdk_restore_logging_services() {
+    if [[ "${_RVDK_JOURNALD_SUSPENDED:-false}" == "true" ]]; then
+        _RVDK_JOURNALD_SUSPENDED="false"
+        systemctl restart systemd-journald.service 2>/dev/null || systemctl start systemd-journald.service 2>/dev/null || true
+    fi
+    if [[ "${_RVDK_SYSLOG_SOCKET_SUSPENDED:-false}" == "true" ]]; then
+        _RVDK_SYSLOG_SOCKET_SUSPENDED="false"
+        systemctl restart syslog.socket 2>/dev/null || systemctl start syslog.socket 2>/dev/null || true
+    fi
+    if [[ "${_RVDK_RSYSLOG_SUSPENDED:-false}" == "true" ]]; then
+        _RVDK_RSYSLOG_SUSPENDED="false"
+        systemctl restart rsyslog.service 2>/dev/null || systemctl start rsyslog.service 2>/dev/null || true
+    fi
+}
+
 if command -v findmnt >/dev/null 2>&1; then
     VARLOG_SRC="$(findmnt -n -o SOURCE /var/log 2>/dev/null || true)"
-    if [[ "$VARLOG_SRC" == *zram* || "$VARLOG_SRC" == *ramlog* ]]; then
-        umount /var/log 2>/dev/null || umount -l /var/log 2>/dev/null || true
-        VENDOR_ZRAM_CHANGED="true"
+    VARLOG_HDD_SRC="$(findmnt -n -o SOURCE /var/log.hdd 2>/dev/null || true)"
+    if [[ "$VARLOG_SRC" == *zram* || "$VARLOG_SRC" == *ramlog* || -n "$VARLOG_HDD_SRC" ]]; then
+        if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+            rvdk_register_cleanup _rvdk_restore_logging_services
+        elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+            trap '_rvdk_restore_logging_services' EXIT
+        fi
+
+        if systemctl is-active --quiet syslog.socket 2>/dev/null; then
+            _RVDK_SYSLOG_SOCKET_SUSPENDED="true"
+            systemctl stop syslog.socket 2>/dev/null || true
+        fi
+        if systemctl is-active --quiet rsyslog.service 2>/dev/null; then
+            _RVDK_RSYSLOG_SUSPENDED="true"
+            systemctl stop rsyslog.service 2>/dev/null || true
+        fi
+        if systemctl is-active --quiet systemd-journald.service 2>/dev/null; then
+            journalctl --flush >/dev/null 2>&1 || true
+            _RVDK_JOURNALD_SUSPENDED="true"
+            systemctl stop systemd-journald.service 2>/dev/null || true
+        fi
+
+        if [[ "$VARLOG_SRC" == *zram* || "$VARLOG_SRC" == *ramlog* ]]; then
+            umount /var/log 2>/dev/null || umount -l /var/log 2>/dev/null || true
+            VENDOR_ZRAM_CHANGED="true"
+        fi
+        if [[ -n "$VARLOG_HDD_SRC" ]]; then
+            umount /var/log.hdd 2>/dev/null || umount -l /var/log.hdd 2>/dev/null || true
+            VENDOR_ZRAM_CHANGED="true"
+        fi
+
+        _rvdk_restore_logging_services
     fi
 fi
 
@@ -586,11 +633,6 @@ if [[ "$TUNE_MODE" == "data" ]]; then
     THP_MODE="never"
 else
     THP_MODE="madvise"
-fi
-
-if [[ -f /etc/systemd/system/eic7700x-thp-tune.service ]]; then
-    systemctl disable eic7700x-thp-tune.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/eic7700x-thp-tune.service
 fi
 
 THP_UNIT="/etc/systemd/system/rvdk-thp-tune.service"

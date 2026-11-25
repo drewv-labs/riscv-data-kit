@@ -520,3 +520,431 @@ rvdk_purge_path_is_symlink_free "{real_home}" ".rvdk/config.env"
 """
         proc = _run_bash(script)
         assert proc.returncode == 0, proc.stderr
+
+
+def _write_exe(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+class TestRvdkValidateCidr:
+    @pytest.mark.parametrize(
+        "bad_cidr",
+        [
+            "10.0.08.0/24",
+            "01.2.3.4/24",
+            "192.168.1.0/08",
+            "256.0.0.1/24",
+            "10.0.0.0/33",
+        ],
+    )
+    def test_rejects_malformed_or_octal_cidrs_without_set_e_crash(self, bad_cidr: str) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rc=0
+rvdk_validate_cidr "{bad_cidr}" || rc=$?
+printf 'RC=%d\\n' "$rc"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "RC=1"
+
+    @pytest.mark.parametrize(
+        "good_cidr",
+        [
+            "192.168.1.0/24",
+            "0.0.0.0/0",
+            "10.0.0.1/32",
+        ],
+    )
+    def test_accepts_valid_cidrs(self, good_cidr: str) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_validate_cidr "{good_cidr}"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+
+
+class TestRvdkSyncColdClock:
+    def _make_common_with_root_gate_enabled(self, tmp_path: Path) -> Path:
+        src = (REPO_ROOT / "lib" / "common.sh").read_text(encoding="utf-8")
+        needle = '[[ "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 ]] || return 0'
+        assert needle in src
+        patched = tmp_path / "common_clock.sh"
+        patched.write_text(
+            src.replace(needle, '[[ "$(uname -s)" == "Linux" ]] || return 0', 1),
+            encoding="utf-8",
+        )
+        return patched
+
+    def _setup_clock_shims(
+        self,
+        tmp_path: Path,
+        host_dates: dict[str, str],
+        local_epoch: str = "1700000000",
+    ) -> tuple[dict[str, str], Path, Path]:
+        bin_dir = tmp_path / "bin"
+        date_set_log = tmp_path / "date_set.log"
+        hwclock_log = tmp_path / "hwclock.log"
+
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+        _write_exe(
+            bin_dir / "date",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-u" && "${{2:-}}" == "+%s" ]]; then
+    printf '%s\\n' "{local_epoch}"
+    exit 0
+fi
+if [[ "${{1:-}}" == "-u" && "${{2:-}}" == "-s" ]]; then
+    printf '%s\\n' "$*" >> "{date_set_log}"
+    exit 0
+fi
+if [[ "${{1:-}}" == "-u" && "${{2:-}}" == "+%Y-%m-%d %H:%M:%S UTC" ]]; then
+    printf '2026-11-18 12:01:00 UTC\\n'
+    exit 0
+fi
+if [[ "${{1:-}}" == "-u" && "${{2:-}}" == "-d" ]]; then
+    exit 1
+fi
+exec /bin/date "$@"
+""",
+        )
+        _write_exe(
+            bin_dir / "hwclock",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{hwclock_log}"
+exit 0
+""",
+        )
+        _write_exe(bin_dir / "timedatectl", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(bin_dir / "chronyc", "#!/usr/bin/env bash\nexit 1\n")
+
+        cases = []
+        for url_sub, date_hdr in host_dates.items():
+            if date_hdr:
+                cases.append(
+                    f'    *"{url_sub}"*)\n'
+                    f'        printf "HTTP/1.1 200 OK\\r\\nDate: {date_hdr}\\r\\n\\r\\n"\n'
+                    f"        exit 0\n"
+                    f"        ;;"
+                )
+            else:
+                cases.append(f'    *"{url_sub}"*)\n        exit 1\n        ;;')
+        case_block = "\n".join(cases)
+        _write_exe(
+            bin_dir / "curl",
+            f"""#!/usr/bin/env bash
+url="${{@: -1}}"
+case "$url" in
+{case_block}
+    *)
+        exit 1
+        ;;
+esac
+""",
+        )
+        return {"PATH": f"{bin_dir}:{os.environ['PATH']}"}, date_set_log, hwclock_log
+
+    def test_rejects_year_2099_http_date_with_warn_and_no_date_step(self, tmp_path: Path) -> None:
+        common_sh = self._make_common_with_root_gate_enabled(tmp_path)
+        env, date_set_log, hwclock_log = self._setup_clock_shims(
+            tmp_path,
+            {
+                "rvdk.drewv-labs.dev": "Thu, 01 Jan 2099 00:00:00 GMT",
+                "deb.debian.org": "Thu, 01 Jan 2099 00:00:10 GMT",
+                "connectivitycheck.gstatic.com": "Thu, 01 Jan 2099 00:00:20 GMT",
+            },
+        )
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{common_sh}"
+rvdk_sync_cold_clock
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "[WARN]" in proc.stdout
+        assert "outside [" in proc.stdout
+        assert not date_set_log.exists()
+        assert not hwclock_log.exists()
+
+    def test_rejects_single_source_spoofed_http_date(self, tmp_path: Path) -> None:
+        common_sh = self._make_common_with_root_gate_enabled(tmp_path)
+        env, date_set_log, hwclock_log = self._setup_clock_shims(
+            tmp_path,
+            {
+                "rvdk.drewv-labs.dev": "Wed, 18 Nov 2026 12:00:00 GMT",
+                "deb.debian.org": "",
+                "connectivitycheck.gstatic.com": "",
+            },
+        )
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{common_sh}"
+rvdk_sync_cold_clock
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "[WARN]" in proc.stdout
+        assert "quorum of 2 agreeing hosts required" in proc.stdout
+        assert not date_set_log.exists()
+        assert not hwclock_log.exists()
+
+    def test_rejects_two_disagreeing_hosts_over_300s(self, tmp_path: Path) -> None:
+        common_sh = self._make_common_with_root_gate_enabled(tmp_path)
+        env, date_set_log, hwclock_log = self._setup_clock_shims(
+            tmp_path,
+            {
+                "rvdk.drewv-labs.dev": "Wed, 18 Nov 2026 12:00:00 GMT",
+                "deb.debian.org": "Wed, 18 Nov 2026 12:10:00 GMT",
+                "connectivitycheck.gstatic.com": "",
+            },
+        )
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{common_sh}"
+rvdk_sync_cold_clock
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "[WARN]" in proc.stdout
+        assert "disagreed by >300s" in proc.stdout
+        assert not date_set_log.exists()
+        assert not hwclock_log.exists()
+
+    def test_two_agreeing_hosts_within_300s_step_clock_and_hwclock(self, tmp_path: Path) -> None:
+        common_sh = self._make_common_with_root_gate_enabled(tmp_path)
+        env, date_set_log, hwclock_log = self._setup_clock_shims(
+            tmp_path,
+            {
+                "rvdk.drewv-labs.dev": "Wed, 18 Nov 2026 12:00:00 GMT",
+                "deb.debian.org": "Wed, 18 Nov 2026 12:02:00 GMT",
+                "connectivitycheck.gstatic.com": "",
+            },
+        )
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{common_sh}"
+rvdk_sync_cold_clock
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "[OK]" in proc.stdout
+        assert "2-host HTTP Date quorum" in proc.stdout
+        assert date_set_log.is_file()
+        assert len(date_set_log.read_text(encoding="utf-8").splitlines()) == 1
+        assert hwclock_log.read_text(encoding="utf-8").splitlines() == ["--systohc --utc"]
+
+
+class TestRvdkAssertSafeManagedDir:
+    @pytest.mark.parametrize(
+        "bad_path",
+        [
+            "",
+            "relative/path",
+            "/",
+            "/usr/",
+            "/usr//local",
+            "/etc/.",
+            "/usr/local/share/rvdk/../../etc",
+            "/foo",
+        ],
+    )
+    def test_rejects_unsafe_paths(self, bad_path: str) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_assert_safe_managed_dir "{bad_path}" "TEST_DIR"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode != 0, f"Unexpectedly accepted {bad_path!r}"
+        assert "Unsafe TEST_DIR:" in proc.stderr
+
+    def test_rejects_symlink_and_real_home(self, tmp_path: Path) -> None:
+        real_target = tmp_path / "real_target"
+        real_target.mkdir()
+        sym_dir = tmp_path / "sym_engine"
+        sym_dir.symlink_to(real_target)
+
+        sym_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_assert_safe_managed_dir "{sym_dir}" "RVDK_ENGINE_DIR"
+"""
+        )
+        assert sym_proc.returncode != 0
+        assert "symbolic link" in sym_proc.stderr
+
+        user_home = tmp_path / "home" / "alice"
+        user_home.mkdir(parents=True)
+        home_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+REAL_HOME="{user_home}"
+rvdk_assert_safe_managed_dir "{user_home}" "RVDK_ENGINE_DIR"
+"""
+        )
+        assert home_proc.returncode != 0
+        assert "resolves to user home" in home_proc.stderr
+
+    @pytest.mark.parametrize("good_path", ["/var/cache/rvdk", "/usr/local/share/rvdk/engine"])
+    def test_accepts_safe_paths_with_zero_stdout(self, good_path: str) -> None:
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_assert_safe_managed_dir "{good_path}" "RVDK_ENGINE_DIR"
+"""
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == ""
+
+
+class TestLibKit:
+    def test_kit_resolve_board_override_clears_dt_inferred_soc_and_factory_user(self) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+export RVDK_DT_MODEL="StarFive VisionFive 2 v1.3B"
+rvdk_kit_resolve --no-cache --board p550 --os debian
+printf 'BOARD=%s\\nSOC=%s\\nUSER=%s\\nOS=%s\\n' \\
+    "$RVDK_BOARD" "$RVDK_SOC" "$RVDK_FACTORY_USER" "$RVDK_OS_ID"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.splitlines() == [
+            "BOARD=sifive/p550",
+            "SOC=eswin/eic7700x",
+            "USER=",
+            "OS=debian",
+        ]
+
+    @pytest.mark.parametrize("bad_id", ["foo/..", "../bar", "foo/."])
+    def test_rejects_traversal_in_board_soc_and_resolve_board_dir(self, bad_id: str) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+export RVDK_DT_MODEL="Unknown"
+rvdk_kit_resolve --no-cache --board "{bad_id}" --soc "{bad_id}" --os debian
+printf 'BOARD=%s|SOC=%s\\n' "$RVDK_BOARD" "$RVDK_SOC"
+if rvdk_resolve_board_dir "{REPO_ROOT}" "{bad_id}"; then
+    exit 1
+fi
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "BOARD=|SOC="
+
+
+class TestLibAptAndProgbar:
+    def test_apt_rewrite_stream_preserves_and_rewrites_to_apt_armbian_com(self, tmp_path: Path) -> None:
+        src_list = tmp_path / "armbian.list"
+        src_list.write_text(
+            "deb https://apt.armbian.com bookworm main bookworm-utils\n"
+            "deb http://mirrors.tuna.tsinghua.edu.cn/armbian bookworm main\n"
+            "deb https://repo.huaweicloud.com/armbian noble main\n"
+            "deb http://apt.armbian.com bookworm main\n",
+            encoding="utf-8",
+        )
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/apt.sh"
+_rvdk_apt_rewrite_stream "{src_list}" "https"
+"""
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "armbian.chi.auroradev.org" not in proc.stdout
+        assert proc.stdout.splitlines() == [
+            "deb https://apt.armbian.com bookworm main bookworm-utils",
+            "deb https://apt.armbian.com bookworm main",
+            "deb https://apt.armbian.com noble main",
+            "deb https://apt.armbian.com bookworm main",
+        ]
+
+    def test_prog_validate_sub_state_confinement(self, tmp_path: Path) -> None:
+        # Reject /tmp/rvdk-foo and /run/rvdk/.. directly against real lib/progbar.sh
+        reject_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/progbar.sh"
+! _rvdk_prog_validate_sub_state "/tmp/rvdk-foo"
+! _rvdk_prog_validate_sub_state "/run/rvdk/.."
+"""
+        )
+        assert reject_proc.returncode == 0, reject_proc.stderr
+
+        # Test accepting /run/rvdk/valid.state via a localized /run/rvdk directory check + mocked root/0755 stat
+        progbar_src = (REPO_ROOT / "lib" / "progbar.sh").read_text(encoding="utf-8")
+        needle = '[[ -d "$pdir" && ! -L "$pdir" ]] || return 1'
+        assert needle in progbar_src
+        fake_run_rvdk = tmp_path / "run" / "rvdk"
+        fake_run_rvdk.mkdir(parents=True)
+        patched_progbar = tmp_path / "progbar_test.sh"
+        patched_progbar.write_text(
+            progbar_src.replace(
+                needle,
+                f'[[ "$pdir" == "/run/rvdk" ]] && pdir="{fake_run_rvdk}"\n    [[ -d "$pdir" && ! -L "$pdir" ]] || return 1',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        bin_dir = tmp_path / "bin"
+        _write_exe(
+            bin_dir / "stat",
+            """#!/usr/bin/env bash
+case "${1:-}" in
+    -c)
+        case "${2:-}" in
+            %u) printf '0\\n' ;;
+            %a) printf '0755\\n' ;;
+        esac
+        ;;
+    -f)
+        case "${2:-}" in
+            %u) printf '0\\n' ;;
+            %Lp) printf '755\\n' ;;
+        esac
+        ;;
+esac
+""",
+        )
+        accept_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{patched_progbar}"
+_rvdk_prog_validate_sub_state "/run/rvdk/valid.state"
+""",
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert accept_proc.returncode == 0, accept_proc.stderr

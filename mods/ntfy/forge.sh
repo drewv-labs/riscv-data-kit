@@ -519,6 +519,9 @@ else
                 log_warn "No pinned SHA-256 provided for ${BUNDLE_NAME} (pass --bundle-sha256 or --allow-remote-sha256 to use remote .sha256 sidecar); building from source..."
                 FORCE_BUILD="true"
             else
+                if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" && "$BUNDLE_URL" != https://* ]]; then
+                    log_fatal "Refusing to fetch remote .sha256 sidecar over insecure non-HTTPS URL (${BUNDLE_URL}); use https:// or pass an explicit --bundle-sha256 <hex64> pin."
+                fi
                 rvdk_prog 32 "ntfy ${NTFY_VERSION}: pulling ${TARGET_SLUG} binary bundle..."
                 log_info "Pulling precompiled ${TARGET_SLUG} bundle from ${BUNDLE_URL}..."
                 _NTFY_TMP_ARCHIVE="$(mktemp /tmp/rvdk-ntfy-bundle.XXXXXX.tar.zst)"
@@ -819,7 +822,7 @@ fi
 if [[ "$DEFAULT_URL_HOST" == "0.0.0.0" || "$DEFAULT_URL_HOST" == "[::]" ]]; then
     DETECTED_IP=""
     if command -v ip >/dev/null 2>&1; then
-        PRIMARY_NIC="${RVDK_PRIMARY_NIC:-$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}' || true)}"
+        PRIMARY_NIC="${RVDK_PRIMARY_NIC:-$(ip -o -4 route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)}"
         if [[ -n "$PRIMARY_NIC" ]]; then
             DETECTED_IP="$(ip -o -4 addr show dev "$PRIMARY_NIC" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}' || true)"
         fi

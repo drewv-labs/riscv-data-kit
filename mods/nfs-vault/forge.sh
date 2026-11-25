@@ -176,9 +176,11 @@ fi
 if [[ -z "$ALLOW_CIDR" ]]; then
     log_fatal "Missing authorized client subnet. Pass --allow-cidr <IPv4/len> (e.g. 192.168.1.0/24) or --auto-subnet."
 fi
-if ! ALLOW_CIDR="$(rvdk_normalize_ipv4_cidr "$ALLOW_CIDR")"; then
+_norm_cidr=""
+if ! _norm_cidr="$(rvdk_normalize_ipv4_cidr "$ALLOW_CIDR")"; then
     log_fatal "Invalid IPv4 CIDR '${ALLOW_CIDR}'."
 fi
+ALLOW_CIDR="$_norm_cidr"
 
 KERNEL_SQUASH_OPT="root_squash"
 GANESHA_SQUASH_OPT="Root_Squash"

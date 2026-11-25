@@ -27,7 +27,7 @@ fi
 _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 
-# @RVDK_INLINE_LIBS: common
+# @RVDK_INLINE_LIBS: common apt
 if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
     if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
         # shellcheck source=lib/common.sh
@@ -46,6 +46,12 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
             [[ "$h" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
         }
         rvdk_sync_cold_clock() { :; }
+    fi
+fi
+if [[ -z "${_RVDK_APT_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
+        # shellcheck source=lib/apt.sh
+        source "${_REPO_ROOT}/lib/apt.sh"
     fi
 fi
 
@@ -71,7 +77,9 @@ _rvdk_emmc_cleanup() {
         fi
         rmdir "${_EMMC_TMP_MNT}" 2>/dev/null || true
     fi
-    declare -F _rvdk_cleanup_tmpfiles >/dev/null 2>&1 && _rvdk_cleanup_tmpfiles || true
+    if typeset -f _rvdk_cleanup_tmpfiles >/dev/null 2>&1; then
+        _rvdk_cleanup_tmpfiles || true
+    fi
 }
 
 print_emmc_usage() {
@@ -142,7 +150,9 @@ main() {
 
     if [[ "$dry_run" != "true" ]]; then
         rvdk_require_root "${BASH_SOURCE[0]:-}" ${orig_args[@]+"${orig_args[@]}"}
-        declare -F rvdk_sync_cold_clock >/dev/null 2>&1 && rvdk_sync_cold_clock
+        if typeset -f rvdk_sync_cold_clock >/dev/null 2>&1; then
+            rvdk_sync_cold_clock
+        fi
     fi
     rvdk_sanitize_locale
 
@@ -279,8 +289,15 @@ main() {
     fi
     if (( ${#missing_pkgs[@]} > 0 )) && command -v apt-get >/dev/null 2>&1; then
         log_info "Installing required bootstrap utilities (${missing_pkgs[*]})..."
-        DEBIAN_FRONTEND=noninteractive apt-get update -y -q
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing_pkgs[@]}"
+        export DEBIAN_FRONTEND=noninteractive
+        if typeset -f rvdk_apt_ensure >/dev/null 2>&1; then
+            rvdk_apt_ensure "${missing_pkgs[@]}"
+        else
+            if [[ "${RVDK_NO_APT_UPDATE:-0}" != "1" && "${RVDK_NO_APT_UPDATE:-false}" != "true" ]]; then
+                apt-get update -y -q
+            fi
+            apt-get install -y -q "${missing_pkgs[@]}"
+        fi
     fi
     for tool_cmd in parted rsync mkfs.ext4 e2label blkid; do
         command -v "$tool_cmd" >/dev/null 2>&1 || log_fatal "Required utility '${tool_cmd}' is not installed."
@@ -536,7 +553,7 @@ main() {
             _EMMC_BOOT0_RO_UNLOCKED="$boot0_ro"
         fi
         dd if="${uboot_dir}/bootinfo_emmc.bin" of="$boot0_dev" bs=512 seek=0 conv=notrunc,fsync status=none
-        dd if="${uboot_dir}/FSBL.bin" of="$boot0_dev" bs=1 seek=512 conv=notrunc,fsync status=none
+        dd if="${uboot_dir}/FSBL.bin" of="$boot0_dev" bs=512 seek=1 conv=notrunc,fsync status=none
         sync
         if [[ -n "${_EMMC_BOOT0_RO_UNLOCKED:-}" && -f "${_EMMC_BOOT0_RO_UNLOCKED}" ]]; then
             printf '1\n' > "${_EMMC_BOOT0_RO_UNLOCKED}"

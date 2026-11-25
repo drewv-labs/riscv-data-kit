@@ -188,7 +188,13 @@ if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" != "1" && "${RVDK_KEEP_VENDOR_MIRRORS:-fa
             [[ -n "$_cur_srv_list" ]] || continue
 
             _sec_had_cn="false"
-            for _srv_tok in $_cur_srv_list; do
+            _had_noglob="false"
+            [[ $- == *f* ]] && _had_noglob="true"
+            set -f
+            # shellcheck disable=SC2206 # intentional word-splitting under set -f
+            _srv_tokens=($_cur_srv_list)
+            [[ "$_had_noglob" == "false" ]] && set +f
+            for _srv_tok in ${_srv_tokens[@]+"${_srv_tokens[@]}"}; do
                 if [[ "$_srv_tok" =~ $OWRT_CN_DNS_RE ]]; then
                     if [[ "$OWRT_DNS_CHANGED" == "false" && -f /etc/config/dhcp && ! -f /var/lib/rvdk/backups/openwrt/dhcp.orig ]]; then
                         mkdir -p /var/lib/rvdk/backups/openwrt
@@ -267,7 +273,21 @@ if [[ -n "$TARGET_USER" && "$TARGET_USER" != "root" ]]; then
             SUDOERS_FILE="/etc/sudoers.d/010_${TARGET_USER}-nopasswd"
             SUDOERS_RULE="${TARGET_USER} ALL=(ALL) NOPASSWD: ALL"
             if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -qxF "$SUDOERS_RULE" "$SUDOERS_FILE"; then
-                printf '%s\n' "$SUDOERS_RULE" | rvdk_atomic_write "$SUDOERS_FILE" 0440
+                TMP_SUDOERS="$(mktemp "/etc/sudoers.d/.010_${TARGET_USER}-nopasswd.rvdk.XXXXXX")"
+                if ! printf '%s\n' "$SUDOERS_RULE" > "$TMP_SUDOERS" || ! chmod 0440 "$TMP_SUDOERS"; then
+                    rm -f "$TMP_SUDOERS"
+                    log_fatal "Failed to stage sudoers rule at ${TMP_SUDOERS}."
+                fi
+                if command -v visudo >/dev/null 2>&1; then
+                    if ! visudo -cf "$TMP_SUDOERS" >/dev/null 2>&1; then
+                        rm -f "$TMP_SUDOERS"
+                        log_fatal "Generated sudoers rule failed visudo syntax check for '${TARGET_USER}'."
+                    fi
+                fi
+                if ! mv -f "$TMP_SUDOERS" "$SUDOERS_FILE"; then
+                    rm -f "$TMP_SUDOERS"
+                    log_fatal "Failed to install validated sudoers rule to ${SUDOERS_FILE}."
+                fi
                 log_ok "Configured passwordless sudo in ${SUDOERS_FILE}"
             else
                 log_skip "Passwordless sudo already active at ${SUDOERS_FILE}"

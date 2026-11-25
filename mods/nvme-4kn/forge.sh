@@ -102,7 +102,7 @@ Options:
   --with-nfs-lv             Provision isolated NFS vault LV (/mnt/nfs_vault, lv_nfsvault, NFS_VAULT)
   --secondary-mount <path>  Secondary mountpoint (default: /mnt/nvme_secondary)
   --secondary-lv <name>     Secondary LV name (default: lv_secondary)
-  --secondary-label <label> Secondary filesystem label (default: RVDK_SECONDARY)
+  --secondary-label <label> Secondary filesystem label (default: RVDK_SEC)
   --primary-pct <pct>       Dual-LV primary allocation (default: 45%VG)
   --secondary-pct <pct>     Dual-LV secondary allocation (default: 30%VG)
   --no-lvm                  Use raw GPT partition instead of LVM2
@@ -186,9 +186,24 @@ if [[ "$WITH_NFS_LV" == "true" ]]; then
     SECONDARY_MOUNT_POINT="${CLI_SEC_MOUNT:-${NFS_MOUNT_POINT:-/mnt/nfs_vault}}"
 else
     SECONDARY_LV_NAME="${CLI_SEC_LV:-lv_secondary}"
-    SECONDARY_FS_LABEL="${CLI_SEC_LABEL:-RVDK_SECONDARY}"
+    SECONDARY_FS_LABEL="${CLI_SEC_LABEL:-RVDK_SEC}"
     SECONDARY_MOUNT_POINT="${CLI_SEC_MOUNT:-/mnt/nvme_secondary}"
 fi
+
+_nvme_validate_fs_label() {
+    local flag_name="$1"
+    local label="$2"
+    local fstype="$3"
+    local max_len=0
+    case "$fstype" in
+        xfs)   max_len=12 ;;
+        ext4)  max_len=16 ;;
+        btrfs) max_len=255 ;;
+    esac
+    if (( max_len > 0 && ${#label} > max_len )); then
+        log_fatal "Invalid ${flag_name} '${label}': length ${#label} exceeds ${fstype} maximum of ${max_len} characters."
+    fi
+}
 
 MOUNT_POINT="$(rvdk_normalize_mount_path "$MOUNT_POINT")"
 SECONDARY_MOUNT_POINT="$(rvdk_normalize_mount_path "$SECONDARY_MOUNT_POINT")"
@@ -200,6 +215,11 @@ SECONDARY_MOUNT_POINT="$(rvdk_normalize_mount_path "$SECONDARY_MOUNT_POINT")"
 [[ "$VG_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || log_fatal "Invalid --vg '${VG_NAME}'."
 [[ "$LV_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || log_fatal "Invalid --lv '${LV_NAME}'."
 [[ "$SECONDARY_LV_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || log_fatal "Invalid --secondary-lv '${SECONDARY_LV_NAME}'."
+
+_pri_fs_lc="$(tr '[:upper:]' '[:lower:]' <<< "$PRIMARY_FSTYPE")"
+case "$_pri_fs_lc" in
+    xfs|ext4|btrfs) _nvme_validate_fs_label "--label" "$FS_LABEL" "$_pri_fs_lc" ;;
+esac
 
 [[ ! -b "$NVME_DEV" ]] && log_fatal "NVMe block device not found: ${NVME_DEV}"
 NVME_DEV="$(readlink -f "$NVME_DEV")"
@@ -298,6 +318,11 @@ if [[ "$FORCE_WIPE" == "false" && "$FSTYPE_IS_AUTO" == "true" ]]; then
     esac
 fi
 
+_nvme_validate_fs_label "--label" "$FS_LABEL" "$NVME_FSTYPE"
+if [[ "$WITH_SECONDARY_LV" == "true" && "$USE_LVM" == "true" ]]; then
+    _nvme_validate_fs_label "--secondary-label" "$SECONDARY_FS_LABEL" "$SEC_FSTYPE"
+fi
+
 EFFECTIVE_PRI_LABEL="$FS_LABEL"
 EFFECTIVE_PRI_SPEC="LABEL=${FS_LABEL}"
 if [[ -n "$EXISTING_FS_DEV" && "$FORCE_WIPE" == "false" ]]; then
@@ -313,7 +338,7 @@ fi
 
 # If existing volume is NOT already converged, enforce non-destructive storage guard before wiping
 if [[ -z "$EXISTING_FS_DEV" || "$EXISTING_FS_TYPE" != "$NVME_FSTYPE" || "$FORCE_WIPE" == "true" ]]; then
-    rvdk_assert_device_safe_to_wipe "$NVME_DEV" "$FORCE_WIPE" "${FS_LABEL},${EFFECTIVE_PRI_LABEL},${SECONDARY_FS_LABEL},RVDK_NVME,RVDK_SECONDARY,NFS_VAULT"
+    rvdk_assert_device_safe_to_wipe "$NVME_DEV" "$FORCE_WIPE" "${FS_LABEL},${EFFECTIVE_PRI_LABEL},${SECONDARY_FS_LABEL},RVDK_NVME,RVDK_SEC,NFS_VAULT"
 fi
 
 _nvme_ensure_unmounted() {
@@ -329,7 +354,7 @@ _nvme_ensure_unmounted() {
     if [[ -n "$dev_scope" && -b "$dev_scope" ]]; then
         while IFS= read -r _desc_mnt; do
             [[ -n "$_desc_mnt" && "$_desc_mnt" == /* ]] && mnt_targets+=("$_desc_mnt")
-        done < <(lsblk -rn -o MOUNTPOINT "$dev_scope" 2>/dev/null || true)
+        done < <(_rvdk_lsblk_mountpoints "$dev_scope")
     fi
 
     if (( ${#mnt_targets[@]} > 0 )); then
@@ -352,7 +377,7 @@ _nvme_ensure_unmounted() {
         while IFS= read -r _desc_mnt; do
             [[ -z "$_desc_mnt" ]] && continue
             log_fatal "Cannot proceed: ${dev_scope} still has busy/mounted descendant '${_desc_mnt}'."
-        done < <(lsblk -rn -o MOUNTPOINT "$dev_scope" 2>/dev/null || true)
+        done < <(_rvdk_lsblk_mountpoints "$dev_scope")
     fi
 }
 
@@ -475,6 +500,10 @@ else
 fi
 
 converge_fstab_entry() {
+    if typeset -f rvdk_converge_fstab_entry >/dev/null 2>&1; then
+        rvdk_converge_fstab_entry "$@"
+        return $?
+    fi
     local spec="$1"
     local mnt="$2"
     local fstype="$3"
@@ -484,7 +513,12 @@ converge_fstab_entry() {
 
     if [[ -s "$fstab_file" ]]; then
         want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
-            BEGIN { replaced = 0 }
+            BEGIN {
+                replaced = 0
+                while (length(mp) > 1 && substr(mp, length(mp), 1) == "/") {
+                    mp = substr(mp, 1, length(mp) - 1)
+                }
+            }
             /^[[:space:]]*#/ || NF < 2 { print; next }
             {
                 m = $2
@@ -510,7 +544,7 @@ converge_fstab_entry() {
         log_skip "${mnt} (${fstype}) already in ${fstab_file}"
     else
         printf '%s\n' "$want_fstab" | rvdk_atomic_write "$fstab_file" 0644
-        if [[ "$fstab_file" == "/etc/fstab" ]]; then
+        if [[ "$fstab_file" == "/etc/fstab" ]] && command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload
         fi
         log_ok "Persisted ${spec} -> ${mnt} (${fstype}) in ${fstab_file}"

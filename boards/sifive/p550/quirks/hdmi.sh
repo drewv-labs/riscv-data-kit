@@ -32,6 +32,40 @@
 # ==============================================================================
 set -Eeuo pipefail
 
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+_REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../../.." && pwd)"
+
+# @RVDK_INLINE_LIBS: common
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:QUIRK:HDMI]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        _rvdk_cleanup_tmpfiles() { :; }
+        rvdk_register_cleanup() { :; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
+fi
+
+rvdk_log_init "RVDK:QUIRK:HDMI"
+
 PERSIST_UNIT="/etc/systemd/system/rvdk-p550-hdmi-off.service"
 PLAT_DRV_BASE="/sys/bus/platform/drivers"
 
@@ -80,28 +114,11 @@ if [[ "$ACTION" != "status" && $EUID -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
-        echo "[RVDK:FATAL] Root privileges required for '${ACTION}'." >&2
-        exit 1
+        log_fatal "Root privileges required for '${ACTION}'."
     fi
 fi
 
-log_info()  { printf "\033[1;36m[RVDK:QUIRK:HDMI]\033[0m %s\n" "$1"; }
-log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
-
-_HDMI_TMPFILES=()
-_hdmi_cleanup_tmpfiles() {
-    local _tf
-    for _tf in ${_HDMI_TMPFILES[@]+"${_HDMI_TMPFILES[@]}"}; do
-        [[ -n "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
-    done
-    _HDMI_TMPFILES=()
-}
-trap '_hdmi_cleanup_tmpfiles' EXIT
-trap '_hdmi_cleanup_tmpfiles; trap - INT; kill -INT $$' INT
-trap '_hdmi_cleanup_tmpfiles; trap - TERM; kill -TERM $$' TERM
+rvdk_register_cleanup _rvdk_cleanup_tmpfiles
 
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
@@ -221,13 +238,8 @@ disable_hdmi() {
             self_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
             exec_cmd="/bin/bash ${self_path} off"
         fi
-        local unit_dir unit_tmp unit_changed="false"
-        unit_dir="$(dirname "$PERSIST_UNIT")"
-        mkdir -p "$unit_dir"
-        unit_tmp="$(mktemp "${unit_dir}/.$(basename "$PERSIST_UNIT").rvdk.XXXXXX")"
-        _HDMI_TMPFILES+=("$unit_tmp")
-        cat <<EOF > "$unit_tmp"
-[Unit]
+        local unit_body unit_changed="false"
+        unit_body="[Unit]
 Description=RVDK SiFive P550 Headless Display/HDMI Suppression
 After=multi-user.target
 
@@ -237,13 +249,11 @@ ExecStart=${exec_cmd}
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
-EOF
-        chmod 0644 "$unit_tmp"
-        if [[ -f "$PERSIST_UNIT" && ! -L "$PERSIST_UNIT" ]] && cmp -s "$unit_tmp" "$PERSIST_UNIT"; then
-            rm -f "$unit_tmp"
+WantedBy=multi-user.target"
+        if [[ -f "$PERSIST_UNIT" && ! -L "$PERSIST_UNIT" ]] && printf '%s\n' "$unit_body" | cmp -s - "$PERSIST_UNIT"; then
+            unit_changed="false"
         else
-            mv -f "$unit_tmp" "$PERSIST_UNIT"
+            printf '%s\n' "$unit_body" | rvdk_atomic_write "$PERSIST_UNIT" 0644
             unit_changed="true"
         fi
         if [[ "$unit_changed" == "true" ]]; then

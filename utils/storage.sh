@@ -17,13 +17,21 @@
 #   sudo rvdk storage autotune [--weights lv_data:1.5,lv_secondary:1.0] [--dry-run]
 # ==============================================================================
 
-# Ensure compatibility when invoked via `zsh` or `bash`
+# Re-exec under bash when invoked via zsh
 if [[ -n "${ZSH_VERSION:-}" ]]; then
-    emulate -L ksh
-    setopt PIPE_FAIL ERR_RETURN NO_UNSET
-else
-    set -Eeuo pipefail
+    case "${0:-}" in
+        zsh|-zsh|*/zsh|*/-zsh) ;;
+        *)
+            if [[ -f "${0:-}" ]]; then
+                exec bash "$0" "$@"
+            fi
+            ;;
+    esac
+    printf '[FAIL] %s\n' "This script requires bash. When piping over stdin, run: curl ... | sudo bash" >&2
+    exit 1
 fi
+
+set -Eeuo pipefail
 
 _SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -716,7 +724,10 @@ main() {
                 rem = alloc;
                 for (i = 1; i <= n; i++) {
                     if (want[i] <= 0) { g = 0; }
-                    else if (i == last_hungry) { g = rem; }
+                    else if (i == last_hungry) {
+                        g = rem;
+                        if (g > want[i]) g = want[i];
+                    }
                     else {
                         g = int(alloc * (s[i] / sum) + 0.5);
                         if (g > want[i]) g = want[i];

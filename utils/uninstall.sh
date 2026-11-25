@@ -15,7 +15,7 @@
 #
 #   • Full Purge (`sudo rvdk uninstall --purge` / `sudo rvdk purge`):
 #       Removes everything above PLUS restores preserved vendor configuration
-#       backups under `/var/lib/rvdk/backups/{apt,dns,ntp,openwrt,registries}`
+#       backups under `/var/lib/rvdk/backups/{apt,boot,dns,ntp,openwrt,registries}`
 #       (unless `--no-restore-backups` is passed), removes `/etc/rvdk/`,
 #       OS/BSP state under `/var/lib/rvdk/`, and all OS/BSP RVDK-authored
 #       systemd/procd tuning units, sysctl/modprobe/journald/APT drop-ins, and
@@ -23,7 +23,8 @@
 #       and `sysctl`. Preserves live workload service drop-ins and caches
 #       (`89-rvdk-io-uring.conf`, `90-rvdk-pg18-hugepages.conf`,
 #       `90-rvdk-tailscale-forwarding.conf`, `90-rvdk-stateful.conf`,
-#       `rvdk-local-pgdg.list`, `/var/lib/rvdk/pgdg-riscv64`,
+#       `90-rvdk-qos.conf`, `90-rvdk-runtime.conf`, `rvdk-tailscale-gro.service`,
+#       `rvdk-local-pgdg.list`, `pgdg.list`, `/var/lib/rvdk/pgdg-riscv64`,
 #       `/var/lib/rvdk/ntfy-riscv64`) unless `--include-workloads` is passed.
 #
 #   • Hard Safety Boundary (NEVER touched even with `--purge`):
@@ -39,11 +40,18 @@
 # ==============================================================================
 
 if [[ -n "${ZSH_VERSION:-}" ]]; then
-    emulate -L ksh
-    setopt PIPE_FAIL ERR_RETURN NO_UNSET
-else
-    set -Eeuo pipefail
+    case "${0:-}" in
+        zsh|-zsh|*/zsh|*/-zsh|zsh[0-9]*|*/zsh[0-9]*) ;;
+        *)
+            if [[ -f "${0:-}" ]]; then
+                exec bash "$0" "$@"
+            fi
+            ;;
+    esac
+    printf '[FAIL] %s\n' "This script requires bash. When piping over stdin, run: curl ... | sudo bash" >&2
+    exit 1
 fi
+set -Eeuo pipefail
 
 _SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -87,6 +95,77 @@ if [[ -z "${_RVDK_MOTD_SH_LOADED:-}" ]]; then
     fi
 fi
 
+if ! typeset -f rvdk_assert_safe_managed_dir >/dev/null 2>&1; then
+    rvdk_assert_safe_managed_dir() {
+        local raw_path="${1:-}"
+        local var_name="${2:-PATH}"
+
+        if [[ -z "$raw_path" || "$raw_path" != /* ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' must be a non-empty absolute path."
+        fi
+        if [[ "$raw_path" =~ [[:cntrl:]] ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' contains control characters."
+        fi
+
+        local norm="$raw_path"
+        while [[ "$norm" == *//* ]]; do
+            norm="${norm//\/\///}"
+        done
+        while [[ "$norm" != "/" && "$norm" == */ ]]; do
+            norm="${norm%/}"
+        done
+
+        if [[ "$norm" == "/" ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' resolves to root '/'."
+        fi
+
+        local comp_count=0 seg rest="${norm#/}"
+        while [[ -n "$rest" ]]; do
+            if [[ "$rest" == */* ]]; then
+                seg="${rest%%/*}"
+                rest="${rest#*/}"
+            else
+                seg="$rest"
+                rest=""
+            fi
+            [[ -z "$seg" ]] && continue
+            if [[ "$seg" == "." || "$seg" == ".." ]]; then
+                log_fatal "Unsafe ${var_name}: '${raw_path}' contains '.' or '..' traversal segment."
+            fi
+            comp_count=$(( comp_count + 1 ))
+        done
+
+        if [[ -L "$raw_path" || -L "$norm" ]]; then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' is a symbolic link."
+        fi
+
+        if (( comp_count < 2 )); then
+            log_fatal "Unsafe ${var_name}: '${raw_path}' must have at least 2 path components."
+        fi
+
+        if [[ -n "${REAL_HOME:-}" ]]; then
+            local norm_home="$REAL_HOME"
+            while [[ "$norm_home" == *//* ]]; do
+                norm_home="${norm_home//\/\///}"
+            done
+            while [[ "$norm_home" != "/" && "$norm_home" == */ ]]; do
+                norm_home="${norm_home%/}"
+            done
+            if [[ "$norm" == "$norm_home" ]]; then
+                log_fatal "Unsafe ${var_name}: '${raw_path}' resolves to user home '${norm_home}'."
+            fi
+        fi
+
+        case "$norm" in
+            /usr|/usr/local|/usr/local/share|/var|/var/cache|/var/lib|/etc|/home|/root|/opt|/tmp)
+                log_fatal "Unsafe ${var_name}: '${raw_path}' is a protected system directory."
+                ;;
+        esac
+
+        return 0
+    }
+fi
+
 print_uninstall_help() {
     cat <<'EOF'
 Usage:
@@ -106,7 +185,9 @@ Options:
                          and caches (89-rvdk-io-uring.conf,
                          90-rvdk-pg18-hugepages.conf,
                          90-rvdk-tailscale-forwarding.conf,
-                         90-rvdk-stateful.conf, rvdk-local-pgdg.list,
+                         90-rvdk-stateful.conf, 90-rvdk-qos.conf,
+                         90-rvdk-runtime.conf, rvdk-tailscale-gro.service,
+                         rvdk-local-pgdg.list, pgdg.list,
                          /var/lib/rvdk/pgdg-riscv64, /var/lib/rvdk/ntfy-riscv64)
   --no-restore-backups   During --purge, skip restoring /var/lib/rvdk/backups/*
                          and leave current APT/DNS/NTP/UCI configs in place
@@ -165,30 +246,31 @@ main() {
     cd /
 
     local sys_engine="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
-    local sys_share_parent
-    sys_share_parent="$(dirname "$sys_engine")"
     local sys_cache="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
     local state_root="${RVDK_STATE_DIR:-/var/lib/rvdk}"
-    local backup_root="${RVDK_BACKUP_ROOT:-${state_root}/backups}"
     local os_type
     os_type="$(uname -s)"
 
-    # Safety guard against dangerous RVDK_ENGINE_DIR / RVDK_CACHE_DIR / RVDK_STATE_DIR overrides
-    case "$sys_engine" in
-        ""|"/"|"/usr"|"/usr/local"|"/usr/local/share"|"/etc"|"/var"|"/home"|"$REAL_HOME")
-            log_fatal "Refusing unsafe RVDK_ENGINE_DIR='${sys_engine}'."
-            ;;
-    esac
-    case "$sys_cache" in
-        ""|"/"|"/var"|"/var/cache"|"/etc"|"/usr"|"/home"|"$REAL_HOME")
-            log_fatal "Refusing unsafe RVDK_CACHE_DIR='${sys_cache}'."
-            ;;
-    esac
-    case "$state_root" in
-        ""|"/"|"/var"|"/var/lib"|"/etc"|"/usr"|"/home"|"$REAL_HOME")
-            log_fatal "Refusing unsafe RVDK_STATE_DIR='${state_root}'."
-            ;;
-    esac
+    # Safety guard against dangerous RVDK_ENGINE_DIR / RVDK_CACHE_DIR / RVDK_STATE_DIR / RVDK_BACKUP_ROOT overrides
+    rvdk_assert_safe_managed_dir "$sys_engine" "RVDK_ENGINE_DIR"
+    rvdk_assert_safe_managed_dir "$sys_cache" "RVDK_CACHE_DIR"
+    rvdk_assert_safe_managed_dir "$state_root" "RVDK_STATE_DIR"
+    while [[ "$sys_engine" == *//* ]]; do sys_engine="${sys_engine//\/\///}"; done
+    while [[ "$sys_engine" != "/" && "$sys_engine" == */ ]]; do sys_engine="${sys_engine%/}"; done
+    while [[ "$sys_cache" == *//* ]]; do sys_cache="${sys_cache//\/\///}"; done
+    while [[ "$sys_cache" != "/" && "$sys_cache" == */ ]]; do sys_cache="${sys_cache%/}"; done
+    while [[ "$state_root" == *//* ]]; do state_root="${state_root//\/\///}"; done
+    while [[ "$state_root" != "/" && "$state_root" == */ ]]; do state_root="${state_root%/}"; done
+
+    local backup_root="${RVDK_BACKUP_ROOT:-${state_root}/backups}"
+    if [[ -n "${RVDK_BACKUP_ROOT:-}" ]]; then
+        rvdk_assert_safe_managed_dir "$backup_root" "RVDK_BACKUP_ROOT"
+    fi
+    while [[ "$backup_root" == *//* ]]; do backup_root="${backup_root//\/\///}"; done
+    while [[ "$backup_root" != "/" && "$backup_root" == */ ]]; do backup_root="${backup_root%/}"; done
+
+    local sys_share_parent
+    sys_share_parent="$(dirname "$sys_engine")"
 
     local mode_desc="Standard Uninstall (restoring default login header; preserving /etc/rvdk, ${state_root} & active tuning)"
     if [[ "$purge" == "true" ]]; then
@@ -277,11 +359,11 @@ main() {
     }
 
     restore_preserved_backups() {
-        [[ -d "$backup_root" ]] || return 0
+        [[ -d "$backup_root" && ! -L "$backup_root" ]] || return 0
         local cat_name cat_dir bfile bbase stem dest bmode bowner
         local openwrt_uci_restored="false"
 
-        for cat_name in apt dns ntp openwrt registries; do
+        for cat_name in apt boot dns ntp openwrt registries; do
             cat_dir="${backup_root}/${cat_name}"
             [[ -d "$cat_dir" ]] || continue
 
@@ -390,7 +472,7 @@ main() {
         remove_path "/run/rvdk"
     fi
 
-    if [[ "$os_type" == "Linux" ]] && declare -F rvdk_restore_login_motd >/dev/null 2>&1; then
+    if [[ "$os_type" == "Linux" ]] && typeset -f rvdk_restore_login_motd >/dev/null 2>&1; then
         if rvdk_restore_login_motd "$dry_run"; then
             removed_count=$(( removed_count + 1 ))
         fi
@@ -573,7 +655,8 @@ main() {
             local w_dropin
             for w_dropin in \
                 /etc/needrestart/conf.d/90-rvdk-stateful.conf \
-                /etc/apt/sources.list.d/rvdk-local-pgdg.list; do
+                /etc/apt/sources.list.d/rvdk-local-pgdg.list \
+                /etc/apt/sources.list.d/pgdg.list; do
                 if [[ -e "$w_dropin" || -L "$w_dropin" ]]; then
                     if [[ "$include_workloads" == "true" ]]; then
                         remove_path "$w_dropin"
@@ -582,6 +665,40 @@ main() {
                     fi
                 fi
             done
+
+            local w_systemd_dropin w_dropin_dir
+            for w_systemd_dropin in \
+                /etc/systemd/system/postgresql@.service.d/90-rvdk-qos.conf \
+                /etc/systemd/system/mosquitto.service.d/90-rvdk-runtime.conf \
+                /etc/systemd/system/ntfy.service.d/90-rvdk-runtime.conf \
+                /etc/systemd/system/nfs-server.service.d/90-rvdk-qos.conf \
+                /etc/systemd/system/nfs-ganesha.service.d/90-rvdk-qos.conf; do
+                if [[ -e "$w_systemd_dropin" || -L "$w_systemd_dropin" ]]; then
+                    if [[ "$include_workloads" == "true" ]]; then
+                        remove_path "$w_systemd_dropin"
+                        systemd_dirty="true"
+                        w_dropin_dir="$(dirname "$w_systemd_dropin")"
+                        if [[ -d "$w_dropin_dir" && ! -L "$w_dropin_dir" ]]; then
+                            if [[ "$dry_run" == "true" ]]; then
+                                log_info "[DRY-RUN] Would remove directory if empty: ${w_dropin_dir}"
+                            else
+                                rmdir "$w_dropin_dir" 2>/dev/null || true
+                            fi
+                        fi
+                    else
+                        log_skip "Preserved workload systemd drop-in ${w_systemd_dropin} (pass '--include-workloads' to purge)"
+                    fi
+                fi
+            done
+
+            if [[ -L /etc/systemd/system/rvdk-tailscale-gro.service || -f /etc/systemd/system/rvdk-tailscale-gro.service ]]; then
+                if [[ "$include_workloads" == "true" ]]; then
+                    stop_disable_systemd_unit "rvdk-tailscale-gro.service"
+                    systemd_dirty="true"
+                else
+                    log_skip "Preserved workload systemd unit /etc/systemd/system/rvdk-tailscale-gro.service (pass '--include-workloads' to purge)"
+                fi
+            fi
 
             if [[ "$restore_backups" == "true" ]]; then
                 restore_preserved_backups

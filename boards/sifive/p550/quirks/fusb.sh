@@ -20,6 +20,40 @@
 # ==============================================================================
 set -Eeuo pipefail
 
+_SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+_REPO_ROOT=""
+[[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../../.." && pwd)"
+
+# @RVDK_INLINE_LIBS: common
+if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_REPO_ROOT}/lib/common.sh"
+    else
+        log_info()  { printf "\033[1;36m[RVDK:QUIRK:FUSB]\033[0m %s\n" "$1"; }
+        log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+        log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+        log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
+        log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+        rvdk_log_init() { :; }
+        _rvdk_cleanup_tmpfiles() { :; }
+        rvdk_register_cleanup() { :; }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
+    fi
+fi
+
+rvdk_log_init "RVDK:QUIRK:FUSB"
+
 MODPROBE_CONF="/etc/modprobe.d/90-rvdk-p550-fusb303b.conf"
 STATE_CACHE="/run/rvdk-fusb303b.bound"
 I2C_DRV_DIR="/sys/bus/i2c/drivers/fusb303b"
@@ -28,6 +62,10 @@ ACTION="toggle"
 EPHEMERAL="false"
 FORCE_BOARD="false"
 QUIET="false"
+
+_fusb_info() { [[ "$QUIET" == "true" ]] || log_info "$1"; }
+_fusb_ok()   { [[ "$QUIET" == "true" ]] || log_ok "$1"; }
+_fusb_skip() { [[ "$QUIET" == "true" ]] || log_skip "$1"; }
 
 usage() {
     cat <<EOF
@@ -70,28 +108,11 @@ if [[ "$ACTION" != "status" && $EUID -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
-        echo "[RVDK:FATAL] Root privileges required for '${ACTION}'." >&2
-        exit 1
+        log_fatal "Root privileges required for '${ACTION}'."
     fi
 fi
 
-log_info()  { [[ "$QUIET" == "true" ]] || printf "\033[1;36m[RVDK:QUIRK:FUSB]\033[0m %s\n" "$1"; }
-log_ok()    { [[ "$QUIET" == "true" ]] || printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip()  { [[ "$QUIET" == "true" ]] || printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[RVDK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
-
-_FUSB_TMPFILES=()
-_fusb_cleanup_tmpfiles() {
-    local _tf
-    for _tf in ${_FUSB_TMPFILES[@]+"${_FUSB_TMPFILES[@]}"}; do
-        [[ -n "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
-    done
-    _FUSB_TMPFILES=()
-}
-trap '_fusb_cleanup_tmpfiles' EXIT
-trap '_fusb_cleanup_tmpfiles; trap - INT; kill -INT $$' INT
-trap '_fusb_cleanup_tmpfiles; trap - TERM; kill -TERM $$' TERM
+rvdk_register_cleanup _rvdk_cleanup_tmpfiles
 
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
@@ -163,7 +184,7 @@ print_status() {
 }
 
 disable_fusb() {
-    log_info "Disabling SiFive P550 front-panel USB-C controller (fusb303b)..."
+    _fusb_info "Disabling SiFive P550 front-panel USB-C controller (fusb303b)..."
 
     local bound_list=()
     local dev_id
@@ -172,69 +193,54 @@ disable_fusb() {
     done < <(bound_i2c_devs)
 
     if [[ ${#bound_list[@]} -gt 0 ]]; then
-        local state_dir state_tmp
-        state_dir="$(dirname "$STATE_CACHE")"
-        if mkdir -p "$state_dir" 2>/dev/null && state_tmp="$(mktemp "${state_dir}/.$(basename "$STATE_CACHE").rvdk.XXXXXX" 2>/dev/null)"; then
-            _FUSB_TMPFILES+=("$state_tmp")
-            printf '%s\n' "${bound_list[@]}" > "$state_tmp"
-            chmod 0644 "$state_tmp" 2>/dev/null || true
-            mv -f "$state_tmp" "$STATE_CACHE" 2>/dev/null || rm -f "$state_tmp" 2>/dev/null || true
-        fi
+        printf '%s\n' "${bound_list[@]}" | rvdk_atomic_write "$STATE_CACHE" 0644 2>/dev/null || true
         for dev_id in "${bound_list[@]}"; do
             if [[ -w "${I2C_DRV_DIR}/unbind" ]]; then
                 printf '%s' "$dev_id" > "${I2C_DRV_DIR}/unbind" 2>/dev/null || true
-                log_ok "Unbound I2C client ${dev_id} from fusb303b driver"
+                _fusb_ok "Unbound I2C client ${dev_id} from fusb303b driver"
             fi
         done
     fi
 
     if is_mod_loaded; then
         if modprobe -r fusb303b 2>/dev/null || rmmod fusb303b 2>/dev/null; then
-            log_ok "Unloaded kernel module fusb303b"
+            _fusb_ok "Unloaded kernel module fusb303b"
         else
             log_warn "fusb303b module still referenced, but I2C client is unbound"
         fi
     fi
 
     if [[ "$EPHEMERAL" == "false" ]]; then
-        local conf_dir conf_tmp
-        conf_dir="$(dirname "$MODPROBE_CONF")"
-        mkdir -p "$conf_dir"
-        conf_tmp="$(mktemp "${conf_dir}/.$(basename "$MODPROBE_CONF").rvdk.XXXXXX")"
-        _FUSB_TMPFILES+=("$conf_tmp")
-        cat <<'EOF' > "$conf_tmp"
-# Managed by RVDK (boards/sifive/p550/quirks/fusb.sh)
+        local conf_body
+        conf_body="# Managed by RVDK (boards/sifive/p550/quirks/fusb.sh)
 # Suppresses out-of-tree front-panel Type-C controller IRQ chatter (irq/*-fusb303b_).
 # Re-enable anytime with: sudo rvdk quirk fusb on
-blacklist fusb303b
-EOF
-        chmod 0644 "$conf_tmp"
-        if [[ -f "$MODPROBE_CONF" && ! -L "$MODPROBE_CONF" ]] && cmp -s "$conf_tmp" "$MODPROBE_CONF"; then
-            rm -f "$conf_tmp"
-            log_skip "Boot blacklist already converged (${MODPROBE_CONF})"
+blacklist fusb303b"
+        if [[ -f "$MODPROBE_CONF" && ! -L "$MODPROBE_CONF" ]] && printf '%s\n' "$conf_body" | cmp -s - "$MODPROBE_CONF"; then
+            _fusb_skip "Boot blacklist already converged (${MODPROBE_CONF})"
         else
-            mv -f "$conf_tmp" "$MODPROBE_CONF"
-            log_ok "Persisted boot blacklist in ${MODPROBE_CONF}"
+            printf '%s\n' "$conf_body" | rvdk_atomic_write "$MODPROBE_CONF" 0644
+            _fusb_ok "Persisted boot blacklist in ${MODPROBE_CONF}"
         fi
     else
-        log_info "Ephemeral mode (--ephemeral): skipped writing ${MODPROBE_CONF}"
+        _fusb_info "Ephemeral mode (--ephemeral): skipped writing ${MODPROBE_CONF}"
     fi
 
     [[ "$QUIET" == "true" ]] || print_status
 }
 
 enable_fusb() {
-    log_info "Enabling SiFive P550 front-panel USB-C controller (fusb303b)..."
+    _fusb_info "Enabling SiFive P550 front-panel USB-C controller (fusb303b)..."
 
     if [[ -f "$MODPROBE_CONF" ]]; then
         rm -f "$MODPROBE_CONF"
-        log_ok "Removed boot blacklist ${MODPROBE_CONF}"
+        _fusb_ok "Removed boot blacklist ${MODPROBE_CONF}"
     fi
 
     if is_mod_loaded; then
-        log_skip "Kernel module fusb303b already loaded"
+        _fusb_skip "Kernel module fusb303b already loaded"
     elif modprobe fusb303b 2>/dev/null; then
-        log_ok "Loaded kernel module fusb303b"
+        _fusb_ok "Loaded kernel module fusb303b"
     fi
 
     if [[ -d "$I2C_DRV_DIR" && -z "$(bound_i2c_devs)" ]]; then
@@ -256,7 +262,7 @@ enable_fusb() {
         for dev_id in ${candidates[@]+"${candidates[@]}"}; do
             if [[ ! -e "${I2C_DRV_DIR}/${dev_id}" && -w "${I2C_DRV_DIR}/bind" ]]; then
                 printf '%s' "$dev_id" > "${I2C_DRV_DIR}/bind" 2>/dev/null || true
-                log_ok "Bound I2C client ${dev_id} to fusb303b driver"
+                _fusb_ok "Bound I2C client ${dev_id} to fusb303b driver"
             fi
         done
     fi

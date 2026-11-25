@@ -243,6 +243,9 @@ META_JSON="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$META_URL")" || lo
 TS_VERSION="$(jq -r '.TarballsVersion // .Version // empty' <<< "$META_JSON")"
 TGZ_NAME="$(jq -r ".Tarballs.\"${TARBALL_ARCH}\" // empty" <<< "$META_JSON")"
 [[ -z "$TS_VERSION" || -z "$TGZ_NAME" ]] && log_fatal "No ${TARBALL_ARCH} tarball advertised in ${META_URL}"
+if [[ "$TGZ_NAME" == */* || "$TGZ_NAME" == *..* || ! "$TGZ_NAME" =~ ^tailscale_[0-9A-Za-z._-]+_(riscv64|amd64|arm64|arm)\.tgz$ ]]; then
+    log_fatal "Invalid Tailscale tarball filename '${TGZ_NAME}' advertised by ${META_URL}"
+fi
 
 TGZ_URL="https://pkgs.tailscale.com/${TRACK}/${TGZ_NAME}"
 SHA_URL="${TGZ_URL}.sha256"
@@ -376,6 +379,41 @@ fi
 PRIMARY_NIC="$(ip -o route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' || true)"
 if [[ -n "$PRIMARY_NIC" ]] && command -v ethtool >/dev/null 2>&1; then
     ethtool -K "$PRIMARY_NIC" rx-udp-gro-forwarding on rx-gro-list off >/dev/null 2>&1 || true
+fi
+
+GRO_UNIT="rvdk-tailscale-gro.service"
+GRO_UNIT_FILE="/etc/systemd/system/${GRO_UNIT}"
+IP_BIN="$(command -v ip 2>/dev/null || echo ip)"
+ETHTOOL_BIN="$(command -v ethtool 2>/dev/null || echo ethtool)"
+WANT_GRO_UNIT="# Managed by RVDK (mods/tailscale/forge.sh)
+[Unit]
+Description=RVDK Tailscale UDP GRO Forwarding Optimization
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'set -- \$(${IP_BIN} -o route show to default 2>/dev/null); while [ \$# -gt 1 ]; do if [ \"\$1\" = \"dev\" ]; then ${ETHTOOL_BIN} -K \"\$2\" rx-udp-gro-forwarding on rx-gro-list off >/dev/null 2>&1 || true; break; fi; shift; done'
+
+[Install]
+WantedBy=multi-user.target"
+
+GRO_CHANGED="false"
+install -d -m 0755 /etc/systemd/system
+if ! printf '%s\n' "$WANT_GRO_UNIT" | cmp -s - "$GRO_UNIT_FILE" 2>/dev/null; then
+    printf '%s\n' "$WANT_GRO_UNIT" | rvdk_atomic_write "$GRO_UNIT_FILE" 0644
+    systemctl daemon-reload
+    GRO_CHANGED="true"
+fi
+if ! systemctl is-enabled --quiet "$GRO_UNIT" 2>/dev/null; then
+    systemctl enable "$GRO_UNIT" >/dev/null 2>&1 || true
+    GRO_CHANGED="true"
+fi
+if [[ "$GRO_CHANGED" == "true" ]]; then
+    log_ok "Converged persistent Tailscale GRO offload service (${GRO_UNIT_FILE})"
+else
+    log_skip "${GRO_UNIT} already converged and enabled"
 fi
 
 # 4. Converge tailscaled.service
