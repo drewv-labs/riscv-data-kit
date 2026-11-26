@@ -89,6 +89,11 @@ STAGE_ITEMS = (
 
 FORBIDDEN_BLEED_PATTERNS: Sequence[tuple[str, re.Pattern[str], bool]] = (
     ("Downstream project bleed (BrakerRak)", re.compile(r"\bbrakerrak\b", re.IGNORECASE), True),
+    ("Downstream project bleed (BrakerBox)", re.compile(r"\bbrakerbox\b", re.IGNORECASE), False),
+    ("Downstream project bleed (BrakerBench)", re.compile(r"\bbrakerbench\b", re.IGNORECASE), False),
+    ("Downstream project bleed (LilSnitch)", re.compile(r"\blilsnitch\b", re.IGNORECASE), False),
+    ("Downstream project bleed (SnitchBench)", re.compile(r"\bsnitchbench\b", re.IGNORECASE), False),
+    ("Downstream node bleed (devbench-p4)", re.compile(r"\bdevbench-p4\b", re.IGNORECASE), False),
     ("Downstream VG bleed (vg_braker)", re.compile(r"\bvg_braker\b", re.IGNORECASE), False),
     ("Downstream project bleed (CarrierPigeons)", re.compile(r"\bcarrier[-_]?pigeons\b", re.IGNORECASE), True),
     ("Downstream project bleed (Pigeoneer)", re.compile(r"\bpigeoneer\b", re.IGNORECASE), False),
@@ -188,6 +193,10 @@ def check_manifests(repo_root: Path) -> list[str]:
         if not isinstance(soc, str) or not (repo_root / "bsp" / soc).is_dir():
             errors.append(f"{rel}: soc={soc!r} does not resolve to an existing bsp/<vendor>/<soc> directory")
 
+        arch = data.get("arch")
+        if arch is not None and arch not in ("riscv64", "riscv32"):
+            errors.append(f"{rel}: optional 'arch'={arch!r} must be 'riscv64' or 'riscv32'")
+
         media = data.get("media")
         if not isinstance(media, dict):
             errors.append(f"{rel}: 'media' must be an object")
@@ -196,6 +205,15 @@ def check_manifests(repo_root: Path) -> list[str]:
                 if not isinstance(spec, dict):
                     errors.append(f"{rel}: media.{med_key} must be an object")
                     continue
+                min_image_mib = spec.get("min_image_mib")
+                if min_image_mib is not None and (
+                    not isinstance(min_image_mib, int)
+                    or isinstance(min_image_mib, bool)
+                    or min_image_mib <= 0
+                ):
+                    errors.append(
+                        f"{rel}: media.{med_key}.min_image_mib={min_image_mib!r} must be a positive integer"
+                    )
                 script_rel = spec.get("script")
                 if script_rel and not (m_path.parent / script_rel).is_file():
                     errors.append(f"{rel}: media.{med_key}.script={script_rel!r} does not exist")

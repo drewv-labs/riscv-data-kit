@@ -35,12 +35,53 @@ _RVDK_KIT_ALLOWED_KEYS=(
     RVDK_SOC_SLUG
     RVDK_BOARD
     RVDK_BOARD_TAG
+    RVDK_ARCH
+    RVDK_MMU
     RVDK_FACTORY_USER
     RVDK_OS_ID
     RVDK_OS_VERSION_ID
     RVDK_PRIMARY_NIC
     RVDK_CPU_HARTS
 )
+
+# Infer architecture (riscv64 | riscv32 | amd64 | arm64) and MMU (sv39 | sv48 | sv57 | none | unknown)
+_rvdk_infer_arch_mmu() {
+    local soc="${1:-}"
+    local host_m
+    host_m="$(uname -m 2>/dev/null || echo unknown)"
+    host_m="$(tr '[:upper:]' '[:lower:]' <<< "$host_m")"
+
+    local arch="" mmu="unknown"
+    if [[ "$soc" == "espressif/esp32p4" || "$host_m" == riscv32* ]]; then
+        arch="riscv32"
+        mmu="none"
+    else
+        case "$soc" in
+            eswin/eic7700x|starfive/jh7110|sifive/fu740|spacemit/k1|spacemit/k3|ultrarisc/dp1000|tenstorrent/atlantis|tenstorrent/blackhole)
+                arch="riscv64" ;;
+        esac
+        if [[ -z "$arch" ]]; then
+            case "$host_m" in
+                riscv64*)       arch="riscv64" ;;
+                riscv32*)       arch="riscv32" ;;
+                x86_64|amd64)   arch="amd64" ;;
+                aarch64|arm64)  arch="arm64" ;;
+                *)              arch="$host_m" ;;
+            esac
+        fi
+        if [[ "$arch" == "riscv32" ]]; then
+            mmu="none"
+        elif [[ "$arch" == "riscv64" && -r /proc/cpuinfo ]]; then
+            local probed_mmu
+            probed_mmu="$(awk -F: '/^[[:space:]]*mmu[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print tolower($2); exit}' /proc/cpuinfo 2>/dev/null || true)"
+            case "$probed_mmu" in
+                sv39|sv48|sv57|none) mmu="$probed_mmu" ;;
+                *)                   mmu="unknown" ;;
+            esac
+        fi
+    fi
+    printf '%s|%s\n' "$arch" "$mmu"
+}
 
 # Map a Device Tree model string -> "SOC|BOARD|BOARD_TAG|FACTORY_USER"
 # Case-insensitive matching handles vendor DT strings such as "ky x1 orangepi-rv2 board".
@@ -87,6 +128,8 @@ _rvdk_infer_from_dt_model() {
             echo "spacemit/k1|milkv/jupiter|jptr1|" ;;
         *"titan"*|*"dp1000"*)
             echo "ultrarisc/dp1000|milkv/titan|titan|" ;;
+        *"esp32-p4-wifi6"*|*"waveshare esp32-p4"*|*"esp32-p4"*|*"esp32p4"*)
+            echo "espressif/esp32p4|waveshare/esp32-p4-wifi6|p4|" ;;
         *"atlantis"*|*"ascalon"*)
             echo "tenstorrent/atlantis|tenstorrent/atlantis|atlantis|" ;;
         *"blackhole"*)
@@ -133,6 +176,8 @@ rvdk_normalize_board_id() {
             echo "firefly/aibox-k3" ;;
         titan|dp1000|milkv-titan|milkv/titan|milk-v/titan|ultrarisc-titan|ultrarisc/titan)
             echo "milkv/titan" ;;
+        espressif-esp32p4|espressif/esp32p4|waveshare-esp32-p4-wifi6|waveshare/esp32-p4-wifi6|waveshare-esp32-p4|waveshare/esp32-p4|waveshare-p4|waveshare/p4|esp32-p4-wifi6|esp32-p4-wifi6-dev-kit|esp32-p4|esp32p4|p4)
+            echo "waveshare/esp32-p4-wifi6" ;;
         atlantis|tt-atlantis|ascalon|tenstorrent-atlantis|tenstorrent/atlantis)
             echo "tenstorrent/atlantis" ;;
         blackhole|tt-blackhole|tenstorrent-blackhole|tenstorrent/blackhole)
@@ -222,15 +267,32 @@ rvdk_kit_resolve() {
 
     # 0ms in-memory fast-path when parent RVDK dispatcher already resolved the Kit
     if [[ "$force_refresh" == "false" && "$no_cache" == "false" && "$has_override" == "false" && "${RVDK_KIT_SCHEMA:-}" == "$RVDK_KIT_SCHEMA_VERSION" && -n "${RVDK_SOC:-}" && -n "${RVDK_OS_ID:-}" ]]; then
+        if [[ -z "${RVDK_ARCH:-}" || -z "${RVDK_MMU:-}" ]]; then
+            local _mem_am _mem_arch _mem_mmu
+            _mem_am="$(_rvdk_infer_arch_mmu "${RVDK_SOC:-}")"
+            IFS='|' read -r _mem_arch _mem_mmu <<< "$_mem_am"
+            RVDK_ARCH="${RVDK_ARCH:-$_mem_arch}"
+            RVDK_MMU="${RVDK_MMU:-$_mem_mmu}"
+            export RVDK_ARCH RVDK_MMU
+        fi
         return 0
     fi
 
     # <1ms disk fast-path: parse cached /etc/rvdk/kit.env safely via rvdk_kv_load without `source`
     if [[ "$force_refresh" == "false" && "$no_cache" == "false" && "$has_override" == "false" && -r "$RVDK_KIT_CACHE_FILE" ]]; then
+        RVDK_ARCH=""
+        RVDK_MMU=""
         rvdk_kv_load "$RVDK_KIT_CACHE_FILE" "${_RVDK_KIT_ALLOWED_KEYS[@]}" || true
         if [[ "${RVDK_KIT_SCHEMA:-}" == "$RVDK_KIT_SCHEMA_VERSION" && -n "${RVDK_SOC:-}" && -n "${RVDK_OS_ID:-}" ]]; then
+            if [[ -z "${RVDK_ARCH:-}" || -z "${RVDK_MMU:-}" ]]; then
+                local _disk_am _disk_arch _disk_mmu
+                _disk_am="$(_rvdk_infer_arch_mmu "${RVDK_SOC:-}")"
+                IFS='|' read -r _disk_arch _disk_mmu <<< "$_disk_am"
+                RVDK_ARCH="${RVDK_ARCH:-$_disk_arch}"
+                RVDK_MMU="${RVDK_MMU:-$_disk_mmu}"
+            fi
             _RVDK_LAST_PROBED_DT_MODEL="${RVDK_DT_MODEL:-}"
-            export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS
+            export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_ARCH RVDK_MMU RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS
             export RVDK_KIT_SOURCE="cache"
             return 0
         fi
@@ -265,6 +327,7 @@ rvdk_kit_resolve() {
             firefly/aibox-k3)           tag="aiboxk3" ;;
             bananapi/f3)                tag="bpif3" ;;
             bananapi/cm6)               tag="bpicm6" ;;
+            waveshare/esp32-p4-wifi6)   tag="p4" ;;
             *)                          tag="${board##*/}" ;;
         esac
     fi
@@ -280,19 +343,21 @@ rvdk_kit_resolve() {
             milkv/titan) soc="ultrarisc/dp1000" ;;
             tenstorrent/atlantis) soc="tenstorrent/atlantis" ;;
             tenstorrent/blackhole) soc="tenstorrent/blackhole" ;;
+            waveshare/esp32-p4-wifi6) soc="espressif/esp32p4" ;;
         esac
     fi
 
     if [[ -z "$board" && -n "$soc" ]]; then
         case "$soc" in
-            eswin/eic7700x)        board="sifive/p550";          tag="p550" ;;
-            sifive/fu740)          board="sifive/unmatched";     tag="unmatched" ;;
-            starfive/jh7110)       board="starfive/vf2";         tag="vf2"; factory_user="user" ;;
-            spacemit/k1)           board="milkv/jupiter";        tag="jptr1" ;;
-            spacemit/k3)           board="milkv/jupiter2";       tag="jptr2" ;;
-            ultrarisc/dp1000)      board="milkv/titan";          tag="titan" ;;
-            tenstorrent/atlantis)  board="tenstorrent/atlantis"; tag="atlantis" ;;
-            tenstorrent/blackhole) board="tenstorrent/blackhole"; tag="blackhole" ;;
+            eswin/eic7700x)        board="sifive/p550";              tag="p550" ;;
+            sifive/fu740)          board="sifive/unmatched";         tag="unmatched" ;;
+            starfive/jh7110)       board="starfive/vf2";             tag="vf2"; factory_user="user" ;;
+            spacemit/k1)           board="milkv/jupiter";            tag="jptr1" ;;
+            spacemit/k3)           board="milkv/jupiter2";           tag="jptr2" ;;
+            ultrarisc/dp1000)      board="milkv/titan";              tag="titan" ;;
+            tenstorrent/atlantis)  board="tenstorrent/atlantis";     tag="atlantis" ;;
+            tenstorrent/blackhole) board="tenstorrent/blackhole";    tag="blackhole" ;;
+            espressif/esp32p4)     board="waveshare/esp32-p4-wifi6"; tag="p4" ;;
         esac
     fi
 
@@ -326,22 +391,34 @@ rvdk_kit_resolve() {
     os_id="$(tr '[:upper:]' '[:lower:]' <<< "${os_id:-unknown}")"
     os_like="$(tr '[:upper:]' '[:lower:]' <<< "${os_like:-}")"
 
-    # Normalize derivative RISC-V BSP distros & versioned media.json tags (ubuntu-24.04, debian-12, RockOS, RevyOS, Ky OpenWrt)
+    # Normalize derivative RISC-V BSP distros & versioned media.json tags (ubuntu-24.04, debian-12, RockOS, RevyOS, Ky OpenWrt, ESP-IDF/NuttX/Buildroot/nommu)
     case "$os_id" in
-        debian|ubuntu|bianbu|openwrt|macos) ;;
-        debian-*|rockos*|revyos*) os_id="debian" ;;
-        ubuntu-*)                 os_id="ubuntu" ;;
-        bianbu-*)                 os_id="bianbu" ;;
-        *openwrt*)                os_id="openwrt" ;;
+        debian|ubuntu|bianbu|openwrt|macos|esp-idf|nuttx|buildroot|linux-nommu) ;;
+        debian-*|rockos*|revyos*)   os_id="debian" ;;
+        ubuntu-*)                   os_id="ubuntu" ;;
+        bianbu-*)                   os_id="bianbu" ;;
+        *openwrt*)                  os_id="openwrt" ;;
+        esp-idf-*|esp_idf*|espidf*) os_id="esp-idf" ;;
+        nuttx-*)                    os_id="nuttx" ;;
+        buildroot-*)                os_id="buildroot" ;;
+        linux-nommu-*|nommu*)       os_id="linux-nommu" ;;
         *)
             case " $os_like " in
-                *" openwrt "*) os_id="openwrt" ;;
-                *" bianbu "*)  os_id="bianbu" ;;
-                *" ubuntu "*)  os_id="ubuntu" ;;
-                *" debian "*)  os_id="debian" ;;
+                *" openwrt "*)     os_id="openwrt" ;;
+                *" bianbu "*)      os_id="bianbu" ;;
+                *" ubuntu "*)      os_id="ubuntu" ;;
+                *" debian "*)      os_id="debian" ;;
+                *" esp-idf "*)     os_id="esp-idf" ;;
+                *" nuttx "*)       os_id="nuttx" ;;
+                *" buildroot "*)   os_id="buildroot" ;;
+                *" linux-nommu "*) os_id="linux-nommu" ;;
             esac
             ;;
     esac
+
+    local arch_mmu arch mmu
+    arch_mmu="$(_rvdk_infer_arch_mmu "$soc")"
+    IFS='|' read -r arch mmu <<< "$arch_mmu"
 
     local soc_slug="${soc//\//-}"
     local primary_nic
@@ -355,6 +432,8 @@ rvdk_kit_resolve() {
     RVDK_SOC_SLUG="$soc_slug"
     RVDK_BOARD="$board"
     RVDK_BOARD_TAG="$tag"
+    RVDK_ARCH="$arch"
+    RVDK_MMU="$mmu"
     RVDK_FACTORY_USER="$factory_user"
     RVDK_OS_ID="$os_id"
     RVDK_OS_VERSION_ID="$os_ver"
@@ -363,7 +442,7 @@ rvdk_kit_resolve() {
     RVDK_KIT_SOURCE="probed"
     _RVDK_LAST_PROBED_DT_MODEL="$dt_model"
 
-    export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS RVDK_KIT_SOURCE
+    export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_ARCH RVDK_MMU RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS RVDK_KIT_SOURCE
 
     # Persist system-wide cache on Linux target nodes using escaped atomic serialization
     if [[ "$no_cache" == "false" && -z "$dt_override" && "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 && -n "$RVDK_SOC" ]] && [[ "$has_override" == "false" || "$force_refresh" == "true" ]]; then
@@ -375,6 +454,8 @@ rvdk_kit_resolve() {
             "RVDK_SOC_SLUG=${RVDK_SOC_SLUG}" \
             "RVDK_BOARD=${RVDK_BOARD}" \
             "RVDK_BOARD_TAG=${RVDK_BOARD_TAG}" \
+            "RVDK_ARCH=${RVDK_ARCH}" \
+            "RVDK_MMU=${RVDK_MMU}" \
             "RVDK_FACTORY_USER=${RVDK_FACTORY_USER}" \
             "RVDK_OS_ID=${RVDK_OS_ID}" \
             "RVDK_OS_VERSION_ID=${RVDK_OS_VERSION_ID}" \
@@ -384,7 +465,7 @@ rvdk_kit_resolve() {
 }
 
 # Single source of truth for silicon compiler profiles across C/C++ (GCC/Clang) & Go (GORISCV64).
-# Sets: RVDK_TARGET_SLUG, RVDK_CPU_MTUNE, RVDK_MARCH_CANDIDATES, RVDK_GORISCV64_CANDIDATES
+# Sets: RVDK_TARGET_SLUG, RVDK_CPU_MTUNE, RVDK_MARCH_CANDIDATES, RVDK_MABI, RVDK_GORISCV64_CANDIDATES
 # shellcheck disable=SC2120
 rvdk_kit_compiler_profile() {
     local soc="${1:-${RVDK_SOC:-}}"
@@ -392,6 +473,7 @@ rvdk_kit_compiler_profile() {
 
     case "$host_arch" in
         riscv64)         host_arch="riscv64" ;;
+        riscv32*)        host_arch="riscv32" ;;
         x86_64|amd64)    host_arch="amd64" ;;
         aarch64|arm64)   host_arch="arm64" ;;
     esac
@@ -401,43 +483,57 @@ rvdk_kit_compiler_profile() {
             RVDK_TARGET_SLUG="sifive-p550"
             RVDK_CPU_MTUNE="sifive-p550"
             RVDK_MARCH_CANDIDATES="rv64gc_zba_zbb rv64gc"
+            RVDK_MABI="lp64d"
             RVDK_GORISCV64_CANDIDATES="rva20u64"
             ;;
         starfive/jh7110)
             RVDK_TARGET_SLUG="starfive-jh7110"
             RVDK_CPU_MTUNE="sifive-u74"
             RVDK_MARCH_CANDIDATES="rv64gc_zba_zbb rv64gc"
+            RVDK_MABI="lp64d"
             RVDK_GORISCV64_CANDIDATES="rva20u64"
             ;;
         sifive/fu740)
             RVDK_TARGET_SLUG="sifive-fu740"
             RVDK_CPU_MTUNE="sifive-u74"
             RVDK_MARCH_CANDIDATES="rv64gc"
+            RVDK_MABI="lp64d"
             RVDK_GORISCV64_CANDIDATES="rva20u64"
             ;;
         spacemit/k1)
             RVDK_TARGET_SLUG="spacemit-k1"
             RVDK_CPU_MTUNE="spacemit-x60"
             RVDK_MARCH_CANDIDATES="rv64gcv_zba_zbb_zbc_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_MABI="lp64d"
             RVDK_GORISCV64_CANDIDATES="rva22u64 rva20u64"
             ;;
         spacemit/k3)
             RVDK_TARGET_SLUG="spacemit-k3"
             RVDK_CPU_MTUNE="spacemit-x100"
             RVDK_MARCH_CANDIDATES="rva23u64 rv64gcv_zba_zbb_zbc_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_MABI="lp64d"
             RVDK_GORISCV64_CANDIDATES="rva23u64 rva22u64 rva20u64"
             ;;
         ultrarisc/dp1000)
             RVDK_TARGET_SLUG="ultrarisc-dp1000"
             RVDK_CPU_MTUNE="generic-ooo"
             RVDK_MARCH_CANDIDATES="rva22u64 rv64gc_zba_zbb_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_MABI="lp64d"
             RVDK_GORISCV64_CANDIDATES="rva22u64 rva20u64"
             ;;
         tenstorrent/atlantis|tenstorrent/blackhole)
             RVDK_TARGET_SLUG="${soc//\//-}"
             RVDK_CPU_MTUNE="tt-ascalon-d8"
             RVDK_MARCH_CANDIDATES="rva23u64 rv64gcv_zba_zbb_zbc_zbs rv64gc_zba_zbb rv64gc"
+            RVDK_MABI="lp64d"
             RVDK_GORISCV64_CANDIDATES="rva23u64 rva22u64 rva20u64"
+            ;;
+        espressif/esp32p4)
+            RVDK_TARGET_SLUG="espressif-esp32p4"
+            RVDK_CPU_MTUNE=""
+            RVDK_MARCH_CANDIDATES="rv32imafc_zicsr_zifencei_xespv2p1 rv32imafc_zicsr_zifencei rv32imafc"
+            RVDK_MABI="ilp32f"
+            RVDK_GORISCV64_CANDIDATES=""
             ;;
         *)
             case "$host_arch" in
@@ -445,12 +541,21 @@ rvdk_kit_compiler_profile() {
                     RVDK_TARGET_SLUG="riscv64-generic"
                     RVDK_CPU_MTUNE=""
                     RVDK_MARCH_CANDIDATES="rv64gc"
+                    RVDK_MABI="lp64d"
                     RVDK_GORISCV64_CANDIDATES="rva20u64"
+                    ;;
+                riscv32)
+                    RVDK_TARGET_SLUG="riscv32-generic"
+                    RVDK_CPU_MTUNE=""
+                    RVDK_MARCH_CANDIDATES="rv32imafc_zicsr_zifencei rv32imac"
+                    RVDK_MABI="ilp32f"
+                    RVDK_GORISCV64_CANDIDATES=""
                     ;;
                 amd64|arm64)
                     RVDK_TARGET_SLUG="linux-${host_arch}"
                     RVDK_CPU_MTUNE=""
                     RVDK_MARCH_CANDIDATES=""
+                    RVDK_MABI=""
                     RVDK_GORISCV64_CANDIDATES=""
                     ;;
                 *)
@@ -460,11 +565,11 @@ rvdk_kit_compiler_profile() {
             ;;
     esac
 
-    export RVDK_TARGET_SLUG RVDK_CPU_MTUNE RVDK_MARCH_CANDIDATES RVDK_GORISCV64_CANDIDATES
+    export RVDK_TARGET_SLUG RVDK_CPU_MTUNE RVDK_MARCH_CANDIDATES RVDK_MABI RVDK_GORISCV64_CANDIDATES
     return 0
 }
 
-# Probe local GCC support against RVDK_MARCH_CANDIDATES & RVDK_CPU_MTUNE.
+# Probe local GCC support against RVDK_MARCH_CANDIDATES, RVDK_MABI, & RVDK_CPU_MTUNE.
 # Sets: RVDK_SELECTED_MARCH, RVDK_OPT_CFLAGS
 # shellcheck disable=SC2120
 rvdk_kit_probe_cflags() {
@@ -479,12 +584,20 @@ rvdk_kit_probe_cflags() {
             RVDK_SELECTED_MARCH="${cands[${#cands[@]}-1]}"
             local cand_march
             for cand_march in "${cands[@]}"; do
-                if "$cc_bin" -march="$cand_march" -E -x c /dev/null >/dev/null 2>&1; then
+                if [[ -n "${RVDK_MABI:-}" ]] && "$cc_bin" -march="$cand_march" -mabi="${RVDK_MABI}" -E -x c /dev/null >/dev/null 2>&1; then
+                    RVDK_SELECTED_MARCH="$cand_march"
+                    break
+                elif "$cc_bin" -march="$cand_march" -E -x c /dev/null >/dev/null 2>&1; then
                     RVDK_SELECTED_MARCH="$cand_march"
                     break
                 fi
             done
             RVDK_OPT_CFLAGS="-O3 -pipe -march=${RVDK_SELECTED_MARCH}"
+            if [[ -n "${RVDK_MABI:-}" ]]; then
+                if "$cc_bin" -march="${RVDK_SELECTED_MARCH}" -mabi="${RVDK_MABI}" -E -x c /dev/null >/dev/null 2>&1; then
+                    RVDK_OPT_CFLAGS="${RVDK_OPT_CFLAGS} -mabi=${RVDK_MABI}"
+                fi
+            fi
             if [[ -n "${RVDK_CPU_MTUNE:-}" ]]; then
                 if "$cc_bin" -march="${RVDK_SELECTED_MARCH}" -mcpu="${RVDK_CPU_MTUNE}" -E -x c /dev/null >/dev/null 2>&1; then
                     RVDK_OPT_CFLAGS="${RVDK_OPT_CFLAGS} -mcpu=${RVDK_CPU_MTUNE} -mtune=${RVDK_CPU_MTUNE}"
@@ -526,16 +639,17 @@ rvdk_kit_probe_goriscv64() {
 }
 
 # Collect all applicable deeptune.sh layers for the resolved Kit in execution order:
-#   1. os/deeptune.sh
+#   1. os/deeptune.sh (Linux OSes; omitted for RTOSes such as esp-idf / nuttx)
 #   2. os/deeptune-${RVDK_OS_ID:-unknown}.sh (if present)
 #   3. bsp/<vendor>/<soc>/deeptune.sh (if present)
 #   4. boards/<vendor>/<board>/deeptune.sh (if present)
 rvdk_collect_deeptune_scripts() {
     local repo_root="$1"
-    local candidates=(
-        "${repo_root}/os/deeptune.sh"
-        "${repo_root}/os/deeptune-${RVDK_OS_ID:-unknown}.sh"
-    )
+    local candidates=()
+    if [[ "${RVDK_OS_ID:-}" != "esp-idf" && "${RVDK_OS_ID:-}" != "nuttx" ]]; then
+        candidates+=("${repo_root}/os/deeptune.sh")
+        candidates+=("${repo_root}/os/deeptune-${RVDK_OS_ID:-unknown}.sh")
+    fi
     [[ -n "${RVDK_SOC:-}" ]] && candidates+=("${repo_root}/bsp/${RVDK_SOC}/deeptune.sh")
     [[ -n "${RVDK_BOARD:-}" ]] && candidates+=("${repo_root}/boards/${RVDK_BOARD}/deeptune.sh")
 
@@ -554,6 +668,8 @@ rvdk_kit_print_env() {
     printf 'RVDK_SOC_SLUG=%q\n'      "${RVDK_SOC_SLUG:-}"
     printf 'RVDK_BOARD=%q\n'         "${RVDK_BOARD:-}"
     printf 'RVDK_BOARD_TAG=%q\n'     "${RVDK_BOARD_TAG:-}"
+    printf 'RVDK_ARCH=%q\n'          "${RVDK_ARCH:-}"
+    printf 'RVDK_MMU=%q\n'           "${RVDK_MMU:-}"
     printf 'RVDK_FACTORY_USER=%q\n'  "${RVDK_FACTORY_USER:-}"
     printf 'RVDK_OS_ID=%q\n'         "${RVDK_OS_ID:-}"
     printf 'RVDK_OS_VERSION_ID=%q\n' "${RVDK_OS_VERSION_ID:-}"
@@ -582,6 +698,20 @@ rvdk_kit_print_summary() {
     done < <(rvdk_collect_deeptune_scripts "$repo_root")
     [[ -z "$chain_str" ]] && chain_str="none"
 
+    local active_tune=""
+    local dt_env="${RVDK_DEEPTUNE_ENV:-/etc/rvdk/deeptune.env}"
+    if [[ ! -r "$dt_env" && -r /var/lib/rvdk/deeptune.conf ]]; then
+        dt_env="/var/lib/rvdk/deeptune.conf"
+    fi
+    if [[ -r "$dt_env" ]]; then
+        local RVDK_TUNE=""
+        rvdk_kv_load "$dt_env" RVDK_TUNE || true
+        active_tune="${RVDK_TUNE:-}"
+    fi
+    if [[ -n "$active_tune" ]]; then
+        chain_str="${chain_str} (active: ${active_tune})"
+    fi
+
     local quirks=()
     if [[ -n "${RVDK_BOARD:-}" && -d "${repo_root}/boards/${RVDK_BOARD}/quirks" ]]; then
         local qf
@@ -599,6 +729,7 @@ rvdk_kit_print_summary() {
     printf "  • Device Tree Model : %s\n" "${RVDK_DT_MODEL:-Unknown}"
     printf "  • Board (boards/)   : %s (tag: %s)\n" "${RVDK_BOARD:-unrecognized}" "${RVDK_BOARD_TAG:--}"
     printf "  • SoC (bsp/)        : %s (slug: %s)\n" "${RVDK_SOC:-unrecognized}" "${RVDK_SOC_SLUG:--}"
+    printf "  • Arch / MMU        : %s (mmu: %s)\n" "${RVDK_ARCH:-unknown}" "${RVDK_MMU:-unknown}"
     printf "  • OS (os/)          : %s %s\n" "${RVDK_OS_ID:-unknown}" "${RVDK_OS_VERSION_ID:-}"
     printf "  • Primary NIC / CPU : %s | %s Harts\n" "${RVDK_PRIMARY_NIC:-none}" "${RVDK_CPU_HARTS:-?}"
     printf "  • Kit Cache File    : %s\n" "$cache_status"

@@ -16,6 +16,11 @@
 #       Suppresses unused Bluetooth/audio/SDIO-Wi-Fi noise while unblocking and
 #       reloading IMG BXE-2-32 (`pvrsrvkm`) and M.2 PCIe Hailo NPU (`hailo_pci`,
 #       `hailo1x_pci`) drivers for OpenCL / RVV 1.0 / PCIe NPU edge inference.
+#     • `iot` tune:
+#       Disables heavy GPU/NPU/HDMI modules (`pvrsrvkm`, `hailo_pci`,
+#       `hailo1x_pci`, `radeon`, `spacemit_drm`, `snd_soc_hdmi_codec`),
+#       preserves wireless/Bluetooth/SDIO/I2C/SPI/UART kernel modules, and
+#       selects `schedutil` cpufreq governor (`ondemand` -> `performance` fallback).
 #     • Dual-Cluster 8-Hart X60 PLIC & RPS Interrupt Balancer
 #       (`spacemit-k1-irq-affinity.service`):
 #       Isolates high-rate GbE/2.5GbE, xHCI USB 3.0, and MMC/eMMC HS400ES
@@ -29,6 +34,8 @@ set -Eeuo pipefail
 MODPROBE_SOC="/etc/modprobe.d/90-rvdk-spacemit-k1-deeptune.conf"
 IRQ_SCRIPT="/usr/local/sbin/rvdk-spacemit-k1-irq-tune"
 IRQ_UNIT="/etc/systemd/system/spacemit-k1-irq-affinity.service"
+PERF_GOV_UNIT="/etc/systemd/system/spacemit-k1-cpufreq-performance.service"
+IOT_GOV_UNIT="/etc/systemd/system/spacemit-k1-cpufreq-iot.service"
 
 _SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -88,7 +95,7 @@ ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--tune)
-            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai"
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai | iot"
             TUNE_REQUEST="$2"
             shift 2
             ;;
@@ -96,7 +103,7 @@ while [[ $# -gt 0 ]]; do
             TUNE_REQUEST="${1#*=}"
             shift
             ;;
-        data|ai|ml)
+        data|ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu)
             TUNE_REQUEST="$1"
             shift
             ;;
@@ -118,7 +125,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo rvdk deeptune [--tune <data|ai>] [status] [--force] [--noprogbar]
+Usage: sudo rvdk deeptune [--tune <data|ai|iot>] [status] [--force] [--noprogbar]
 Layer 2 SoC script: bsp/spacemit/k1/deeptune.sh
 EOF
             exit 0
@@ -129,6 +136,14 @@ EOF
     esac
 done
 
+if [[ -n "$TUNE_REQUEST" ]]; then
+    _tune_pre="$(tr '[:upper:]' '[:lower:]' <<< "$TUNE_REQUEST")"
+    case "$_tune_pre" in
+        ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu|data) ;;
+        *) log_fatal "Invalid --tune '${_tune_pre}' (expected: data | ai | iot)" ;;
+    esac
+fi
+
 if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
@@ -137,7 +152,7 @@ if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     fi
 fi
 
-declare -F rvdk_kit_resolve >/dev/null 2>&1 && rvdk_kit_resolve
+typeset -f rvdk_kit_resolve >/dev/null 2>&1 && rvdk_kit_resolve
 
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
@@ -180,10 +195,16 @@ print_status() {
         irq_svc="enabled"
     fi
 
+    local cpufreq_gov="firmware-fixed"
+    if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+        cpufreq_gov="$(tr -d '[:space:]' < /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")"
+    fi
+
     log_info "Layer 2 SoC (spacemit/k1):"
     printf "  • IMG BXE-2-32 GPU  : %s\n" "$gpu_mod"
     printf "  • PCIe Hailo AI NPU : %s\n" "$npu_mod"
     printf "  • Broadcom SDIO WiFi: %s\n" "$wifi_mod"
+    printf "  • CPUFreq Governor  : %s\n" "$cpufreq_gov"
     printf "  • 8-Hart X60 IRQs   : %s (%s)\n" "$irq_svc" "$IRQ_UNIT"
 }
 
@@ -192,13 +213,8 @@ if [[ "$ACTION" == "status" ]]; then
     exit 0
 fi
 
-if [[ "${RVDK_OS_ID:-}" == "openwrt" || -f /etc/openwrt_release ]] || ! command -v systemctl >/dev/null 2>&1; then
-    log_skip "Non-systemd rootfs (${RVDK_OS_ID:-procd}); skipping systemd SpacemiT K1 DeepTune units"
-    exit 0
-fi
-
 if [[ -z "$TUNE_REQUEST" && -r /etc/rvdk/deeptune.env ]]; then
-    if declare -F rvdk_kv_load >/dev/null 2>&1; then
+    if typeset -f rvdk_kv_load >/dev/null 2>&1; then
         RVDK_TUNE=""
         rvdk_kv_load /etc/rvdk/deeptune.env RVDK_TUNE
         TUNE_REQUEST="$RVDK_TUNE"
@@ -209,10 +225,71 @@ fi
 TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "${TUNE_REQUEST:-data}")"
 
 case "$TUNE_REQUEST" in
-    ai|ml|edge-ai|edge-ml) TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
-    data)                  TUNE_MODE="data"; TUNE_LABEL="data" ;;
-    *)                     log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai)" ;;
+    ai|ml|edge-ai|edge-ml)   TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
+    iot|edge-iot|sensor|mcu) TUNE_MODE="iot";  TUNE_LABEL="iot" ;;
+    data)                    TUNE_MODE="data"; TUNE_LABEL="data" ;;
+    *)                       log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai | iot)" ;;
 esac
+
+_k1_select_iot_governor() {
+    local avail_file="" cand_gov="" avail_list=""
+    for avail_file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_available_governors; do
+        [[ -r "$avail_file" ]] || continue
+        avail_list="$(cat "$avail_file" 2>/dev/null || true)"
+        for cand_gov in schedutil ondemand performance; do
+            if [[ " ${avail_list} " == *" ${cand_gov} "* ]]; then
+                printf '%s\n' "$cand_gov"
+                return 0
+            fi
+        done
+    done
+    printf 'schedutil\n'
+}
+
+_k1_apply_governor_live() {
+    local target_gov="$1"
+    local changed="false" g cur_g
+    for g in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+        [[ -w "$g" ]] || continue
+        cur_g="$(tr -d '[:space:]' < "$g" 2>/dev/null || true)"
+        if [[ "$cur_g" != "$target_gov" ]]; then
+            if printf '%s\n' "$target_gov" > "$g" 2>/dev/null; then
+                changed="true"
+            fi
+        fi
+    done
+    [[ "$changed" == "true" ]]
+}
+
+if [[ "${RVDK_OS_ID:-}" == "openwrt" || -f /etc/openwrt_release ]] || ! command -v systemctl >/dev/null 2>&1; then
+    if [[ "$TUNE_MODE" == "iot" ]]; then
+        IOT_GOV="$(_k1_select_iot_governor)"
+        _k1_apply_governor_live "$IOT_GOV" || true
+        if [[ -f /etc/rc.common ]]; then
+            PROCD_K1_GOV="/etc/init.d/spacemit-k1-cpufreq"
+            WANT_PROCD_K1_GOV="#!/bin/sh /etc/rc.common
+START=95
+start() {
+    for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+        [ -d \"\$c\" ] || continue
+        avail=\$(cat \"\$c/scaling_available_governors\" 2>/dev/null || true)
+        for gov in schedutil ondemand performance; do
+            case \" \$avail \" in
+                *\" \$gov \"*) echo \"\$gov\" > \"\$c/scaling_governor\" 2>/dev/null || true; break ;;
+            esac
+        done
+    done
+}"
+            if ! printf '%s\n' "$WANT_PROCD_K1_GOV" | cmp -s - "$PROCD_K1_GOV" 2>/dev/null; then
+                printf '%s\n' "$WANT_PROCD_K1_GOV" | rvdk_atomic_write "$PROCD_K1_GOV" 0755
+                "$PROCD_K1_GOV" enable 2>/dev/null || true
+            fi
+        fi
+        log_ok "Applied SpacemiT K1 IoT cpufreq governor (${IOT_GOV}) on non-systemd rootfs"
+    fi
+    log_skip "Non-systemd rootfs (${RVDK_OS_ID:-procd}); skipping systemd SpacemiT K1 DeepTune units"
+    exit 0
+fi
 
 PRIMARY_NIC="${RVDK_PRIMARY_NIC:-}"
 if [[ -z "$PRIMARY_NIC" ]] && command -v ip >/dev/null 2>&1; then
@@ -234,46 +311,62 @@ log_info "Converging SpacemiT K1 / Ky X1 Silicon DeepTune (--tune ${TUNE_LABEL} 
 # ==============================================================================
 rvdk_prog 35 "SpacemiT K1 DeepTune: converging wireless, audio & GPU/Hailo modules (--tune ${TUNE_LABEL})..."
 
-if pgrep -f "brcm_patchram_plus" >/dev/null 2>&1; then
-    pkill -TERM -f "brcm_patchram_plus" 2>/dev/null || true
-    log_ok "Stopped background brcm_patchram_plus UART Bluetooth daemon"
+if [[ "$TUNE_MODE" != "iot" ]]; then
+    if pgrep -f "brcm_patchram_plus" >/dev/null 2>&1; then
+        pkill -TERM -f "brcm_patchram_plus" 2>/dev/null || true
+        log_ok "Stopped background brcm_patchram_plus UART Bluetooth daemon"
+    fi
+
+    if [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
+        for mod_load_cfg in /etc/modules /etc/modules-load.d/orangepirv2.conf; do
+            if [[ -f "$mod_load_cfg" ]] && grep -Eq '^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]]|$)' "$mod_load_cfg" 2>/dev/null; then
+                sed -E 's/^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?$/# \1 # disabled by RVDK spacemit\/k1 deeptune/' "$mod_load_cfg" \
+                    | rvdk_atomic_write "$mod_load_cfg" 0644
+                log_ok "Disabled forced SDIO Wi-Fi module autoload in ${mod_load_cfg}"
+            fi
+        done
+    fi
 fi
 
-if [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
-    for mod_load_cfg in /etc/modules /etc/modules-load.d/orangepirv2.conf; do
-        if [[ -f "$mod_load_cfg" ]] && grep -Eq '^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]]|$)' "$mod_load_cfg" 2>/dev/null; then
-            sed -E 's/^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?$/# \1 # disabled by RVDK spacemit\/k1 deeptune/' "$mod_load_cfg" \
-                | rvdk_atomic_write "$mod_load_cfg" 0644
-            log_ok "Disabled forced SDIO Wi-Fi module autoload in ${mod_load_cfg}"
-        fi
-    done
-fi
-
-SOC_BASE_BLACKLIST=(
-    hci_uart
-    btbcm
-    btusb
-    btrtl
-    btintel
-    bluetooth
+SOC_HDMI_AUDIO_MODS=(
     snd_soc_hdmi_codec
     snd_soc_simple_card
     snd_soc_simple_card_utils
     snd_soc_audio_graph_card
 )
 
-if [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
-    SOC_BASE_BLACKLIST=(bcmdhd dhd_static_buf "${SOC_BASE_BLACKLIST[@]}")
-fi
+SOC_BT_MODS=(
+    hci_uart
+    btbcm
+    btusb
+    btrtl
+    btintel
+    bluetooth
+)
 
-TARGET_MODS=("${SOC_BASE_BLACKLIST[@]}")
-if [[ "$TUNE_MODE" == "data" ]]; then
-    TARGET_MODS=(pvrsrvkm hailo_pci hailo1x_pci radeon "${TARGET_MODS[@]}")
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    TARGET_MODS=(
+        pvrsrvkm
+        hailo_pci
+        hailo1x_pci
+        radeon
+        spacemit_drm
+        "${SOC_HDMI_AUDIO_MODS[@]}"
+    )
+else
+    SOC_BASE_BLACKLIST=("${SOC_BT_MODS[@]}" "${SOC_HDMI_AUDIO_MODS[@]}")
+    if [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
+        SOC_BASE_BLACKLIST=(bcmdhd dhd_static_buf "${SOC_BASE_BLACKLIST[@]}")
+    fi
+    TARGET_MODS=("${SOC_BASE_BLACKLIST[@]}")
+    if [[ "$TUNE_MODE" == "data" ]]; then
+        TARGET_MODS=(pvrsrvkm hailo_pci hailo1x_pci radeon "${TARGET_MODS[@]}")
+    fi
 fi
 
 mkdir -p /etc/modprobe.d
 WANT_MODPROBE="# Managed by RVDK (bsp/spacemit/k1/deeptune.sh | tune=${TUNE_LABEL})
-# Suppresses SpacemiT K1/Ky X1 Bluetooth/ALSA$( [[ "$PRIMARY_IS_WIFI" == "false" ]] && printf "/SDIO-WiFi" )$( [[ "$TUNE_MODE" == "data" ]] && printf " and IMG GPU / Hailo PCIe NPU" ) modules."
+# Suppresses SpacemiT K1/Ky X1 $( [[ "$TUNE_MODE" == "iot" ]] && printf "GPU/NPU/HDMI/ALSA (preserving Wi-Fi/BT/SDIO/I2C/SPI/UART)" || printf "Bluetooth/ALSA$( [[ "$PRIMARY_IS_WIFI" == "false" ]] && printf "/SDIO-WiFi" )$( [[ "$TUNE_MODE" == "data" ]] && printf " and IMG GPU / Hailo PCIe NPU" )" ) modules."
 for m in "${TARGET_MODS[@]}"; do
     WANT_MODPROBE+=$'\n'"blacklist ${m}"
 done
@@ -305,6 +398,74 @@ if [[ "$TUNE_MODE" == "ai" ]]; then
             log_skip "Accelerator module (${ai_mod}) already loaded for '${TUNE_LABEL}' tune"
         fi
     done
+fi
+
+# ==============================================================================
+# 1b. SPACEMIT K1 CPUFREQ GOVERNOR POLICY (`iot`: schedutil -> ondemand -> performance)
+# ==============================================================================
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    rvdk_prog 55 "SpacemiT K1 DeepTune: configuring low-power cpufreq governor..."
+    IOT_GOV="$(_k1_select_iot_governor)"
+    GOV_CHANGED="false"
+    if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq "^GOVERNOR=\"?${IOT_GOV}\"?\$" /etc/default/cpufrequtils 2>/dev/null; then
+        if grep -Eq '^GOVERNOR=' /etc/default/cpufrequtils 2>/dev/null; then
+            sed "s/^GOVERNOR=.*/GOVERNOR=\"${IOT_GOV}\"/" /etc/default/cpufrequtils | rvdk_atomic_write /etc/default/cpufrequtils 0644
+        else
+            {
+                cat /etc/default/cpufrequtils
+                printf '\nGOVERNOR="%s"\n' "$IOT_GOV"
+            } | rvdk_atomic_write /etc/default/cpufrequtils 0644
+        fi
+        GOV_CHANGED="true"
+    fi
+
+    if _k1_apply_governor_live "$IOT_GOV"; then
+        GOV_CHANGED="true"
+    fi
+
+    if systemctl is-enabled --quiet spacemit-k1-cpufreq-performance.service 2>/dev/null; then
+        systemctl disable --now spacemit-k1-cpufreq-performance.service >/dev/null 2>&1 || true
+        GOV_CHANGED="true"
+    fi
+
+    WANT_IOT_GOV_UNIT="[Unit]
+Description=RVDK SpacemiT K1 IoT CPUFreq Governor (schedutil -> ondemand -> performance)
+After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service orangepi-hardware-optimize.service armbian-hardware-optimize.service spacemit-k1-cpufreq-performance.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do [ -d \"\$c\" ] || continue; avail=\$(cat \"\$c/scaling_available_governors\" 2>/dev/null || true); for gov in schedutil ondemand performance; do case \" \$avail \" in *\" \$gov \"*) echo \"\$gov\" > \"\$c/scaling_governor\" 2>/dev/null || true; break ;; esac; done; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target"
+    if ! printf '%s\n' "$WANT_IOT_GOV_UNIT" | cmp -s - "$IOT_GOV_UNIT" 2>/dev/null; then
+        printf '%s\n' "$WANT_IOT_GOV_UNIT" | rvdk_atomic_write "$IOT_GOV_UNIT" 0644
+        systemctl daemon-reload
+        systemctl enable --now spacemit-k1-cpufreq-iot.service >/dev/null 2>&1 || true
+        GOV_CHANGED="true"
+    elif ! systemctl is-enabled --quiet spacemit-k1-cpufreq-iot.service 2>/dev/null; then
+        systemctl enable --now spacemit-k1-cpufreq-iot.service >/dev/null 2>&1 || true
+        GOV_CHANGED="true"
+    fi
+
+    if [[ "$GOV_CHANGED" == "true" ]]; then
+        log_ok "Configured SpacemiT K1 cpufreq governor -> '${IOT_GOV}' (--tune iot)"
+    else
+        log_skip "SpacemiT K1 cpufreq governor already converged ('${IOT_GOV}')"
+    fi
+elif [[ -f "$IOT_GOV_UNIT" ]]; then
+    systemctl disable --now spacemit-k1-cpufreq-iot.service >/dev/null 2>&1 || true
+    rm -f "$IOT_GOV_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -f "$PERF_GOV_UNIT" ]]; then
+        systemctl enable --now spacemit-k1-cpufreq-performance.service >/dev/null 2>&1 || true
+    fi
+    if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq '^GOVERNOR="?performance"?$' /etc/default/cpufrequtils 2>/dev/null; then
+        sed 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils | rvdk_atomic_write /etc/default/cpufrequtils 0644
+    fi
+    _k1_apply_governor_live "performance" || true
+    log_ok "Restored SpacemiT K1 cpufreq performance governor (--tune ${TUNE_LABEL})"
 fi
 
 # ==============================================================================

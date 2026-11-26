@@ -39,8 +39,12 @@ rvdk_bsp_read_dt_model() {
 rvdk_bsp_protect_dpkg() {
     local conf_path="$1"
     local label="${2:-vendor U-Boot/DTB}"
-    if [[ ! -d /etc/apt/apt.conf.d ]]; then
-        log_skip "Non-APT rootfs; skipping dpkg confold hook"
+    if [[ "${RVDK_ARCH:-}" == "riscv32" || "${RVDK_MMU:-}" == "none" ]]; then
+        log_skip "riscv32/nommu target (${RVDK_SOC:-espressif/esp32p4}); skipping APT/dpkg confold hook"
+        return 0
+    fi
+    if ! command -v dpkg >/dev/null 2>&1 || ! command -v apt-get >/dev/null 2>&1 || [[ ! -d /etc/apt/apt.conf.d ]]; then
+        log_skip "Non-APT rootfs (dpkg/apt-get absent); skipping dpkg confold hook"
         return 0
     fi
     local want='Dpkg::Options {
@@ -91,6 +95,10 @@ rvdk_bsp_persist_wired_nic() {
 
     if [[ -f /etc/openwrt_release ]]; then
         log_skip "OpenWrt netifd manages network interfaces (/etc/config/network); leaving untouched"
+        return 0
+    fi
+    if ! command -v ip >/dev/null 2>&1; then
+        log_skip "iproute2 'ip' command absent; skipping NIC persistence"
         return 0
     fi
 
@@ -304,6 +312,10 @@ _rvdk_bsp_select_root_part() {
 # Converge non-colliding ext4 rootfs labels (`rvdk_sd_root` vs `rvdk_emmc_root`)
 # and repair duplicate UUIDs across dual-populated SD + eMMC SBCs.
 rvdk_bsp_converge_mmc_root_labels() {
+    if [[ "${RVDK_ARCH:-}" == "riscv32" || "${RVDK_MMU:-}" == "none" ]]; then
+        log_skip "riscv32/nommu target; skipping ext4 SD/eMMC label convergence"
+        return 0
+    fi
     if [[ -f /etc/openwrt_release ]]; then
         log_skip "OpenWrt rootfs; skipping ext4 SD/eMMC label convergence"
         return 0
@@ -564,6 +576,11 @@ rvdk_bsp_unlock_pmu() {
     local sysctl_file="$1"
     local cpu_label="$2"
     local expose_kallsyms="${3:-false}"
+
+    if [[ "${RVDK_ARCH:-}" == "riscv32" || "${RVDK_MMU:-}" == "none" ]] && [[ ! -d /proc/sys/kernel ]]; then
+        log_skip "Non-Linux/nommu target without /proc/sys/kernel; skipping ${cpu_label} PMU sysctl"
+        return 0
+    fi
 
     local kptr_val="1"
     if [[ "$expose_kallsyms" == "true" ]]; then

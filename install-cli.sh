@@ -390,7 +390,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
  Usage:
    sudo rvdk                      # Run full Day-0 (OS + Silicon BSP) bootstrap
    rvdk kit                       # Inspect resolved Board/SoC/OS Kit cache
-   sudo rvdk deeptune             # Multi-layer DeepTune (--tune data|ai)
+   sudo rvdk deeptune             # Multi-layer DeepTune (--tune data|ai|iot)
    sudo rvdk storage [status|...] # Live LVM elastic manager (grow, shrink, autotune)
    sudo rvdk quirk <name|list>    # Toggle board quirks (e.g. hdmi, fusb)
    rvdk flash <board> <medium>    # Flash board media (e.g. rvdk flash p550 usb 4)

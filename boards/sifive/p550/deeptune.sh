@@ -52,16 +52,23 @@ fi
 rvdk_log_init "RVDK:P550-DEEPTUNE"
 
 ACTION="apply"
+TUNE_REQUEST="${RVDK_TUNE:-}"
 FORCE_ARG=()
 ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--tune)
-            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai"
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai | iot"
+            TUNE_REQUEST="$2"
             shift 2
             ;;
-        --tune=*|data|ai|ml)
+        --tune=*)
+            TUNE_REQUEST="${1#*=}"
+            shift
+            ;;
+        data|ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu)
+            TUNE_REQUEST="$1"
             shift
             ;;
         status|--status)
@@ -82,7 +89,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo rvdk deeptune [--tune <data|ai>] [status] [--force] [--noprogbar]
+Usage: sudo rvdk deeptune [--tune <data|ai|iot>] [status] [--force] [--noprogbar]
 Layer 3 Board script: boards/sifive/p550/deeptune.sh
 EOF
             exit 0
@@ -103,6 +110,14 @@ if [[ "$ACTION" == "status" ]]; then
     exit 0
 fi
 
+if [[ -n "$TUNE_REQUEST" ]]; then
+    _tune_pre="$(tr '[:upper:]' '[:lower:]' <<< "$TUNE_REQUEST")"
+    case "$_tune_pre" in
+        ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu|data) ;;
+        *) log_fatal "Invalid --tune '${_tune_pre}' (expected: data | ai | iot)" ;;
+    esac
+fi
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
@@ -110,6 +125,18 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
         log_fatal "Root privileges required. Run via 'sudo rvdk deeptune'."
     fi
 fi
+
+if [[ -z "$TUNE_REQUEST" && -r /etc/rvdk/deeptune.env ]]; then
+    TUNE_REQUEST="$(awk -F= '/^RVDK_TUNE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' /etc/rvdk/deeptune.env 2>/dev/null || true)"
+fi
+TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "${TUNE_REQUEST:-data}")"
+
+case "$TUNE_REQUEST" in
+    ai|ml|edge-ai|edge-ml)   TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
+    iot|edge-iot|sensor|mcu) TUNE_MODE="iot";  TUNE_LABEL="iot" ;;
+    data)                    TUNE_MODE="data"; TUNE_LABEL="data" ;;
+    *)                       log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai | iot)" ;;
+esac
 
 _p550_fusb_converged() {
     local modprobe_conf="/etc/modprobe.d/90-rvdk-p550-fusb303b.conf"
@@ -130,8 +157,13 @@ _p550_fusb_converged() {
     return 0
 }
 
-rvdk_prog_init "P550 Carrier DeepTune: suppressing HF106C front-panel USB-C IRQ..."
-log_info "Converging SiFive Premier P550 Carrier DeepTune (HDMI crashcart preserved)..."
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    rvdk_prog_init "P550 Carrier DeepTune (--tune iot): suppressing fusb303b & HDMI..."
+    log_info "Converging SiFive Premier P550 Carrier DeepTune (--tune iot | low-power headless)..."
+else
+    rvdk_prog_init "P550 Carrier DeepTune: suppressing HF106C front-panel USB-C IRQ..."
+    log_info "Converging SiFive Premier P550 Carrier DeepTune (HDMI crashcart preserved)..."
+fi
 
 if [[ -n "$FUSB_QUIRK" && -f "$FUSB_QUIRK" ]]; then
     FUSB_WAS_CONVERGED="false"
@@ -146,4 +178,8 @@ if [[ -n "$FUSB_QUIRK" && -f "$FUSB_QUIRK" ]]; then
     fi
 fi
 
-rvdk_prog 100 "P550 Carrier DeepTune complete"
+if [[ "$TUNE_MODE" == "iot" && -n "$HDMI_QUIRK" && -f "$HDMI_QUIRK" ]]; then
+    bash "$HDMI_QUIRK" off ${FORCE_ARG[@]+"${FORCE_ARG[@]}"}
+fi
+
+rvdk_prog 100 "P550 Carrier DeepTune (--tune ${TUNE_LABEL}) complete"

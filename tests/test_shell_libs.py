@@ -861,6 +861,561 @@ fi
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip() == "BOARD=|SOC="
 
+    @pytest.mark.parametrize(
+        "alias",
+        [
+            "espressif-esp32p4",
+            "espressif/esp32p4",
+            "waveshare-esp32-p4-wifi6",
+            "waveshare/esp32-p4-wifi6",
+            "waveshare-esp32-p4",
+            "waveshare/esp32-p4",
+            "waveshare-p4",
+            "waveshare/p4",
+            "esp32-p4-wifi6",
+            "esp32-p4-wifi6-dev-kit",
+            "esp32-p4",
+            "esp32p4",
+            "p4",
+        ],
+    )
+    def test_kit_resolve_all_13_esp32p4_aliases(self, alias: str) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+rvdk_kit_resolve --no-cache --board "{alias}" --os esp-idf
+printf 'BOARD=%s|SOC=%s|SLUG=%s|TAG=%s|ARCH=%s|MMU=%s|OS=%s\\n' \\
+    "$RVDK_BOARD" "$RVDK_SOC" "$RVDK_SOC_SLUG" "$RVDK_BOARD_TAG" "$RVDK_ARCH" "$RVDK_MMU" "$RVDK_OS_ID"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert (
+            proc.stdout.strip()
+            == "BOARD=waveshare/esp32-p4-wifi6|SOC=espressif/esp32p4|SLUG=espressif-esp32p4|TAG=p4|ARCH=riscv32|MMU=none|OS=esp-idf"
+        )
+
+    @pytest.mark.parametrize(
+        "dt_model",
+        [
+            "Waveshare ESP32-P4-WIFI6-DEV-KIT",
+            "Waveshare ESP32-P4 Evaluation",
+            "Custom ESP32-P4 Sensor",
+            "Espressif ESP32P4 SoC",
+        ],
+    )
+    def test_kit_resolve_esp32p4_dt_tokens(self, dt_model: str) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+export RVDK_DT_MODEL="{dt_model}"
+rvdk_kit_resolve --no-cache --os nuttx
+printf 'BOARD=%s|SOC=%s|TAG=%s|ARCH=%s|MMU=%s|OS=%s\\n' \\
+    "$RVDK_BOARD" "$RVDK_SOC" "$RVDK_BOARD_TAG" "$RVDK_ARCH" "$RVDK_MMU" "$RVDK_OS_ID"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert (
+            proc.stdout.strip()
+            == "BOARD=waveshare/esp32-p4-wifi6|SOC=espressif/esp32p4|TAG=p4|ARCH=riscv32|MMU=none|OS=nuttx"
+        )
+
+    @pytest.mark.parametrize("bare_dt", ["Waveshare Generic Demo", "Orange Pi P4"])
+    def test_kit_resolve_rejects_bare_waveshare_or_p4_dt_tokens(self, bare_dt: str) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+export RVDK_DT_MODEL="{bare_dt}"
+rvdk_kit_resolve --no-cache --os debian
+printf 'BOARD=%s|SOC=%s\\n' "$RVDK_BOARD" "$RVDK_SOC"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "BOARD=|SOC="
+
+    @pytest.mark.parametrize("os_name", ["esp-idf", "nuttx", "buildroot", "linux-nommu"])
+    def test_kit_resolve_uname_riscv32_and_nommu_os_ids(self, tmp_path: Path, os_name: str) -> None:
+        bin_dir = tmp_path / "bin"
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-m" ]]; then
+    printf 'riscv32\\n'
+    exit 0
+fi
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+export RVDK_DT_MODEL="Unknown"
+rvdk_kit_resolve --no-cache --os "{os_name}"
+printf 'ARCH=%s|MMU=%s|OS=%s\\n' "$RVDK_ARCH" "$RVDK_MMU" "$RVDK_OS_ID"
+"""
+        proc = _run_bash(script, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == f"ARCH=riscv32|MMU=none|OS={os_name}"
+
+    def test_kit_compiler_profile_and_probe_cflags_esp32p4_and_generics(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        fake_cc = _write_exe(
+            bin_dir / "fake-gcc",
+            """#!/usr/bin/env bash
+if [[ "$*" == *"-march=rv32imafc_zicsr_zifencei_xespv2p1"* ]]; then
+    exit 1
+fi
+if [[ "$*" == *"-march=rv32imafc_zicsr_zifencei"* && "$*" == *"-mabi=ilp32f"* ]]; then
+    exit 0
+fi
+if [[ "$*" == *"-march=rv32imafc_zicsr_zifencei"* && "$*" != *"-mabi="* ]]; then
+    exit 0
+fi
+exit 1
+""",
+        )
+        fake_go = _write_exe(bin_dir / "fake-go", "#!/usr/bin/env bash\nexit 0\n")
+
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+rvdk_kit_compiler_profile "espressif/esp32p4" "riscv32"
+rvdk_kit_probe_cflags "{fake_cc}"
+rvdk_kit_probe_goriscv64 "{fake_go}"
+printf 'P4=%s|%s|%s|%s|%s|%s|%s\\n' \\
+    "$RVDK_TARGET_SLUG" "$RVDK_CPU_MTUNE" "$RVDK_MABI" "$RVDK_GORISCV64_CANDIDATES" \\
+    "$RVDK_SELECTED_MARCH" "$RVDK_OPT_CFLAGS" "$RVDK_SELECTED_GORISCV64"
+
+rvdk_kit_compiler_profile "" "riscv32"
+printf 'GEN32=%s|%s|%s|%s\\n' \\
+    "$RVDK_TARGET_SLUG" "$RVDK_MARCH_CANDIDATES" "$RVDK_MABI" "$RVDK_GORISCV64_CANDIDATES"
+
+rvdk_kit_compiler_profile "eswin/eic7700x" "riscv64"
+printf 'RV64=%s|%s\\n' "$RVDK_TARGET_SLUG" "$RVDK_MABI"
+
+rvdk_kit_compiler_profile "" "x86_64"
+printf 'AMD64=%s|%s\\n' "$RVDK_TARGET_SLUG" "$RVDK_MABI"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.splitlines() == [
+            "P4=espressif-esp32p4||ilp32f||rv32imafc_zicsr_zifencei|-O3 -pipe -march=rv32imafc_zicsr_zifencei -mabi=ilp32f|",
+            "GEN32=riscv32-generic|rv32imafc_zicsr_zifencei rv32imac|ilp32f|",
+            "RV64=sifive-p550|lp64d",
+            "AMD64=linux-amd64|",
+        ]
+
+    def test_kit_env_cache_persists_and_loads_arch_mmu(self, tmp_path: Path) -> None:
+        cache_file = tmp_path / "kit.env"
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/kit.sh"
+export RVDK_KIT_CACHE_FILE="{cache_file}"
+rvdk_kv_write "{cache_file}" 0644 "test" \\
+    "RVDK_KIT_SCHEMA=1" \\
+    "RVDK_DT_MODEL=Waveshare ESP32-P4-WIFI6-DEV-KIT" \\
+    "RVDK_SOC=espressif/esp32p4" \\
+    "RVDK_SOC_SLUG=espressif-esp32p4" \\
+    "RVDK_BOARD=waveshare/esp32-p4-wifi6" \\
+    "RVDK_BOARD_TAG=p4" \\
+    "RVDK_ARCH=riscv32" \\
+    "RVDK_MMU=none" \\
+    "RVDK_FACTORY_USER=" \\
+    "RVDK_OS_ID=esp-idf" \\
+    "RVDK_OS_VERSION_ID=5.4" \\
+    "RVDK_PRIMARY_NIC=wlan0" \\
+    "RVDK_CPU_HARTS=2"
+rvdk_kit_resolve
+printf 'SRC=%s|ARCH=%s|MMU=%s|SOC=%s|BOARD=%s\\n' \\
+    "$RVDK_KIT_SOURCE" "$RVDK_ARCH" "$RVDK_MMU" "$RVDK_SOC" "$RVDK_BOARD"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert (
+            proc.stdout.strip()
+            == "SRC=cache|ARCH=riscv32|MMU=none|SOC=espressif/esp32p4|BOARD=waveshare/esp32-p4-wifi6"
+        )
+
+
+class TestLibBspAndMotdRiscv32:
+    def test_protect_dpkg_and_mmc_labels_skip_cleanly_on_riscv32(self, tmp_path: Path) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/bsp.sh"
+export RVDK_ARCH="riscv32"
+export RVDK_MMU="none"
+export RVDK_SOC="espressif/esp32p4"
+rvdk_bsp_protect_dpkg "{tmp_path}/90-test" "ESP32-P4"
+rvdk_bsp_converge_mmc_root_labels
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.count("[SKIP]") == 2
+
+    def test_motd_renders_riscv32_without_riscv64_fallback_and_iot_badge(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        _write_exe(
+            bin_dir / "uname",
+            """#!/usr/bin/env bash
+case "${1:-}" in
+    -s) printf 'Linux\\n' ;;
+    -o) printf 'GNU/Linux\\n' ;;
+    -r) printf '6.12-nommu\\n' ;;
+    -m) exit 1 ;;
+    *)  exit 1 ;;
+esac
+""",
+        )
+        kit_env = tmp_path / "kit.env"
+        kit_env.write_text(
+            'RVDK_KIT_SCHEMA="1"\n'
+            'RVDK_DT_MODEL="Waveshare ESP32-P4-WIFI6-DEV-KIT"\n'
+            'RVDK_SOC="espressif/esp32p4"\n'
+            'RVDK_SOC_SLUG="espressif-esp32p4"\n'
+            'RVDK_BOARD="waveshare/esp32-p4-wifi6"\n'
+            'RVDK_BOARD_TAG="p4"\n'
+            'RVDK_ARCH="riscv32"\n'
+            'RVDK_MMU="none"\n'
+            'RVDK_OS_ID="linux-nommu"\n'
+            'RVDK_OS_VERSION_ID=""\n'
+            'RVDK_PRIMARY_NIC="wlan0"\n'
+            'RVDK_CPU_HARTS="2"\n',
+            encoding="utf-8",
+        )
+        dt_env = tmp_path / "deeptune.env"
+        dt_env.write_text('RVDK_TUNE="iot"\nRVDK_TUNE_MODE="iot"\n', encoding="utf-8")
+
+        motd_sh = tmp_path / "motd_render.sh"
+        gen = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/motd.sh"
+{{
+    printf '#!/bin/sh\\n'
+    _rvdk_emit_motd_renderer_body
+    printf '_rvdk_motd_render\\n'
+}} > "{motd_sh}"
+chmod +x "{motd_sh}"
+"""
+        )
+        assert gen.returncode == 0, gen.stderr
+
+        run = subprocess.run(
+            ["/bin/sh", str(motd_sh)],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "RVDK_KIT_CACHE_FILE": str(kit_env),
+                "RVDK_DEEPTUNE_ENV": str(dt_env),
+                "RVDK_ENGINE_DIR": str(tmp_path / "no_engine"),
+            },
+            check=False,
+        )
+        assert run.returncode == 0, run.stderr
+        assert "riscv32" in run.stdout
+        assert "riscv64" not in run.stdout
+        assert "Arch / MMU        : riscv32 (mmu: none)" in run.stdout
+        assert "(active: iot)" in run.stdout
+
+
+class TestBootstrapRiscv32AndTuneIot:
+    def _make_staged_repo(self, tmp_path: Path) -> tuple[Path, Path]:
+        repo = tmp_path / "rvdk"
+        shutil.copytree(REPO_ROOT / "lib", repo / "lib")
+        shutil.copy2(REPO_ROOT / "bootstrap.sh", repo / "bootstrap.sh")
+        (repo / "bootstrap.sh").chmod(0o755)
+
+        spy_log = tmp_path / "spy.log"
+        for rel in (
+            "os/bootstrap-apt.sh",
+            "os/deeptune.sh",
+            "bsp/espressif/esp32p4/forge.sh",
+            "bsp/espressif/esp32p4/deeptune.sh",
+            "boards/waveshare/esp32-p4-wifi6/deeptune.sh",
+        ):
+            _write_exe(
+                repo / rel,
+                f"""#!/usr/bin/env bash
+printf '%s %s\\n' "{rel}" "$*" >> "{spy_log}"
+exit 0
+""",
+            )
+        return repo, spy_log
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["postgresql", "--board", "p4", "--os", "esp-idf"],
+            ["mods/nvme-4kn", "--board", "p4", "--os", "esp-idf"],
+            ["mods/btrfs-raid", "--board", "p4", "--os", "esp-idf"],
+            ["mods/nfs-vault", "--board", "p4", "--os", "esp-idf"],
+            ["mods/tailscale", "--board", "p4", "--os", "esp-idf"],
+            ["mods/ntfy", "--board", "p4", "--os", "esp-idf"],
+            ["day0", "--board", "p4", "--os", "esp-idf", "--with-tailscale", "--stage-dir", "/tmp/rvdk_unused"],
+        ],
+    )
+    def test_riscv32_nommu_fails_fast_on_unsupported_modules(
+        self, tmp_path: Path, args: list[str]
+    ) -> None:
+        repo, _ = self._make_staged_repo(tmp_path)
+        proc = subprocess.run(
+            [BASH_BIN, str(repo / "bootstrap.sh"), *args],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ["PATH"], "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env")},
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert "riscv32 / nommu" in proc.stderr
+
+    def test_day0_skips_bootstrap_apt_and_chains_esp32p4_stage_dir(self, tmp_path: Path) -> None:
+        repo, spy_log = self._make_staged_repo(tmp_path)
+        stage_dir = tmp_path / "stage"
+        proc = subprocess.run(
+            [
+                BASH_BIN,
+                str(repo / "bootstrap.sh"),
+                "day0",
+                "--board",
+                "p4",
+                "--os",
+                "esp-idf",
+                "--tune",
+                "iot",
+                "--stage-dir",
+                str(stage_dir),
+                "--noprogbar",
+            ],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ["PATH"], "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env")},
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "[SKIP]" in proc.stdout
+        assert "Skipping os/bootstrap-apt.sh" in proc.stdout
+        calls = spy_log.read_text(encoding="utf-8").splitlines()
+        assert not any(c.startswith("os/bootstrap-apt.sh") for c in calls)
+        assert not any(c.startswith("os/deeptune.sh") for c in calls)
+        assert calls == [
+            f"bsp/espressif/esp32p4/forge.sh --noprogbar --stage-dir {stage_dir}",
+            f"bsp/espressif/esp32p4/deeptune.sh --tune iot --noprogbar --stage-dir {stage_dir}",
+            f"boards/waveshare/esp32-p4-wifi6/deeptune.sh --tune iot --noprogbar --stage-dir {stage_dir}",
+        ]
+        assert (stage_dir / "config" / "deeptune.env").is_file()
+
+    @pytest.mark.parametrize("alias", ["iot", "edge-iot", "sensor", "mcu"])
+    def test_deeptune_normalizes_iot_aliases_with_stage_dir(
+        self, tmp_path: Path, alias: str
+    ) -> None:
+        repo, spy_log = self._make_staged_repo(tmp_path)
+        stage_dir = tmp_path / f"stage_{alias}"
+        proc = subprocess.run(
+            [
+                BASH_BIN,
+                str(repo / "bootstrap.sh"),
+                "deeptune",
+                "--board",
+                "p4",
+                "--os",
+                "linux-nommu",
+                "--tune",
+                alias,
+                "--stage-dir",
+                str(stage_dir),
+                "--noprogbar",
+            ],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ["PATH"], "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env")},
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        calls = spy_log.read_text(encoding="utf-8").splitlines()
+        assert calls == [
+            f"bsp/espressif/esp32p4/deeptune.sh --tune iot --noprogbar --stage-dir {stage_dir}",
+            f"boards/waveshare/esp32-p4-wifi6/deeptune.sh --tune iot --noprogbar --stage-dir {stage_dir}",
+        ]
+
+    def test_direct_bsp_and_board_script_dispatch_unprivileged(self, tmp_path: Path) -> None:
+        stage_dir = tmp_path / "stage_direct"
+        env = {
+            "PATH": os.environ["PATH"],
+            "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env"),
+            "RVDK_DEEPTUNE_ENV": str(tmp_path / "none_dt.env"),
+        }
+        cmds = [
+            ["bsp/espressif/esp32p4/forge.sh", "--stage-dir", str(stage_dir), "--noprogbar"],
+            ["bsp/espressif/esp32p4/deeptune.sh", "--tune", "iot", "--stage-dir", str(stage_dir), "--noprogbar"],
+            ["boards/waveshare/esp32-p4-wifi6/deeptune.sh", "--tune", "iot", "--stage-dir", str(stage_dir), "--noprogbar"],
+            ["boards/waveshare/esp32-p4-wifi6/quirks/c6-sdio.sh", "enable", "--stage-dir", str(stage_dir), "--noprogbar"],
+            ["bsp/espressif/esp32p4/deeptune.sh", "status", "--stage-dir", str(stage_dir)],
+            ["boards/waveshare/esp32-p4-wifi6/flash-sd.sh", "--dry-run"],
+            ["bsp/espressif/esp32p4/forge.sh", "--help"],
+        ]
+        for args in cmds:
+            proc = subprocess.run(
+                [BASH_BIN, str(REPO_ROOT / "bootstrap.sh"), *args],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            assert proc.returncode == 0, f"{args}: stdout={proc.stdout}\nstderr={proc.stderr}"
+            if args[1] == "status":
+                assert "sdkconfig.rvdk.iot.defaults" in proc.stdout
+
+        assert (stage_dir / "config" / "rvdk-kit.env").is_file()
+        assert 'RVDK_ARCH="riscv32"' in (stage_dir / "config" / "rvdk-kit.env").read_text(encoding="utf-8")
+        assert (stage_dir / "config" / "sdkconfig.rvdk.iot.defaults").is_file()
+        assert (stage_dir / "config" / "board-waveshare-p4.defaults").is_file()
+        assert (stage_dir / "config" / "c6-sdio.env").is_file()
+
+        # Pass 2 via direct forge.sh emits [SKIP] unprivileged
+        p2 = subprocess.run(
+            [BASH_BIN, str(REPO_ROOT / "bootstrap.sh"), "bsp/espressif/esp32p4/forge.sh", "--stage-dir", str(stage_dir), "--noprogbar"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert p2.returncode == 0, p2.stderr
+        assert "[SKIP]" in p2.stdout
+
+    @pytest.mark.parametrize(
+        "bad_subcmd",
+        [
+            "/etc/passwd",
+            "/bsp/espressif/esp32p4/forge.sh",
+            "/boards/waveshare/esp32-p4-wifi6/deeptune.sh",
+            "bsp/../../etc/passwd",
+            "bsp/espressif/../esp32p4/forge.sh",
+            "boards/waveshare/esp32-p4-wifi6/quirks/../../deeptune.sh",
+            "bsp/./espressif/esp32p4/forge.sh",
+            "bsp//espressif/esp32p4/forge.sh",
+            "bsp/espressif/esp32p4/nonexistent.sh",
+            "boards/waveshare/esp32-p4-wifi6/media.json",
+            "install/../../etc/passwd",
+        ],
+    )
+    def test_direct_script_dispatch_rejects_traversal_leading_slash_and_missing(
+        self, tmp_path: Path, bad_subcmd: str
+    ) -> None:
+        proc = subprocess.run(
+            [BASH_BIN, str(REPO_ROOT / "bootstrap.sh"), bad_subcmd, "--stage-dir", str(tmp_path)],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ["PATH"], "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env")},
+            check=False,
+        )
+        assert proc.returncode != 0, f"Expected failure for {bad_subcmd}, got rc=0 stdout={proc.stdout}"
+
+    def test_direct_script_dispatch_rejects_symlink_escape(self, tmp_path: Path) -> None:
+        repo, _ = self._make_staged_repo(tmp_path)
+        outside = tmp_path / "outside.sh"
+        _write_exe(outside, "#!/usr/bin/env bash\necho ESCAPED\n")
+        (repo / "bsp" / "espressif" / "esp32p4" / "escape.sh").symlink_to(outside)
+
+        proc = subprocess.run(
+            [BASH_BIN, str(repo / "bootstrap.sh"), "bsp/espressif/esp32p4/escape.sh", "--stage-dir", str(tmp_path / "s")],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ["PATH"], "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env")},
+            check=False,
+        )
+        assert proc.returncode != 0
+        assert "ESCAPED" not in proc.stdout
+
+    def test_deeptune_p4_data_tune_pass1_pass2_idempotency_preserves_sdkconfig_fragment(
+        self, tmp_path: Path
+    ) -> None:
+        stage_dir = tmp_path / "stage_data_p4"
+        env = {
+            "PATH": os.environ["PATH"],
+            "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env"),
+            "RVDK_DEEPTUNE_ENV": str(tmp_path / "none_dt.env"),
+        }
+        cmd = [
+            BASH_BIN,
+            str(REPO_ROOT / "bootstrap.sh"),
+            "deeptune",
+            "--board",
+            "p4",
+            "--os",
+            "esp-idf",
+            "--tune",
+            "data",
+            "--stage-dir",
+            str(stage_dir),
+            "--noprogbar",
+        ]
+        p1 = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+        assert p1.returncode == 0, f"stdout={p1.stdout}\nstderr={p1.stderr}"
+
+        dt_env_path = stage_dir / "config" / "deeptune.env"
+        iot_cfg_path = stage_dir / "config" / "sdkconfig.rvdk.iot.defaults"
+        board_cfg_path = stage_dir / "config" / "board-waveshare-p4.defaults"
+        assert dt_env_path.is_file()
+        assert iot_cfg_path.is_file()
+        assert board_cfg_path.is_file()
+
+        dt_env_text = dt_env_path.read_text(encoding="utf-8")
+        assert 'RVDK_TUNE="iot"' in dt_env_text
+        assert 'RVDK_SDKCONFIG_FRAGMENT="sdkconfig.rvdk.iot.defaults"' in dt_env_text
+        snap_before = {
+            p.name: p.read_bytes() for p in sorted((stage_dir / "config").iterdir()) if p.is_file()
+        }
+
+        p2 = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+        assert p2.returncode == 0, f"stdout={p2.stdout}\nstderr={p2.stderr}"
+        assert "[SKIP]" in p2.stdout
+        assert "Flipping Kit DeepTune" not in p2.stdout
+        snap_after = {
+            p.name: p.read_bytes() for p in sorted((stage_dir / "config").iterdir()) if p.is_file()
+        }
+        assert snap_after == snap_before
+
+    def test_bsp_deeptune_alias_still_runs_orchestrated_deeptune(self, tmp_path: Path) -> None:
+        repo, spy_log = self._make_staged_repo(tmp_path)
+        stage_dir = tmp_path / "stage_bsp_dt"
+        proc = subprocess.run(
+            [
+                BASH_BIN,
+                str(repo / "bootstrap.sh"),
+                "bsp/deeptune",
+                "--board",
+                "p4",
+                "--os",
+                "esp-idf",
+                "--tune",
+                "iot",
+                "--stage-dir",
+                str(stage_dir),
+                "--noprogbar",
+            ],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ["PATH"], "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env")},
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert spy_log.read_text(encoding="utf-8").splitlines() == [
+            f"bsp/espressif/esp32p4/deeptune.sh --tune iot --noprogbar --stage-dir {stage_dir}",
+            f"boards/waveshare/esp32-p4-wifi6/deeptune.sh --tune iot --noprogbar --stage-dir {stage_dir}",
+        ]
+
 
 class TestLibAptAndProgbar:
     def test_apt_rewrite_stream_preserves_and_rewrites_to_apt_armbian_com(self, tmp_path: Path) -> None:

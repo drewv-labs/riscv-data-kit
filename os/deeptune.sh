@@ -23,8 +23,9 @@
 #     • Locks down per-SSH `systemd --user` PipeWire & GNOME Keyring sockets
 #     • Unloads & blacklists universal non-server kernel modules (`cfg80211`,
 #       `joydev`, `input_leds`, `apple_mfi_fastcharge`, `dm_multipath`, `nvme_fabrics`)
-#     • Applies reversible Transparent HugePages policy (`--tune data` -> `never`,
-#       `--tune ai` -> `madvise`) and headless scheduler/VM sysctls
+#     • Applies reversible Transparent HugePages policy (`--tune data` / `iot`
+#       -> `never`, `--tune ai` -> `madvise`), flash-friendly volatile journald
+#       & wireless/sensor preservation (`--tune iot`), and headless sysctls
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -81,7 +82,7 @@ rvdk_log_init "RVDK:OS-DEEPTUNE"
 
 usage() {
     cat <<EOF
-Usage: sudo $0 [--tune <data|ai>] [--force] [--no-apt-update] [--noprogbar]
+Usage: sudo $0 [--tune <data|ai|iot>] [--force] [--no-apt-update] [--noprogbar]
 EOF
 }
 
@@ -89,9 +90,19 @@ ORIG_ARGS=("$@")
 TUNE_REQUEST="${RVDK_TUNE:-data}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -t|--tune) TUNE_REQUEST="${2:-}"; shift 2 ;;
-        --tune=*)  TUNE_REQUEST="${1#*=}"; shift ;;
-        data|ai|ml) TUNE_REQUEST="$1"; shift ;;
+        -t|--tune)
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai | iot"
+            TUNE_REQUEST="$2"
+            shift 2
+            ;;
+        --tune=*)
+            TUNE_REQUEST="${1#*=}"
+            shift
+            ;;
+        data|ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu)
+            TUNE_REQUEST="$1"
+            shift
+            ;;
         --force)   shift ;;
         --no-apt-update|--skip-apt-update) export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)          export RVDK_NO_PROGBAR="1"; shift ;;
@@ -99,6 +110,14 @@ while [[ $# -gt 0 ]]; do
         *) log_fatal "Unknown argument: $1 (try --help)" ;;
     esac
 done
+
+TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "$TUNE_REQUEST")"
+case "$TUNE_REQUEST" in
+    data)                    TUNE_MODE="data"; TUNE_LABEL="data" ;;
+    ai|ml|edge-ai|edge-ml)   TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
+    iot|edge-iot|sensor|mcu) TUNE_MODE="iot";  TUNE_LABEL="iot" ;;
+    *) log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai | iot)" ;;
+esac
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
@@ -108,14 +127,7 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     fi
 fi
 
-TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "$TUNE_REQUEST")"
-case "$TUNE_REQUEST" in
-    data)                  TUNE_MODE="data"; TUNE_LABEL="data" ;;
-    ai|ml|edge-ai|edge-ml) TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
-    *) log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai)" ;;
-esac
-
-if declare -F rvdk_kit_resolve >/dev/null 2>&1; then
+if typeset -f rvdk_kit_resolve >/dev/null 2>&1; then
     rvdk_kit_resolve
 fi
 
@@ -131,14 +143,22 @@ PRIMARY_NIC="${RVDK_PRIMARY_NIC:-}"
 PRIMARY_IS_WIFI="false"
 if [[ -n "$PRIMARY_NIC" ]] && [[ "$PRIMARY_NIC" == wl* || -d "/sys/class/net/${PRIMARY_NIC}/wireless" ]]; then
     PRIMARY_IS_WIFI="true"
-    log_warn "Primary NIC '${PRIMARY_NIC}' is wireless; preserving wpa_supplicant & cfg80211 to protect active SSH link"
+    if [[ "$TUNE_MODE" != "iot" ]]; then
+        log_warn "Primary NIC '${PRIMARY_NIC}' is wireless; preserving wpa_supplicant & cfg80211 to protect active SSH link"
+    fi
 fi
 
-# OpenWrt / non-systemd fast-path: apply THP + BusyBox-compatible sysctls without systemd/APT calls
-if [[ "${RVDK_OS_ID:-}" == "openwrt" || -f /etc/openwrt_release ]] || ! command -v systemctl >/dev/null 2>&1; then
-    log_skip "Non-systemd/APT rootfs (${RVDK_OS_ID:-procd}); skipping systemd timer & Debian/Ubuntu desktop package purges"
+# OpenWrt / non-systemd / riscv32 nommu fast-path: apply THP + BusyBox-compatible sysctls without systemd/APT calls
+if [[ "${RVDK_OS_ID:-}" == "openwrt" || "${RVDK_OS_ID:-}" == "buildroot" || "${RVDK_OS_ID:-}" == "linux-nommu" || "${RVDK_OS_ID:-}" == "esp-idf" || "${RVDK_OS_ID:-}" == "nuttx" || "${RVDK_MMU:-}" == "none" || "${RVDK_ARCH:-}" == "riscv32" || -f /etc/openwrt_release ]] || ! command -v systemctl >/dev/null 2>&1; then
+    if [[ "${RVDK_OS_ID:-}" == "esp-idf" || "${RVDK_OS_ID:-}" == "nuttx" || ! -d /proc/sys ]]; then
+        log_skip "Non-Linux / RTOS rootfs (${RVDK_OS_ID:-rtos}); skipping Linux OS THP & sysctl DeepTune"
+        rvdk_prog 100 "OS DeepTune (--tune ${TUNE_LABEL}) complete"
+        exit 0
+    fi
 
-    if [[ "$TUNE_MODE" == "data" ]]; then
+    log_skip "Non-systemd/nommu rootfs (${RVDK_OS_ID:-procd}); skipping systemd timer & Debian/Ubuntu desktop package purges"
+
+    if [[ "$TUNE_MODE" == "data" || "$TUNE_MODE" == "iot" ]]; then
         THP_MODE="never"
     else
         THP_MODE="madvise"
@@ -162,22 +182,38 @@ start() {
             fi
         fi
         log_ok "Set Transparent HugePages -> '${THP_MODE}' (--tune ${TUNE_LABEL})"
+    else
+        log_skip "Transparent HugePages sysfs absent (nommu/stripped kernel); skipping THP tuning"
     fi
 
     mkdir -p /etc/sysctl.d
     DEEPTUNE_SYSCTL="/etc/sysctl.d/95-rvdk-deeptune.conf"
     OWRT_SYSCTLS=("# Managed by RVDK (os/deeptune.sh | tune=${TUNE_LABEL})")
-    [[ -e /proc/sys/kernel/sched_autogroup_enabled ]] && OWRT_SYSCTLS+=("kernel.sched_autogroup_enabled = 0")
-    [[ -e /proc/sys/vm/swappiness ]]                  && OWRT_SYSCTLS+=("vm.swappiness = 1")
-    [[ -e /proc/sys/kernel/printk ]]                  && OWRT_SYSCTLS+=("kernel.printk = 3 4 1 3")
-    [[ -e /proc/sys/kernel/nmi_watchdog ]]            && OWRT_SYSCTLS+=("kernel.nmi_watchdog = 0")
+    if [[ "$TUNE_MODE" == "iot" ]]; then
+        [[ -e /proc/sys/vm/swappiness ]]                  && OWRT_SYSCTLS+=("vm.swappiness = 1")
+        [[ -e /proc/sys/vm/dirty_background_ratio ]]      && OWRT_SYSCTLS+=("vm.dirty_background_ratio = 3")
+        [[ -e /proc/sys/vm/dirty_ratio ]]                 && OWRT_SYSCTLS+=("vm.dirty_ratio = 8")
+        [[ -e /proc/sys/vm/dirty_writeback_centisecs ]]   && OWRT_SYSCTLS+=("vm.dirty_writeback_centisecs = 1500")
+        [[ -e /proc/sys/vm/vfs_cache_pressure ]]          && OWRT_SYSCTLS+=("vm.vfs_cache_pressure = 120")
+        [[ -e /proc/sys/kernel/sched_autogroup_enabled ]] && OWRT_SYSCTLS+=("kernel.sched_autogroup_enabled = 0")
+        [[ -e /proc/sys/net/core/rmem_max ]]              && OWRT_SYSCTLS+=("net.core.rmem_max = 1048576")
+        [[ -e /proc/sys/net/core/wmem_max ]]              && OWRT_SYSCTLS+=("net.core.wmem_max = 1048576")
+        [[ -e /proc/sys/net/ipv4/tcp_keepalive_time ]]    && OWRT_SYSCTLS+=("net.ipv4.tcp_keepalive_time = 60")
+        [[ -e /proc/sys/net/ipv4/tcp_keepalive_intvl ]]   && OWRT_SYSCTLS+=("net.ipv4.tcp_keepalive_intvl = 15")
+        [[ -e /proc/sys/net/ipv4/tcp_keepalive_probes ]]  && OWRT_SYSCTLS+=("net.ipv4.tcp_keepalive_probes = 4")
+    else
+        [[ -e /proc/sys/kernel/sched_autogroup_enabled ]] && OWRT_SYSCTLS+=("kernel.sched_autogroup_enabled = 0")
+        [[ -e /proc/sys/vm/swappiness ]]                  && OWRT_SYSCTLS+=("vm.swappiness = 1")
+        [[ -e /proc/sys/kernel/printk ]]                  && OWRT_SYSCTLS+=("kernel.printk = 3 4 1 3")
+        [[ -e /proc/sys/kernel/nmi_watchdog ]]            && OWRT_SYSCTLS+=("kernel.nmi_watchdog = 0")
+    fi
     WANT_OWRT_DT_SYSCTL="$(printf '%s\n' "${OWRT_SYSCTLS[@]}")"
     if ! printf '%s\n' "$WANT_OWRT_DT_SYSCTL" | cmp -s - "$DEEPTUNE_SYSCTL" 2>/dev/null; then
         printf '%s\n' "$WANT_OWRT_DT_SYSCTL" | rvdk_atomic_write "$DEEPTUNE_SYSCTL" 0644
         sysctl -p "$DEEPTUNE_SYSCTL" >/dev/null 2>&1 || true
-        log_ok "Applied router/non-systemd scheduler & VM sysctls (${DEEPTUNE_SYSCTL})"
+        log_ok "Applied non-systemd/IoT scheduler & VM sysctls (${DEEPTUNE_SYSCTL})"
     else
-        log_skip "Router/non-systemd scheduler & VM sysctls already converged"
+        log_skip "Non-systemd/IoT scheduler & VM sysctls already converged"
     fi
     rvdk_prog 100 "OS DeepTune (--tune ${TUNE_LABEL}) complete"
     exit 0
@@ -218,7 +254,7 @@ if command -v findmnt >/dev/null 2>&1; then
     VARLOG_SRC="$(findmnt -n -o SOURCE /var/log 2>/dev/null || true)"
     VARLOG_HDD_SRC="$(findmnt -n -o SOURCE /var/log.hdd 2>/dev/null || true)"
     if [[ "$VARLOG_SRC" == *zram* || "$VARLOG_SRC" == *ramlog* || -n "$VARLOG_HDD_SRC" ]]; then
-        if declare -F rvdk_register_cleanup >/dev/null 2>&1; then
+        if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
             rvdk_register_cleanup _rvdk_restore_logging_services
         elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
             trap '_rvdk_restore_logging_services' EXIT
@@ -303,35 +339,55 @@ if [[ "$VENDOR_ZRAM_CHANGED" == "true" ]]; then
 fi
 
 # ==============================================================================
-# 0b. ENSURE PERSISTENT SYSTEMD-JOURNALD BEFORE RETIRING RSYSLOG
+# 0b. CONFIGURE BOUNDED SYSTEMD-JOURNALD (PERSISTENT OR IOT VOLATILE)
 # ==============================================================================
-rvdk_prog 10 "OS DeepTune: persisting bounded systemd-journald (256M)..."
-mkdir -p /etc/systemd/journald.conf.d /var/log/journal
-chmod 0755 /etc/systemd/journald.conf.d
-systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
-
-# Clear Armbian/OrangePi 20M SystemMaxUse override in /etc/systemd/journald.conf if present
-if [[ -f /etc/systemd/journald.conf ]] && grep -qx 'SystemMaxUse=20M' /etc/systemd/journald.conf 2>/dev/null; then
-    _new_jconf="$(sed 's/^SystemMaxUse=20M$/#SystemMaxUse=/' /etc/systemd/journald.conf)"
-    printf '%s\n' "$_new_jconf" | rvdk_atomic_write /etc/systemd/journald.conf 0644
-fi
-
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-rvdk-deeptune.conf"
-WANT_JOURNALD="[Journal]
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    rvdk_prog 10 "OS DeepTune: configuring flash-friendly volatile systemd-journald (16M)..."
+    mkdir -p /etc/systemd/journald.conf.d
+    chmod 0755 /etc/systemd/journald.conf.d
+    WANT_JOURNALD="[Journal]
+Storage=volatile
+RuntimeMaxUse=16M
+RateLimitIntervalSec=30s
+RateLimitBurst=200
+ForwardToSyslog=no
+ForwardToWall=no"
+    if ! printf "%s\n" "$WANT_JOURNALD" | cmp -s - "$JOURNALD_DROPIN" 2>/dev/null; then
+        printf "%s\n" "$WANT_JOURNALD" | rvdk_atomic_write "$JOURNALD_DROPIN" 0644
+        systemctl restart systemd-journald.service 2>/dev/null || true
+        log_ok "Configured volatile flash-friendly systemd-journald (Storage=volatile, RuntimeMaxUse=16M)"
+    else
+        log_skip "Volatile systemd-journald policy already converged"
+    fi
+else
+    rvdk_prog 10 "OS DeepTune: persisting bounded systemd-journald (256M)..."
+    mkdir -p /etc/systemd/journald.conf.d /var/log/journal
+    chmod 0755 /etc/systemd/journald.conf.d
+    systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
+
+    # Clear Armbian/OrangePi 20M SystemMaxUse override in /etc/systemd/journald.conf if present
+    if [[ -f /etc/systemd/journald.conf ]] && grep -qx 'SystemMaxUse=20M' /etc/systemd/journald.conf 2>/dev/null; then
+        _new_jconf="$(sed 's/^SystemMaxUse=20M$/#SystemMaxUse=/' /etc/systemd/journald.conf)"
+        printf '%s\n' "$_new_jconf" | rvdk_atomic_write /etc/systemd/journald.conf 0644
+    fi
+
+    WANT_JOURNALD="[Journal]
 Storage=persistent
 SystemMaxUse=256M
 RuntimeMaxUse=64M
 ForwardToSyslog=no
 ForwardToWall=no"
 
-if ! printf "%s\n" "$WANT_JOURNALD" | cmp -s - "$JOURNALD_DROPIN" 2>/dev/null; then
-    printf "%s\n" "$WANT_JOURNALD" | rvdk_atomic_write "$JOURNALD_DROPIN" 0644
-    systemctl restart systemd-journald.service 2>/dev/null || true
-    journalctl --flush >/dev/null 2>&1 || true
-    journalctl --vacuum-size=256M >/dev/null 2>&1 || true
-    log_ok "Configured persistent bounded systemd-journald (Storage=persistent, 256M max)"
-else
-    log_skip "Persistent systemd-journald cap already configured"
+    if ! printf "%s\n" "$WANT_JOURNALD" | cmp -s - "$JOURNALD_DROPIN" 2>/dev/null; then
+        printf "%s\n" "$WANT_JOURNALD" | rvdk_atomic_write "$JOURNALD_DROPIN" 0644
+        systemctl restart systemd-journald.service 2>/dev/null || true
+        journalctl --flush >/dev/null 2>&1 || true
+        journalctl --vacuum-size=256M >/dev/null 2>&1 || true
+        log_ok "Configured persistent bounded systemd-journald (Storage=persistent, 256M max)"
+    else
+        log_skip "Persistent systemd-journald cap already configured"
+    fi
 fi
 
 mask_units_quiet() {
@@ -425,7 +481,21 @@ BLOAT_DAEMONS=(
     syslog.socket
     nfs-blkmap.service
 )
-[[ "$PRIMARY_IS_WIFI" == "false" ]] && BLOAT_DAEMONS+=(wpa_supplicant.service)
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    BLOAT_DAEMONS+=(
+        packagekit.service
+        ModemManager.service
+        apport.service
+        apport-autoreport.service
+        whoopsie.service
+    )
+    if [[ "$(readlink /etc/systemd/system/wpa_supplicant.service 2>/dev/null || true)" == "/dev/null" ]]; then
+        systemctl unmask wpa_supplicant.service >/dev/null 2>&1 || true
+        log_ok "Unmasked wpa_supplicant.service for IoT wireless transport (--tune iot)"
+    fi
+elif [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
+    BLOAT_DAEMONS+=(wpa_supplicant.service)
+fi
 
 if mask_units_quiet "${BLOAT_DAEMONS[@]}"; then
     log_ok "Stopped & masked non-essential system daemons (fwupd, multipathd, cups, avahi, udisks2, upower, rsyslog)"
@@ -537,7 +607,16 @@ CANDIDATE_PURGE_PKGS=(
     pipewire-audio
     wireplumber
 )
-[[ "$PRIMARY_IS_WIFI" == "false" ]] && CANDIDATE_PURGE_PKGS+=(wpasupplicant)
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    CANDIDATE_PURGE_PKGS+=(
+        packagekit
+        modemmanager
+        apport
+        whoopsie
+    )
+elif [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
+    CANDIDATE_PURGE_PKGS+=(wpasupplicant)
+fi
 
 if [[ "$NM_SAFE_TO_PURGE" == "true" ]]; then
     CANDIDATE_PURGE_PKGS+=(
@@ -598,7 +677,7 @@ OS_BLACKLIST_MODS=(
     dm_multipath
     nvme_fabrics
 )
-[[ "$PRIMARY_IS_WIFI" == "false" ]] && OS_BLACKLIST_MODS=(cfg80211 "${OS_BLACKLIST_MODS[@]}")
+[[ "$PRIMARY_IS_WIFI" == "false" && "$TUNE_MODE" != "iot" ]] && OS_BLACKLIST_MODS=(cfg80211 "${OS_BLACKLIST_MODS[@]}")
 
 MODPROBE_OS="/etc/modprobe.d/85-rvdk-os-deeptune.conf"
 WANT_OS_MODPROBE="# Managed by RVDK (os/deeptune.sh)
@@ -629,7 +708,7 @@ done
 # ==============================================================================
 rvdk_prog 92 "OS DeepTune: applying THP (${TUNE_LABEL}) & scheduler sysctls..."
 
-if [[ "$TUNE_MODE" == "data" ]]; then
+if [[ "$TUNE_MODE" == "data" || "$TUNE_MODE" == "iot" ]]; then
     THP_MODE="never"
 else
     THP_MODE="madvise"
@@ -661,16 +740,33 @@ if [[ -d /sys/kernel/mm/transparent_hugepage ]]; then
         done
         log_skip "Transparent HugePages policy already converged at '${THP_MODE}'"
     fi
+else
+    log_skip "Transparent HugePages sysfs absent; skipping THP unit"
 fi
 
 DEEPTUNE_SYSCTL="/etc/sysctl.d/95-rvdk-deeptune.conf"
-WANT_SYSCTL="# Managed by RVDK (os/deeptune.sh | tune=${TUNE_LABEL})
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    WANT_SYSCTL="# Managed by RVDK (os/deeptune.sh | tune=iot)
+vm.swappiness = 1
+vm.dirty_background_ratio = 3
+vm.dirty_ratio = 8
+vm.dirty_writeback_centisecs = 1500
+vm.vfs_cache_pressure = 120
+kernel.sched_autogroup_enabled = 0
+net.core.rmem_max = 1048576
+net.core.wmem_max = 1048576
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 4"
+else
+    WANT_SYSCTL="# Managed by RVDK (os/deeptune.sh | tune=${TUNE_LABEL})
 # Disable desktop session TTY autogrouping so database & compute workers get pure scheduler fairness
 kernel.sched_autogroup_enabled = 0
 # Minimize swap inclination & console printk stalls
 vm.swappiness = 1
 kernel.printk = 3 4 1 3
 -kernel.nmi_watchdog = 0"
+fi
 
 if ! printf "%s\n" "$WANT_SYSCTL" | cmp -s - "$DEEPTUNE_SYSCTL" 2>/dev/null; then
     printf "%s\n" "$WANT_SYSCTL" | rvdk_atomic_write "$DEEPTUNE_SYSCTL" 0644

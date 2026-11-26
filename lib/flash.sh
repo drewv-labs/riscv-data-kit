@@ -231,7 +231,7 @@ _rvdk_udev_settle() {
 }
 
 rvdk_flash_list() {
-    local boards_root="${_FLASH_REPO_ROOT}/boards"
+    local boards_root="${RVDK_BOARDS_DIR:-${_FLASH_REPO_ROOT}/boards}"
     if ! command -v python3 >/dev/null 2>&1; then
         log_fatal "python3 is required to inspect board media manifests."
     fi
@@ -241,8 +241,8 @@ import glob, json, os, sys
 boards_root = sys.argv[1]
 paths = sorted(glob.glob(os.path.join(boards_root, "*", "*", "media.json")))
 print("RVDK Board Media Catalog (boards/*/*/media.json):")
-print("  {:<12} {:<22} {:<10} {:<12} {}".format("TAG", "BOARD", "MEDIUM", "MODE", "DESCRIPTION"))
-print("  " + "-" * 86)
+print("  {:<12} {:<26} {:<10} {:<12} {}".format("TAG", "BOARD", "MEDIUM", "MODE", "DESCRIPTION"))
+print("  " + "-" * 90)
 for p in paths:
     with open(p, "r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -250,18 +250,18 @@ for p in paths:
     board = data.get("board", "-")
     media = data.get("media") or {}
     if not media:
-        print("  {:<12} {:<22} {:<10} {:<12} {}".format(tag, board, "-", "-", "(Vendor / onboard storage)"))
+        print("  {:<12} {:<26} {:<10} {:<12} {}".format(tag, board, "-", "-", "(Vendor / onboard storage)"))
         continue
     for m_name, spec in sorted(media.items()):
         mode = spec.get("mode", "uboot_ext4" if spec.get("uboot_payload") else "raw")
         desc = spec.get("description", "")
-        print("  {:<12} {:<22} {:<10} {:<12} {}".format(tag, board, m_name, mode, desc))
+        print("  {:<12} {:<26} {:<10} {:<12} {}".format(tag, board, m_name, mode, desc))
 PY
 }
 
 _rvdk_flash_resolve_manifest() {
     local query="$1"
-    local boards_root="${_FLASH_REPO_ROOT}/boards"
+    local boards_root="${RVDK_BOARDS_DIR:-${_FLASH_REPO_ROOT}/boards}"
     if typeset -f rvdk_normalize_board_id >/dev/null 2>&1; then
         query="$(rvdk_normalize_board_id "$query")"
     fi
@@ -357,6 +357,19 @@ aliases = {
     "milk-v/titan": "milkv/titan",
     "ultrarisc-titan": "milkv/titan",
     "ultrarisc/titan": "milkv/titan",
+    "espressif-esp32p4": "waveshare/esp32-p4-wifi6",
+    "espressif/esp32p4": "waveshare/esp32-p4-wifi6",
+    "waveshare-esp32-p4-wifi6": "waveshare/esp32-p4-wifi6",
+    "waveshare/esp32-p4-wifi6": "waveshare/esp32-p4-wifi6",
+    "waveshare-esp32-p4": "waveshare/esp32-p4-wifi6",
+    "waveshare/esp32-p4": "waveshare/esp32-p4-wifi6",
+    "waveshare-p4": "waveshare/esp32-p4-wifi6",
+    "waveshare/p4": "waveshare/esp32-p4-wifi6",
+    "esp32-p4-wifi6": "waveshare/esp32-p4-wifi6",
+    "esp32-p4-wifi6-dev-kit": "waveshare/esp32-p4-wifi6",
+    "esp32-p4": "waveshare/esp32-p4-wifi6",
+    "esp32p4": "waveshare/esp32-p4-wifi6",
+    "p4": "waveshare/esp32-p4-wifi6",
     "atlantis": "tenstorrent/atlantis",
     "tt-atlantis": "tenstorrent/atlantis",
     "ascalon": "tenstorrent/atlantis",
@@ -731,6 +744,7 @@ _rvdk_flash_postprocess_raw() {
     local root_label="$4"
     local regen_uuid="$5"
     local emmc_boot0="$6"
+    local board_arch="${7:-}"
 
     if [[ -n "$root_label" && ! "$root_label" =~ ^[a-zA-Z0-9_.-]{1,16}$ ]]; then
         log_fatal "Invalid ext4 root label '${root_label}' (max 16 chars: [a-zA-Z0-9_.-])."
@@ -770,13 +784,13 @@ _rvdk_flash_postprocess_raw() {
         done
 
         if (( ${#slices[@]} == 0 )); then
-            [[ -n "$root_label" ]] && log_warn "No partition slices detected on ${block_dev} after image stream; skipping host ext4 hygiene."
+            [[ -n "$root_label" && "$board_arch" != "riscv32" ]] && log_warn "No partition slices detected on ${block_dev} after image stream; skipping host ext4 hygiene."
             return 0
         fi
 
         local root_slice=""
         if ! root_slice="$(_rvdk_select_ext4_root_slice "$tune2fs_bin" "$root_part_hint" "${slices[@]}")"; then
-            [[ -n "$root_label" ]] && log_warn "Could not locate an ext4 rootfs slice on ${block_dev}; skipping host ext4 hygiene."
+            [[ -n "$root_label" && "$board_arch" != "riscv32" ]] && log_warn "Could not locate an ext4 rootfs slice on ${block_dev}; skipping host ext4 hygiene."
             return 0
         fi
 
@@ -840,7 +854,7 @@ _rvdk_flash_postprocess_raw() {
     done < <(lsblk -ln -o PATH,TYPE "$block_dev" 2>/dev/null || true)
 
     if (( ${#linux_parts[@]} == 0 )); then
-        [[ -n "$root_label" ]] && log_warn "No child partitions detected on ${block_dev}; skipping post-flash filesystem hygiene."
+        [[ -n "$root_label" && "$board_arch" != "riscv32" ]] && log_warn "No child partitions detected on ${block_dev}; skipping post-flash filesystem hygiene."
         return 0
     fi
 
@@ -849,7 +863,7 @@ _rvdk_flash_postprocess_raw() {
         root_slice="$(_rvdk_select_ext4_root_slice "$tune2fs_bin" "$root_part_hint" "${linux_parts[@]}" || true)"
     fi
     if [[ -z "$root_slice" ]]; then
-        [[ -n "$root_label" ]] && log_warn "Could not locate ext4 rootfs partition on ${block_dev}; skipping post-flash filesystem hygiene."
+        [[ -n "$root_label" && "$board_arch" != "riscv32" ]] && log_warn "Could not locate ext4 rootfs partition on ${block_dev}; skipping post-flash filesystem hygiene."
         return 0
     fi
 
@@ -1029,7 +1043,10 @@ Options:
       --no-root-label          Skip post-flash ext4 root filesystem labeling
       --insecure-skip-sha256   Bypass mandatory SHA-256 verification (NOT recommended)
       --allow-non-removable    Allow targeting non-USB/MMC drives on Linux (still blocks OS/swap disks)
+  -t, --tune <data|ai|iot>     Target DeepTune profile (sd_bootstrap media)
       --hostname <name>        Optional target hostname override (sd_bootstrap media)
+      --stage-dir <dir>        Stage config/artifacts directory (sd_bootstrap media)
+      --stage-only [<dir>]     Stage artifacts without touching block devices (sd_bootstrap media)
   -n, --dry-run                Dry-run preflight check (sd_bootstrap media)
       --force                  Override the 256 GiB large-drive safety ceiling
   -y, --yes                    Skip interactive confirmation prompt
@@ -1050,6 +1067,9 @@ rvdk_flash_main() {
     local cli_sha256=""
     local cli_root_label=""
     local bootstrap_hostname=""
+    local bootstrap_tune=""
+    local bootstrap_stage_dir=""
+    local bootstrap_stage_only="false"
     local dry_run="false"
     local want_help="false"
     local skip_root_label="false"
@@ -1061,15 +1081,29 @@ rvdk_flash_main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --board)                 board_query="${2:-}"; shift 2 ;;
-            --medium)                medium="${2:-}"; shift 2 ;;
-            -d|--device)             target_arg="${2:-}"; shift 2 ;;
-            -i|--image)              image_path="${2:-}"; shift 2 ;;
-            --sha256)                cli_sha256="${2:-}"; shift 2 ;;
+            --board)                 [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; board_query="${2:-}"; shift 2 ;;
+            --medium)                [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; medium="${2:-}"; shift 2 ;;
+            -d|--device)             [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; target_arg="${2:-}"; shift 2 ;;
+            -i|--image)              [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; image_path="${2:-}"; shift 2 ;;
+            --sha256)                [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; cli_sha256="${2:-}"; shift 2 ;;
             --allow-remote-sha256)   allow_remote_sha256="true"; shift ;;
-            --root-label)            cli_root_label="${2:-}"; shift 2 ;;
+            --root-label)            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; cli_root_label="${2:-}"; shift 2 ;;
             --no-root-label)         skip_root_label="true"; shift ;;
-            --hostname)              bootstrap_hostname="${2:-}"; shift 2 ;;
+            --hostname)              [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; bootstrap_hostname="${2:-}"; shift 2 ;;
+            -t|--tune)               [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; bootstrap_tune="${2:-}"; shift 2 ;;
+            --tune=*)                bootstrap_tune="${1#*=}"; [[ -z "$bootstrap_tune" ]] && log_fatal "Option '--tune=' requires an argument."; shift ;;
+            --stage-dir)             [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."; bootstrap_stage_dir="${2:-}"; shift 2 ;;
+            --stage-dir=*)           bootstrap_stage_dir="${1#*=}"; [[ -z "$bootstrap_stage_dir" ]] && log_fatal "Option '--stage-dir=' requires an argument."; shift ;;
+            --stage-only=*)          bootstrap_stage_only="true"; bootstrap_stage_dir="${1#*=}"; [[ -z "$bootstrap_stage_dir" ]] && log_fatal "Option '--stage-only=' requires an argument."; shift ;;
+            --stage-only)
+                bootstrap_stage_only="true"
+                if [[ -n "${2:-}" && "${2:-}" != -* && -z "$bootstrap_stage_dir" && ! "${2:-}" =~ ^(/dev/|[0-9]+$) ]]; then
+                    bootstrap_stage_dir="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
             -n|--dry-run)            dry_run="true"; shift ;;
             --insecure-skip-sha256)  skip_sha256="true"; shift ;;
             --allow-non-removable)   allow_non_removable="true"; shift ;;
@@ -1123,10 +1157,15 @@ if med not in media:
     sys.exit(2)
 m = media[med]
 mode = m.get("mode") or ("uboot_ext4" if m.get("uboot_payload") else "raw")
+raw_min_img = m.get("min_image_mib")
+min_img_val = 100 if raw_min_img is None else raw_min_img
+raw_min_size = m.get("min_size_gib")
+min_size_val = 8 if raw_min_size is None else raw_min_size
 fields = [
     doc.get("board", ""),
     doc.get("tag", ""),
     doc.get("name", ""),
+    doc.get("arch", "") or "",
     mode,
     m.get("script", ""),
     m.get("image", ""),
@@ -1140,7 +1179,8 @@ fields = [
     m.get("root_label", ""),
     "true" if m.get("regenerate_root_uuid") else "false",
     "true" if m.get("emmc_uboot_boot0") else "false",
-    str(m.get("min_size_gib", 8)),
+    str(min_size_val),
+    str(min_img_val),
     "\n".join(m.get("post_flash_notes") or []),
 ]
 for item in fields[:-1]:
@@ -1153,11 +1193,12 @@ PY
         log_fatal "Failed to resolve medium '${medium}' in ${manifest_path}."
     fi
 
-    local board_id board_tag board_name flash_mode script_rel default_img manifest_sha custom_url fallback_url fallback_sha uboot_payload fs_label root_part manifest_root_label regen_root_uuid emmc_uboot_boot0 min_size_gib
+    local board_id board_tag board_name board_arch flash_mode script_rel default_img manifest_sha custom_url fallback_url fallback_sha uboot_payload fs_label root_part manifest_root_label regen_root_uuid emmc_uboot_boot0 min_size_gib min_image_mib
     {
         IFS= read -r board_id
         IFS= read -r board_tag
         IFS= read -r board_name
+        IFS= read -r board_arch
         IFS= read -r flash_mode
         IFS= read -r script_rel
         IFS= read -r default_img
@@ -1172,12 +1213,17 @@ PY
         IFS= read -r regen_root_uuid
         IFS= read -r emmc_uboot_boot0
         IFS= read -r min_size_gib
+        IFS= read -r min_image_mib
     } <<< "$parsed_spec"
     local post_notes="${parsed_spec#*---NOTES---}"
     post_notes="${post_notes#$'\n'}"
 
     local effective_root_label="${cli_root_label:-$manifest_root_label}"
     [[ "$skip_root_label" == "true" ]] && effective_root_label=""
+
+    if [[ "$flash_mode" == "sd_bootstrap" && "${RVDK_FLASH_FORCE_RAW:-0}" == "1" ]]; then
+        flash_mode="raw"
+    fi
 
     if [[ "$flash_mode" == "sd_bootstrap" ]]; then
         local manifest_dir bootstrap_script
@@ -1187,8 +1233,16 @@ PY
         local fwd_args=()
         [[ "$want_help" == "true" ]] && fwd_args+=("--help")
         [[ -n "$target_arg" ]] && fwd_args+=("--device" "$target_arg")
+        [[ -n "$image_path" ]] && fwd_args+=("--image" "$image_path")
+        [[ -n "$cli_sha256" ]] && fwd_args+=("--sha256" "$cli_sha256")
+        [[ "$allow_remote_sha256" == "true" ]] && fwd_args+=("--allow-remote-sha256")
+        [[ "$skip_sha256" == "true" ]] && fwd_args+=("--insecure-skip-sha256")
+        [[ "$allow_non_removable" == "true" ]] && fwd_args+=("--allow-non-removable")
         [[ -n "$effective_root_label" ]] && fwd_args+=("--root-label" "$effective_root_label")
         [[ -n "$bootstrap_hostname" ]] && fwd_args+=("--hostname" "$bootstrap_hostname")
+        [[ -n "$bootstrap_tune" ]] && fwd_args+=("--tune" "$bootstrap_tune")
+        [[ -n "$bootstrap_stage_dir" ]] && fwd_args+=("--stage-dir" "$bootstrap_stage_dir")
+        [[ "$bootstrap_stage_only" == "true" ]] && fwd_args+=("--stage-only")
         [[ "$dry_run" == "true" ]] && fwd_args+=("--dry-run")
         [[ "$force_large_disk" == "true" ]] && fwd_args+=("--force")
         [[ "$skip_confirm" == "true" ]] && fwd_args+=("--yes")
@@ -1198,6 +1252,10 @@ PY
     if [[ "$want_help" == "true" ]]; then
         rvdk_flash_usage
         return 0
+    fi
+
+    if [[ "${RVDK_FLASH_FORCE_RAW:-0}" != "1" ]] && [[ -n "$bootstrap_tune" || -n "$bootstrap_stage_dir" || "$bootstrap_stage_only" == "true" ]]; then
+        log_fatal "--tune, --stage-dir, and --stage-only are only supported for 'sd_bootstrap' media manifests."
     fi
 
     if [[ -z "$target_arg" ]]; then
@@ -1219,7 +1277,9 @@ PY
     fi
     local mirror_url="${RVDK_MIRROR_URL:-https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1}"
     [[ "$min_size_gib" =~ ^[0-9]+$ ]] || min_size_gib=8
+    [[ "$min_image_mib" =~ ^[1-9][0-9]*$ ]] || min_image_mib=100
     local min_bytes=$(( min_size_gib * 1024 * 1024 * 1024 ))
+    local min_image_bytes=$(( min_image_mib * 1024 * 1024 ))
     local max_safe_bytes=$(( 256 * 1024 * 1024 * 1024 ))
 
     # ==========================================================================
@@ -1402,8 +1462,8 @@ PY
 
     local img_size_bytes
     img_size_bytes="$(wc -c < "$image_path" | tr -dc '0-9')"
-    if (( img_size_bytes < 104857600 )); then
-        log_fatal "Safety Interlock: ${image_path} is only ${img_size_bytes} bytes (< 100 MiB). Refusing to write!"
+    if (( img_size_bytes < min_image_bytes )); then
+        log_fatal "Safety Interlock: ${image_path} is only ${img_size_bytes} bytes (< ${min_image_mib} MiB). Refusing to write!"
     fi
 
     if [[ "$skip_confirm" != "true" ]]; then
@@ -1582,7 +1642,8 @@ PY
             "$root_part" \
             "$effective_root_label" \
             "$regen_root_uuid" \
-            "$emmc_uboot_boot0"
+            "$emmc_uboot_boot0" \
+            "$board_arch"
 
         if [[ "$os_type" == "Darwin" ]]; then
             diskutil eject "$block_dev"

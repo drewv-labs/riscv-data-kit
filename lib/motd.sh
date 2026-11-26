@@ -37,9 +37,18 @@ _rvdk_motd_render() {
     fi
     [ -z "$os_pretty" ] && os_pretty="$(uname -s 2>/dev/null || echo Linux)"
 
+    kit_file="${RVDK_KIT_CACHE_FILE:-/etc/rvdk/kit.env}"
+    tune_file="${RVDK_DEEPTUNE_ENV:-/etc/rvdk/deeptune.env}"
+
     os_sys="$(uname -o 2>/dev/null || echo GNU/Linux)"
     os_rel="$(uname -r 2>/dev/null || echo unknown)"
-    os_arch="$(uname -m 2>/dev/null || echo riscv64)"
+    os_arch="$(uname -m 2>/dev/null || true)"
+    if [ -z "$os_arch" ] && [ -r "$kit_file" ]; then
+        os_arch="$(awk -F= '/^RVDK_ARCH=/ {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' "$kit_file" 2>/dev/null)"
+    fi
+    if [ -z "$os_arch" ]; then
+        os_arch="${RVDK_ARCH:-unknown}"
+    fi
 
     printf '\n%s (%s %s %s)\n' "$os_pretty" "$os_sys" "$os_rel" "$os_arch"
     printf ' tuned by RVDK (github.com/drewv-labs/riscv-data-kit)\n\n'
@@ -186,12 +195,18 @@ _rvdk_motd_render() {
     fi
 
     kit_out=""
-    # Fast <10ms /bin/sh + awk path when /etc/rvdk/kit.env exists (avoids ~95ms bash CLI fork)
-    if [ -r /etc/rvdk/kit.env ]; then
+    # Fast <10ms /bin/sh + awk path when kit.env exists (avoids ~95ms bash CLI fork)
+    if [ -r "$kit_file" ]; then
         dt_tune=""
-        if [ -r /etc/rvdk/deeptune.env ]; then
-            dt_tune="$(awk -F= '/^RVDK_TUNE=/ {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' /etc/rvdk/deeptune.env 2>/dev/null)"
+        if [ -r "$tune_file" ]; then
+            dt_tune="$(awk -F= '/^RVDK_TUNE=/ {sub(/^[^=]*=/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit}' "$tune_file" 2>/dev/null)"
         fi
+        [ -z "$dt_tune" ] && dt_tune="${RVDK_TUNE:-}"
+        case "$(printf '%s' "$dt_tune" | tr '[:upper:]' '[:lower:]')" in
+            iot|edge-iot|sensor|mcu) dt_tune="iot" ;;
+            ai|ml|edge-ai|edge-ml)   dt_tune="ai" ;;
+            data)                    dt_tune="data" ;;
+        esac
         eng_dir="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
 
         kit_sc=""
@@ -215,18 +230,20 @@ _rvdk_motd_render() {
                     esac
                     ;;
             esac
-        done < /etc/rvdk/kit.env
+        done < "$kit_file"
         case "$kit_sc" in *..*|/*) kit_sc="" ;; esac
         case "$kit_bd" in *..*|/*) kit_bd="" ;; esac
         case "$kit_oi" in *..*|*/*) kit_oi="" ;; esac
 
         dt_chain="$kit_dt_chain"
         if [ -z "$dt_chain" ]; then
-            if [ -f "${eng_dir}/os/deeptune.sh" ] && [ ! -L "${eng_dir}/os/deeptune.sh" ]; then
-                dt_chain="os/deeptune.sh"
-            fi
-            if [ -n "$kit_oi" ] && [ -f "${eng_dir}/os/deeptune-${kit_oi}.sh" ] && [ ! -L "${eng_dir}/os/deeptune-${kit_oi}.sh" ]; then
-                dt_chain="${dt_chain:+${dt_chain} -> }os/deeptune-${kit_oi}.sh"
+            if [ "$kit_oi" != "esp-idf" ] && [ "$kit_oi" != "nuttx" ]; then
+                if [ -f "${eng_dir}/os/deeptune.sh" ] && [ ! -L "${eng_dir}/os/deeptune.sh" ]; then
+                    dt_chain="os/deeptune.sh"
+                fi
+                if [ -n "$kit_oi" ] && [ -f "${eng_dir}/os/deeptune-${kit_oi}.sh" ] && [ ! -L "${eng_dir}/os/deeptune-${kit_oi}.sh" ]; then
+                    dt_chain="${dt_chain:+${dt_chain} -> }os/deeptune-${kit_oi}.sh"
+                fi
             fi
             if [ -n "$kit_sc" ] && [ -f "${eng_dir}/bsp/${kit_sc}/deeptune.sh" ] && [ ! -L "${eng_dir}/bsp/${kit_sc}/deeptune.sh" ]; then
                 dt_chain="${dt_chain:+${dt_chain} -> }bsp/${kit_sc}/deeptune.sh"
@@ -256,7 +273,10 @@ _rvdk_motd_render() {
         kit_out="$(awk -F= \
             -v tune="$dt_tune" \
             -v chain="$dt_chain" \
-            -v quirks="$bd_quirks" '
+            -v quirks="$bd_quirks" \
+            -v kit_path="$kit_file" \
+            -v fallback_arch="${RVDK_ARCH:-$os_arch}" \
+            -v fallback_mmu="${RVDK_MMU:-}" '
             function unq(s) {
                 sub(/^[^=]*=/, "", s)
                 gsub(/^"|"$/, "", s)
@@ -272,18 +292,23 @@ _rvdk_motd_render() {
             /^RVDK_BOARD_TAG=/     { bt = unq($0) }
             /^RVDK_SOC=/           { sc = unq($0) }
             /^RVDK_SOC_SLUG=/      { ss = unq($0) }
+            /^RVDK_ARCH=/          { ar = unq($0) }
+            /^RVDK_MMU=/           { mm = unq($0) }
             /^RVDK_OS_ID=/         { oi = unq($0) }
             /^RVDK_OS_VERSION_ID=/ { ov = unq($0) }
             /^RVDK_PRIMARY_NIC=/   { pn = unq($0) }
             /^RVDK_CPU_HARTS=/     { ch = unq($0) }
             END {
-                if (dt != "" || bd != "") {
+                if (dt != "" || bd != "" || sc != "" || ar != "") {
+                    eff_arch = (ar != "" ? ar : (fallback_arch != "" ? fallback_arch : "unknown"))
+                    eff_mmu = (mm != "" ? mm : (fallback_mmu != "" ? fallback_mmu : "unknown"))
                     printf "  • Device Tree Model : %s\n", (dt != "" ? dt : "Unknown")
                     printf "  • Board (boards/)   : %s (tag: %s)\n", (bd != "" ? bd : "unrecognized"), (bt != "" ? bt : "-")
                     printf "  • SoC (bsp/)        : %s (slug: %s)\n", (sc != "" ? sc : "unrecognized"), (ss != "" ? ss : "-")
+                    printf "  • Arch / MMU        : %s (mmu: %s)\n", eff_arch, eff_mmu
                     printf "  • OS (os/)          : %s %s\n", (oi != "" ? oi : "unknown"), ov
                     printf "  • Primary NIC / CPU : %s | %s Harts\n", (pn != "" ? pn : "none"), (ch != "" ? ch : "?")
-                    printf "  • Kit Cache File    : /etc/rvdk/kit.env (cached)\n"
+                    printf "  • Kit Cache File    : %s (cached)\n", kit_path
                     if (chain == "") chain = "none"
                     if (tune != "") {
                         printf "  • DeepTune Chain    : %s (active: %s)\n", chain, tune
@@ -293,11 +318,11 @@ _rvdk_motd_render() {
                     printf "  • Board Quirks      : %s\n", (quirks != "" ? quirks : "none")
                 }
             }
-        ' /etc/rvdk/kit.env 2>/dev/null)"
+        ' "$kit_file" 2>/dev/null)"
     fi
 
-    # Fallback ONLY when /etc/rvdk/kit.env does not exist
-    if [ -z "$kit_out" ] && [ ! -r /etc/rvdk/kit.env ]; then
+    # Fallback ONLY when kit.env does not exist
+    if [ -z "$kit_out" ] && [ ! -r "$kit_file" ]; then
         rvdk_bin=""
         if [ -x /usr/local/bin/rvdk ]; then
             rvdk_bin="/usr/local/bin/rvdk"

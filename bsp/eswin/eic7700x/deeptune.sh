@@ -13,6 +13,11 @@
 #     • `ai` tune:
 #       Suppresses unused ALSA audio codec modules while removing `pvrsrvkm` from
 #       the blacklist and reloading it live for OpenCL / edge AI compute.
+#     • `iot` tune:
+#       Disables heavy GPU/display modules (`pvrsrvkm`, `es_drm`, `dw_hdmi_eswin`,
+#       `dw_hdmi_cec`, ALSA/HDMI codecs) to minimize quiescent power & thermal
+#       floor, preserves wireless/SDIO/I2C/SPI/UART kernel modules, and selects
+#       `schedutil` cpufreq governor (`ondemand` -> `performance` fallback).
 #     • SiFive P550 4-Hart PLIC Interrupt Affinity (`eic7700x-irq-affinity.service`):
 #       Spreads high-rate xHCI USB 3.2 and primary GbE interrupts off CPU0 across
 #       harts 1..3 (`xhci-hcd:usb3` -> CPU1, primary NIC -> CPU2, `xhci-hcd:usb1` -> CPU3).
@@ -29,6 +34,8 @@ LEGACY_MODPROBE="/etc/modprobe.d/90-rvdk-p550-deeptune.conf"
 MODPROBE_SOC="/etc/modprobe.d/90-rvdk-eic7700x-deeptune.conf"
 IRQ_SCRIPT="/usr/local/sbin/rvdk-eic7700x-irq-tune"
 IRQ_UNIT="/etc/systemd/system/eic7700x-irq-affinity.service"
+PERF_GOV_UNIT="/etc/systemd/system/eic7700x-cpufreq-performance.service"
+IOT_GOV_UNIT="/etc/systemd/system/eic7700x-cpufreq-iot.service"
 
 _SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -88,7 +95,7 @@ ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -t|--tune)
-            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai"
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument: data | ai | iot"
             TUNE_REQUEST="$2"
             shift 2
             ;;
@@ -96,7 +103,7 @@ while [[ $# -gt 0 ]]; do
             TUNE_REQUEST="${1#*=}"
             shift
             ;;
-        data|ai|ml)
+        data|ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu)
             TUNE_REQUEST="$1"
             shift
             ;;
@@ -118,7 +125,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             cat <<'EOF'
-Usage: sudo rvdk deeptune [--tune <data|ai>] [status] [--force] [--noprogbar]
+Usage: sudo rvdk deeptune [--tune <data|ai|iot>] [status] [--force] [--noprogbar]
 Layer 2 SoC script: bsp/eswin/eic7700x/deeptune.sh
 EOF
             exit 0
@@ -129,6 +136,14 @@ EOF
     esac
 done
 
+if [[ -n "$TUNE_REQUEST" ]]; then
+    _tune_pre="$(tr '[:upper:]' '[:lower:]' <<< "$TUNE_REQUEST")"
+    case "$_tune_pre" in
+        ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu|data) ;;
+        *) log_fatal "Invalid --tune '${_tune_pre}' (expected: data | ai | iot)" ;;
+    esac
+fi
+
 if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
@@ -137,7 +152,7 @@ if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     fi
 fi
 
-declare -F rvdk_kit_resolve >/dev/null 2>&1 && rvdk_kit_resolve
+typeset -f rvdk_kit_resolve >/dev/null 2>&1 && rvdk_kit_resolve
 
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
@@ -163,8 +178,14 @@ print_status() {
     local irq_svc="inactive"
     systemctl is-enabled --quiet eic7700x-irq-affinity.service 2>/dev/null && irq_svc="enabled"
 
+    local cpufreq_gov="firmware-fixed"
+    if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+        cpufreq_gov="$(tr -d '[:space:]' < /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")"
+    fi
+
     log_info "Layer 2 SoC (eswin/eic7700x):"
     printf "  • PowerVR GPU/AI    : %s\n" "$gpu_mod"
+    printf "  • CPUFreq Governor  : %s\n" "$cpufreq_gov"
     printf "  • PLIC IRQ Balancer : %s (%s)\n" "$irq_svc" "$IRQ_UNIT"
 }
 
@@ -174,7 +195,7 @@ if [[ "$ACTION" == "status" ]]; then
 fi
 
 if [[ -z "$TUNE_REQUEST" && -r /etc/rvdk/deeptune.env ]]; then
-    if declare -F rvdk_kv_load >/dev/null 2>&1; then
+    if typeset -f rvdk_kv_load >/dev/null 2>&1; then
         RVDK_TUNE=""
         rvdk_kv_load /etc/rvdk/deeptune.env RVDK_TUNE
         TUNE_REQUEST="$RVDK_TUNE"
@@ -185,9 +206,10 @@ fi
 TUNE_REQUEST="$(tr '[:upper:]' '[:lower:]' <<< "${TUNE_REQUEST:-data}")"
 
 case "$TUNE_REQUEST" in
-    ai|ml|edge-ai|edge-ml) TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
-    data)                  TUNE_MODE="data"; TUNE_LABEL="data" ;;
-    *)                     log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai)" ;;
+    ai|ml|edge-ai|edge-ml)   TUNE_MODE="ai";   TUNE_LABEL="ai" ;;
+    iot|edge-iot|sensor|mcu) TUNE_MODE="iot";  TUNE_LABEL="iot" ;;
+    data)                    TUNE_MODE="data"; TUNE_LABEL="data" ;;
+    *)                       log_fatal "Invalid --tune '${TUNE_REQUEST}' (expected: data | ai | iot)" ;;
 esac
 
 PRIMARY_NIC="${RVDK_PRIMARY_NIC:-end0}"
@@ -233,10 +255,12 @@ SOC_AUDIO_MODS=(
 TARGET_MODS=("${SOC_AUDIO_MODS[@]}")
 if [[ "$TUNE_MODE" == "data" ]]; then
     TARGET_MODS=(pvrsrvkm "${TARGET_MODS[@]}")
+elif [[ "$TUNE_MODE" == "iot" ]]; then
+    TARGET_MODS=(pvrsrvkm es_drm dw_hdmi_eswin dw_hdmi_cec "${TARGET_MODS[@]}")
 fi
 
 WANT_MODPROBE="# Managed by RVDK (bsp/eswin/eic7700x/deeptune.sh | tune=${TUNE_LABEL})
-# Suppresses EIC7700X ALSA codec$( [[ "$TUNE_MODE" == "data" ]] && printf " and PowerVR BXM-4-64 GPU (pvrsrvkm)" ) modules."
+# Suppresses EIC7700X ALSA codec$( [[ "$TUNE_MODE" == "data" ]] && printf " and PowerVR BXM-4-64 GPU (pvrsrvkm)" )$( [[ "$TUNE_MODE" == "iot" ]] && printf ", PowerVR GPU (pvrsrvkm), and HDMI/DRM" ) modules."
 for m in "${TARGET_MODS[@]}"; do
     WANT_MODPROBE+=$'\n'"blacklist ${m}"
 done
@@ -266,6 +290,109 @@ if [[ "$TUNE_MODE" == "ai" ]]; then
     else
         log_skip "PowerVR compute/GPU module (pvrsrvkm) already loaded for '${TUNE_LABEL}' tune"
     fi
+fi
+
+# ==============================================================================
+# 1b. EIC7700X CPUFREQ GOVERNOR POLICY (`iot`: schedutil -> ondemand -> performance)
+# ==============================================================================
+_eic_select_iot_governor() {
+    local avail_file="" cand_gov="" avail_list=""
+    for avail_file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_available_governors; do
+        [[ -r "$avail_file" ]] || continue
+        avail_list="$(cat "$avail_file" 2>/dev/null || true)"
+        for cand_gov in schedutil ondemand performance; do
+            if [[ " ${avail_list} " == *" ${cand_gov} "* ]]; then
+                printf '%s\n' "$cand_gov"
+                return 0
+            fi
+        done
+    done
+    printf 'schedutil\n'
+}
+
+_eic_apply_governor_live() {
+    local target_gov="$1"
+    local changed="false" g cur_g
+    for g in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+        [[ -w "$g" ]] || continue
+        cur_g="$(tr -d '[:space:]' < "$g" 2>/dev/null || true)"
+        if [[ "$cur_g" != "$target_gov" ]]; then
+            if printf '%s\n' "$target_gov" > "$g" 2>/dev/null; then
+                changed="true"
+            fi
+        fi
+    done
+    [[ "$changed" == "true" ]]
+}
+
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    rvdk_prog 55 "EIC7700X DeepTune: configuring low-power cpufreq governor..."
+    IOT_GOV="$(_eic_select_iot_governor)"
+    GOV_CHANGED="false"
+    if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq "^GOVERNOR=\"?${IOT_GOV}\"?\$" /etc/default/cpufrequtils 2>/dev/null; then
+        if grep -Eq '^GOVERNOR=' /etc/default/cpufrequtils 2>/dev/null; then
+            sed "s/^GOVERNOR=.*/GOVERNOR=\"${IOT_GOV}\"/" /etc/default/cpufrequtils | rvdk_atomic_write /etc/default/cpufrequtils 0644
+        else
+            {
+                cat /etc/default/cpufrequtils
+                printf '\nGOVERNOR="%s"\n' "$IOT_GOV"
+            } | rvdk_atomic_write /etc/default/cpufrequtils 0644
+        fi
+        GOV_CHANGED="true"
+    fi
+
+    if _eic_apply_governor_live "$IOT_GOV"; then
+        GOV_CHANGED="true"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-enabled --quiet eic7700x-cpufreq-performance.service 2>/dev/null; then
+            systemctl disable --now eic7700x-cpufreq-performance.service >/dev/null 2>&1 || true
+            GOV_CHANGED="true"
+        fi
+        WANT_IOT_GOV_UNIT="[Unit]
+Description=RVDK ESWIN EIC7700X IoT CPUFreq Governor (schedutil -> ondemand -> performance)
+After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service eic7700x-cpufreq-performance.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do [ -d \"\$c\" ] || continue; avail=\$(cat \"\$c/scaling_available_governors\" 2>/dev/null || true); for gov in schedutil ondemand performance; do case \" \$avail \" in *\" \$gov \"*) echo \"\$gov\" > \"\$c/scaling_governor\" 2>/dev/null || true; break ;; esac; done; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target"
+        if ! printf '%s\n' "$WANT_IOT_GOV_UNIT" | cmp -s - "$IOT_GOV_UNIT" 2>/dev/null; then
+            printf '%s\n' "$WANT_IOT_GOV_UNIT" | rvdk_atomic_write "$IOT_GOV_UNIT" 0644
+            systemctl daemon-reload
+            systemctl enable --now eic7700x-cpufreq-iot.service >/dev/null 2>&1 || true
+            GOV_CHANGED="true"
+        elif ! systemctl is-enabled --quiet eic7700x-cpufreq-iot.service 2>/dev/null; then
+            systemctl enable --now eic7700x-cpufreq-iot.service >/dev/null 2>&1 || true
+            GOV_CHANGED="true"
+        fi
+    fi
+
+    if [[ "$GOV_CHANGED" == "true" ]]; then
+        log_ok "Configured EIC7700X cpufreq governor -> '${IOT_GOV}' (--tune iot)"
+    else
+        log_skip "EIC7700X cpufreq governor already converged ('${IOT_GOV}')"
+    fi
+elif [[ -f "$IOT_GOV_UNIT" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now eic7700x-cpufreq-iot.service >/dev/null 2>&1 || true
+        rm -f "$IOT_GOV_UNIT"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if [[ -f "$PERF_GOV_UNIT" ]]; then
+            systemctl enable --now eic7700x-cpufreq-performance.service >/dev/null 2>&1 || true
+        fi
+    else
+        rm -f "$IOT_GOV_UNIT"
+    fi
+    if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq '^GOVERNOR="?performance"?$' /etc/default/cpufrequtils 2>/dev/null; then
+        sed 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils | rvdk_atomic_write /etc/default/cpufrequtils 0644
+    fi
+    _eic_apply_governor_live "performance" || true
+    log_ok "Restored EIC7700X cpufreq performance governor (--tune ${TUNE_LABEL})"
 fi
 
 # ==============================================================================

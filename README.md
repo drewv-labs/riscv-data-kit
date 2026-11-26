@@ -10,15 +10,15 @@
 
 ---
 
-The `riscv-data-kit` (**RVDK**) transforms out-of-the-box `riscv64` single-board computers and workstations into deterministic, headless Linux servers ready to get to work. 
+The `riscv-data-kit` (**RVDK**) transforms out-of-the-box `riscv64` single-board computers, workstations, and `riscv32` nommu edge targets into deterministic, headless systems ready to get to work. 
 * Vendor-isolated Board Support Package (BSP) guards
-* Cached hardware/OS Kit discovery (`/etc/rvdk/kit.env`)
+* Cached hardware/OS Kit discovery (`/etc/rvdk/kit.env` including `RVDK_ARCH` and `RVDK_MMU`)
 * Hardware Performance Monitoring Unit (PMU) counter exposure (`kptr_restrict = 1` safe default)
-* Workload-aware `deeptune` profiles (`data`, `ai`)
-* Board-specific hardware `quirk` toggles
-* Metadata-driven host recovery media flashers (`SHA-256` verified)
-* Native `4Kn` NVMe + Elastic LVM + Btrfs RAID 10 storage modules
-* Precompiled [build catalog](https://github.com/drewv-labs/riscv-data-kit/releases) across **[SiFive](https://www.sifive.com/)**, **[Tenstorrent](https://tenstorrent.com/)**, **[StarFive](https://www.starfivetech.com/en/)**, **[Milk-V](https://milkv.io/)**, **[SpacemiT](https://www.spacemit.com/en/)**, **[UltraRISC](https://www.ultrarisc.com/)**, **[Banana Pi](https://www.banana-pi.org/)**, **[Firefly](https://www.t-firefly.com/pages/riscv)**, and **[Orange Pi](http://www.orangepi.org/)** platforms.
+* Workload-aware `deeptune` profiles (`data`, `ai`, `iot`)
+* Board-specific hardware `quirk` toggles (`hdmi`, `fusb`, `c6-sdio`)
+* Metadata-driven host recovery & SD provisioning media flashers (`SHA-256` verified)
+* Native `4Kn` NVMe + Elastic LVM + Btrfs RAID 10 storage modules (`riscv64` + MMU)
+* Precompiled [build catalog](https://github.com/drewv-labs/riscv-data-kit/releases) across **[SiFive](https://www.sifive.com/)**, **[Tenstorrent](https://tenstorrent.com/)**, **[StarFive](https://www.starfivetech.com/en/)**, **[Milk-V](https://milkv.io/)**, **[SpacemiT](https://www.spacemit.com/en/)**, **[UltraRISC](https://www.ultrarisc.com/)**, **[Banana Pi](https://www.banana-pi.org/)**, **[Firefly](https://www.t-firefly.com/pages/riscv)**, **[Orange Pi](http://www.orangepi.org/)**, and **[Waveshare](https://www.waveshare.com/)** / **[Espressif](https://www.espressif.com/)** platforms.
 
 ---
 
@@ -29,7 +29,7 @@ Vendor RISC-V OS images frequently ship with desktop GUI bloat, plain-HTTP regio
 `RVDK` lives strictly in system space (`/usr/local/share/rvdk/engine`, `/etc/rvdk/`, `/var/cache/rvdk/`, `/var/lib/rvdk/`) with zero `~/.rvdk` user-home footprint, decoupling bare-metal bring-up and service provisioning into independent, strictly idempotent layers dispatched via `rvdk` (`/usr/bin/rvdk` & `/usr/local/bin/rvdk`) or standalone `curl | sudo bash` endpoints:
 
 ### **Layer 1 — OS Normalization (`os/`):** 
-Converges Debian, Ubuntu, Bianbu, and OpenWrt root filesystems into lean, headless server/router baselines. 
+Converges Debian, Ubuntu, Bianbu, and OpenWrt root filesystems into lean, headless server/router baselines (and skips cleanly on RTOS/nommu targets such as `esp-idf`, `nuttx`, `buildroot`, and `linux-nommu`). 
 * Canonical US-first signed HTTPS package mirror normalization (`deb.debian.org`, `security.debian.org`, `ports.ubuntu.com`, `downloads.openwrt.org`) & factory PyPI/npm/cargo/DNS touch-plane hygiene (`--keep-mirrors` opt-out)
 * Cold-RTC clock skew recovery (HTTP `Date:` step) & US-first persistent NTP (`systemd-timesyncd` / `chrony` / `sysntpd`) for batteryless SBCs
 * Non-interactive operator account provisioning with SSH `authorized_keys` inheritance
@@ -44,14 +44,14 @@ Organizes silicon hooks by SoC die (`bsp/<vendor>/<soc>/`) and board specifics (
 * Protects vendor `extlinux` and `zz-u-boot-menu` hooks (`--force-confdef` / `--force-confold`)
 * Migrates stale factory APT snapshots onto signed HTTPS mirrors
 * Masks unstable sleep targets & persists active SSH/wired NICs safely
-* Enforces deterministic, non-colliding `ext4` root labels (`rvdk_sd_root` vs `rvdk_emmc_root`) & UUIDs across dual-media SBCs
+* Enforces deterministic, non-colliding `ext4` root labels (`rvdk_sd_root` vs `rvdk_emmc_root`) & UUIDs across dual-media SBCs (with guarded non-APT/FAT32 skip paths for `riscv32` nommu targets)
 * Unlocks hardware PMU counters (`kernel.perf_event_paranoid = -1`, `kernel.kptr_restrict = 1`)
-* Toggles for board quirks (`hdmi`, `fusb`)
-* Chains `os -> bsp -> board` kernel/IRQ/VM tuning (`--tune data|ai`) with bounded persistent `journald`
+* Toggles for board quirks (`hdmi`, `fusb`, `c6-sdio`)
+* Chains `os -> bsp -> board` kernel/IRQ/VM & declarative Kconfig tuning (`--tune data|ai|iot`) with bounded persistent or flash-endurance-safe `journald`
 <br>
 
 ### **Layer 3 — Composable Data, Storage & Network Modules (`postgresql/`, `mods/`):** 
-Self-contained, opt-in modules for: 
+Self-contained, opt-in modules (`riscv64` + MMU required for PG18, NVMe/RAID, NFSv4, Tailscale, and `ntfy` — fail fast deterministically on `riscv32` / nommu) for: 
 * `io_uring` PostgreSQL 18.6 (SHA-256 verified prebuilt `.tar.zst` bundle by default, or `--force-build` cold compilation)
 * Native `4Kn` NVMe + Single/Dual-LVM (`vg_rvdk`) with OS/swap disk wipe guards
 * Kernel Btrfs RAID 10
@@ -80,6 +80,7 @@ Self-contained, opt-in modules for:
 | Milk-V | Jupiter 2 | `milkv/jupiter2` | `spacemit/k3` | 8x SpacemiT X100 (4-Wide OoO) | RVA23 + RVV 1.0 | Planned |
 | Firefly | AIBOX-K3 | `firefly/aibox-k3` | `spacemit/k3` | 8x SpacemiT X100 (4-Wide OoO) | RVA23 + RVV 1.0 | Planned (Jupiter 2 proxy) |
 | Tenstorrent | Atlantis | `tenstorrent/atlantis` | `tenstorrent/atlantis` | 8x Tenstorrent Ascalon-X (Wide OoO) | RVA23 + RVV 1.0 | Planned |
+| Waveshare | ESP32-P4-WIFI6-DEV-KIT | `waveshare/esp32-p4-wifi6` | `espressif/esp32p4` | 2x HP + 1x LP RISC-V (`riscv32`, nommu) | RV32IMAFC + Zicsr/Zifencei | ActiveDev |
 
 --- 
 
@@ -114,8 +115,9 @@ curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash
 rvdk kit                                                 # Inspect resolved Board/SoC/OS Kit & DeepTune chain
 sudo rvdk os --user rvadmin --hostname rv-vf2 --nopasswd # OS normalization only
 sudo rvdk bsp                                            # Silicon BSP & PMU unlock only
-sudo rvdk deeptune --tune data                           # Multi-layer kernel tuning (data | ai)
-rvdk quirk list                                          # List & toggle board hardware quirks (e.g. hdmi, fusb)
+sudo rvdk deeptune --tune data                           # Multi-layer kernel tuning (data | ai | iot)
+sudo rvdk deeptune --board p4 --os esp-idf --tune iot --stage-dir /tmp/p4-stage
+rvdk quirk list                                          # List & toggle board hardware quirks (e.g. hdmi, fusb, c6-sdio)
 sudo rvdk uninstall                                      # Remove CLI & caches (add --purge to wipe /etc/rvdk & drop-ins)
 ```
 ---
@@ -164,6 +166,8 @@ sudo rvdk flash rv2 emmc                                 # Bootstrap onboard RV2
 rvdk flash vf2 sd 4                                      # Flash StarFive VisionFive 2 SD card (/dev/disk4)
 rvdk flash p550 usb 4                                    # Stage U-Boot ext4 recovery USB for HiFive Premier P550
 rvdk flash p550 usb --device /dev/sdX --image /path/to/custom.img.zst --sha256 <hex64>
+rvdk flash p4 sd 4 --tune iot                            # Provision Waveshare ESP32-P4-WIFI6 SD card (FAT32 RVDK_P4_SD)
+rvdk flash p4 sd --stage-only /tmp/p4-stage --tune iot   # Stage ESP32-P4 config/Kconfig fragments without touching disks
 ```
 
 ---

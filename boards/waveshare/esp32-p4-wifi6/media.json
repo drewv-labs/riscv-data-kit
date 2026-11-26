@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "board": "waveshare/esp32-p4-wifi6",
+  "tag": "p4",
+  "name": "Waveshare ESP32-P4-WIFI6-DEV-KIT (ESP32-P4NRW32X + ESP32-C6)",
+  "soc": "espressif/esp32p4",
+  "arch": "riscv32",
+  "default_os": "esp-idf",
+  "media": {
+    "sd": {
+      "mode": "sd_bootstrap",
+      "script": "flash-sd.sh",
+      "description": "4-bit SDMMC FAT32 provisioning (RVDK_P4_SD, 32KB clusters) & optional raw riscv32 SD image flasher",
+      "root_label": "RVDK_P4_SD",
+      "min_size_gib": 4,
+      "min_image_mib": 4,
+      "post_flash_notes": [
+        "======================================================================",
+        " Waveshare ESP32-P4-WIFI6-DEV-KIT SD & Firmware Bring-Up:",
+        "   1. Insert MicroSD (RVDK_P4_SD FAT32) into the 4-bit SDMMC TF slot.",
+        "   2. Connect USB-Serial-JTAG (Espressif 303a:1001) to flash ESP-IDF",
+        "      or NuttX riscv32 firmware via `esptool.py` / `idf.py flash`.",
+        "   3. Onboard ESP32-C6 Wi-Fi 6 / BLE 5.3 connects over 4-bit SDIO",
+        "      (40 MHz); toggle via `rvdk quirk c6-sdio [enable|disable|status]`.",
+        "   4. Staged RVDK profiles reside under /config on RVDK_P4_SD.",
+        "======================================================================"
+      ]
+    }
+  },
+  "quirks": [
+    "c6-sdio"
+  ]
+}

@@ -661,3 +661,203 @@ rvdk_converge_fstab_entry "LABEL=NEW_SPEC" "/mnt/nvme_data/" "xfs" "{entry2}" "{
             f"{entry2}\n"
         )
         assert fstab.read_text(encoding="utf-8") == expected2
+
+
+class TestFlashP4AndMinImageMib:
+    def _make_p4_boards_dir(
+        self,
+        tmp_path: Path,
+        *,
+        min_image_mib: int | None = 4,
+    ) -> tuple[Path, Path]:
+        boards_dir = tmp_path / "boards"
+        p4_dir = boards_dir / "waveshare" / "esp32-p4-wifi6"
+        p4_dir.mkdir(parents=True)
+        spy_log = tmp_path / "flash_sd_spy.log"
+        _write_exe(
+            p4_dir / "flash-sd.sh",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" > "{spy_log}"
+exit 0
+""",
+        )
+        sd_spec: dict[str, object] = {
+            "mode": "sd_bootstrap",
+            "script": "flash-sd.sh",
+            "description": "Waveshare ESP32-P4 SD provisioning",
+            "root_label": "RVDK_P4_SD",
+            "min_size_gib": 4,
+        }
+        if min_image_mib is not None:
+            sd_spec["min_image_mib"] = min_image_mib
+
+        import json
+
+        manifest = {
+            "schema_version": 1,
+            "board": "waveshare/esp32-p4-wifi6",
+            "tag": "p4",
+            "name": "Waveshare ESP32-P4-WIFI6-DEV-KIT",
+            "soc": "espressif/esp32p4",
+            "arch": "riscv32",
+            "default_os": "esp-idf",
+            "media": {"sd": sd_spec},
+            "quirks": [],
+        }
+        (p4_dir / "media.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return boards_dir, spy_log
+
+    @pytest.mark.parametrize(
+        "alias",
+        [
+            "espressif-esp32p4",
+            "espressif/esp32p4",
+            "waveshare-esp32-p4-wifi6",
+            "waveshare/esp32-p4-wifi6",
+            "waveshare-esp32-p4",
+            "waveshare/esp32-p4",
+            "waveshare-p4",
+            "waveshare/p4",
+            "esp32-p4-wifi6",
+            "esp32-p4-wifi6-dev-kit",
+            "esp32-p4",
+            "esp32p4",
+            "p4",
+        ],
+    )
+    def test_resolve_manifest_all_13_esp32p4_aliases(self, tmp_path: Path, alias: str) -> None:
+        boards_dir, _ = self._make_p4_boards_dir(tmp_path)
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/flash.sh"
+_rvdk_flash_resolve_manifest "{alias}"
+"""
+        proc = _run_bash(script, env={"RVDK_BOARDS_DIR": str(boards_dir)})
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == str(boards_dir / "waveshare" / "esp32-p4-wifi6" / "media.json")
+
+    def test_sd_bootstrap_on_sd_forwards_extra_args_to_flash_sd(self, tmp_path: Path) -> None:
+        boards_dir, spy_log = self._make_p4_boards_dir(tmp_path)
+        stage_dir = tmp_path / "stage"
+        img_file = tmp_path / "app.img"
+        img_file.write_bytes(b"img")
+
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/flash.sh"
+rvdk_flash_main p4 sd /dev/disk4 \\
+    --tune iot \\
+    --hostname sensor-01 \\
+    --stage-dir "{stage_dir}" \\
+    --stage-only \\
+    --image "{img_file}" \\
+    -n -y
+"""
+        proc = _run_bash(script, env={"RVDK_BOARDS_DIR": str(boards_dir)})
+        assert proc.returncode == 0, proc.stderr
+        recorded = spy_log.read_text(encoding="utf-8").strip()
+        assert recorded == (
+            f"--device /dev/disk4 --image {img_file} --root-label RVDK_P4_SD "
+            f"--hostname sensor-01 --tune iot --stage-dir {stage_dir} --stage-only --dry-run --yes"
+        )
+
+        # Also test `--stage-only <dir>` syntax without positional disk
+        spy_log.unlink()
+        script2 = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/flash.sh"
+rvdk_flash_main p4 sd --stage-only "{stage_dir}" --tune iot
+"""
+        proc2 = _run_bash(script2, env={"RVDK_BOARDS_DIR": str(boards_dir)})
+        assert proc2.returncode == 0, proc2.stderr
+        assert (
+            spy_log.read_text(encoding="utf-8").strip()
+            == f"--root-label RVDK_P4_SD --tune iot --stage-dir {stage_dir} --stage-only"
+        )
+
+    def test_min_image_mib_enforces_custom_threshold_and_default_100mib(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        _make_darwin_uname_shim(bin_dir)
+        _make_diskutil_shim(
+            bin_dir,
+            """   Device Identifier:         disk4
+   Device Node:               /dev/disk4
+   Device / Media Name:       SanDisk MicroSD
+   Device Location:           External
+   Removable Media:           Removable
+   Virtual:                   No
+   Disk Size:                 16.0 GB (16000000000 Bytes)""",
+        )
+
+        boards_dir_4mib, _ = self._make_p4_boards_dir(tmp_path / "m4", min_image_mib=4)
+        boards_dir_def, _ = self._make_p4_boards_dir(tmp_path / "mdef", min_image_mib=None)
+
+        img_1m = tmp_path / "small.img"
+        with img_1m.open("wb") as fh:
+            fh.seek(1024 * 1024 - 1)
+            fh.write(b"\x00")
+
+        img_5m = tmp_path / "valid5m.img"
+        with img_5m.open("wb") as fh:
+            fh.seek(5 * 1024 * 1024 - 1)
+            fh.write(b"\x00")
+
+        base_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_FLASH_FORCE_RAW": "1",
+        }
+
+        dd_log = tmp_path / "dd.log"
+        _write_exe(
+            bin_dir / "dd",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{dd_log}"
+exit 0
+""",
+        )
+        _write_exe(bin_dir / "sync", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "brew", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(
+            bin_dir / "sudo",
+            """#!/usr/bin/env bash
+if [[ "${1:-}" == "-v" ]]; then
+    exit 0
+fi
+exec "$@"
+""",
+        )
+
+        # 1 MiB image fails `< 4 MiB` check
+        fail_1m = _run_bash(
+            f'set -Eeuo pipefail; source "{REPO_ROOT}/lib/flash.sh"; rvdk_flash_main p4 sd /dev/disk4 --image "{img_1m}" -y',
+            env={**base_env, "RVDK_BOARDS_DIR": str(boards_dir_4mib)},
+        )
+        assert fail_1m.returncode != 0
+        assert "(< 4 MiB)" in fail_1m.stderr
+        assert not dd_log.exists()
+
+        # 5 MiB image passes `< 4 MiB` check and executes dd
+        pass_5m = subprocess.run(
+            [
+                BASH_BIN,
+                "-c",
+                f'set -Eeuo pipefail; source "{REPO_ROOT}/lib/flash.sh"; rvdk_flash_main p4 sd /dev/disk4 --image "{img_5m}" -y',
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, **base_env, "RVDK_BOARDS_DIR": str(boards_dir_4mib)},
+            timeout=15,
+            check=False,
+        )
+        assert pass_5m.returncode == 0, pass_5m.stderr
+        assert "Refusing to write!" not in pass_5m.stderr
+        assert f"if={img_5m} of=/dev/rdisk4" in dd_log.read_text(encoding="utf-8")
+
+        # Without explicit min_image_mib, default 100 MiB interlock still rejects 5 MiB image
+        fail_def = _run_bash(
+            f'set -Eeuo pipefail; source "{REPO_ROOT}/lib/flash.sh"; rvdk_flash_main p4 sd /dev/disk4 --image "{img_5m}" -y',
+            env={**base_env, "RVDK_BOARDS_DIR": str(boards_dir_def)},
+        )
+        assert fail_def.returncode != 0
+        assert "(< 100 MiB)" in fail_def.stderr

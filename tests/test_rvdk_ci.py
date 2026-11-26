@@ -148,10 +148,68 @@ class TestCheckManifests:
         errs = rvdk_ci.check_manifests(repo)
         assert any("expected schema_version == 1" in e for e in errs)
 
+    def test_valid_riscv32_sd_bootstrap_with_arch_and_min_image_mib(self, tmp_path: Path) -> None:
+        media = {
+            "sd": {
+                "mode": "sd_bootstrap",
+                "script": "flash-sd.sh",
+                "root_label": "RVDK_P4_SD",
+                "min_size_gib": 4,
+                "min_image_mib": 4,
+            }
+        }
+        repo = _make_manifest_repo(
+            tmp_path,
+            media=media,
+            manifest_overrides={"arch": "riscv32"},
+        )
+        assert rvdk_ci.check_manifests(repo) == []
+
+    def test_valid_riscv64_arch_passes(self, tmp_path: Path) -> None:
+        repo = _make_manifest_repo(tmp_path, manifest_overrides={"arch": "riscv64"})
+        assert rvdk_ci.check_manifests(repo) == []
+
+    @pytest.mark.parametrize("bad_arch", ["amd64", "x86_64", "arm64", 123, True])
+    def test_invalid_arch_rejected(self, tmp_path: Path, bad_arch: object) -> None:
+        repo = _make_manifest_repo(tmp_path, manifest_overrides={"arch": bad_arch})
+        errs = rvdk_ci.check_manifests(repo)
+        assert len(errs) == 1
+        assert "optional 'arch'" in errs[0]
+
+    @pytest.mark.parametrize("bad_min_mib", [0, -4, True, False, "4", 4.5])
+    def test_invalid_min_image_mib_rejected(self, tmp_path: Path, bad_min_mib: object) -> None:
+        media = {
+            "sd": {
+                "mode": "sd_bootstrap",
+                "script": "flash-sd.sh",
+                "min_image_mib": bad_min_mib,
+            }
+        }
+        repo = _make_manifest_repo(tmp_path, media=media)
+        errs = rvdk_ci.check_manifests(repo)
+        assert len(errs) == 1
+        assert "min_image_mib" in errs[0]
+
 
 class TestForbiddenBleedPatterns:
     def test_repo_has_no_forbidden_patterns(self) -> None:
         assert rvdk_ci.check_forbidden_patterns(REPO_ROOT) == []
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "Braker" + "Box",
+            "Braker" + "Bench",
+            "Lil" + "Snitch",
+            "Snitch" + "Bench",
+            "devbench-" + "p4",
+        ],
+    )
+    def test_new_downstream_iot_bleed_tokens_caught(self, tmp_path: Path, token: str) -> None:
+        (tmp_path / "script.sh").write_text(f"echo {token}\n", encoding="utf-8")
+        errs = rvdk_ci.check_forbidden_patterns(tmp_path)
+        assert len(errs) == 1
+        assert "script.sh:1:" in errs[0]
 
     @pytest.mark.parametrize(
         "token",

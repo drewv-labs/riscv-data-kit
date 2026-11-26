@@ -4,10 +4,10 @@
 # Path: riscv-data-kit/bootstrap.sh
 #
 # Usage (One-Shot Curl Day-0 OS + BSP Bootstrapper + CLI Install):
-#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-node --nopasswd [--deeptune] [--tune data|ai] [--with-tailscale]
+#   curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash -s -- --user rvadmin --hostname rv-node --nopasswd [--deeptune] [--tune data|ai|iot] [--with-tailscale]
 #
 # Usage (Local CLI after install-cli.sh or bootstrap.sh):
-#   sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update|uninstall] [--deeptune] [--tune data|ai] [--no-apt-update] [--with-tailscale] [--noprogbar]
+#   sudo rvdk [day0|bsp|os|deeptune|storage|postgresql|mods/*|utils/purge-user.sh|update|uninstall] [--deeptune] [--tune data|ai|iot] [--stage-dir <dir>] [--no-apt-update] [--with-tailscale] [--noprogbar]
 #   rvdk kit [status|--refresh|--env]
 #   sudo rvdk storage [status|grow|shrink|autotune] [--lv <name>] [--gb <N>|--mb <N>]
 #   sudo rvdk quirk <name|list> [off|on|toggle|status]
@@ -56,7 +56,7 @@ if [[ $# -gt 0 ]]; then
     done
     if [[ "$NEED_ROOT" == "true" ]]; then
         case "$1" in
-            flash)
+            flash|boards/*/flash-*.sh|boards/*/flash-*)
                 NEED_ROOT="false"
                 ;;
             kit)
@@ -67,20 +67,33 @@ if [[ $# -gt 0 ]]; then
                     done
                 fi
                 ;;
+            storage)
+                for _arg in "$@"; do
+                    case "$_arg" in
+                        status|--status|--dry-run) NEED_ROOT="false" ;;
+                    esac
+                done
+                ;;
             quirk|quirks)
                 case "${2:-list}" in
                     list|--list) NEED_ROOT="false" ;;
                     *)
-                        case "${3:-}" in
-                            status|--status|stat|check) NEED_ROOT="false" ;;
-                        esac
+                        for _arg in "$@"; do
+                            case "$_arg" in
+                                status|--status|stat|check|--stage-dir|--stage-dir=*|--stage-only|--dry-run)
+                                    NEED_ROOT="false"
+                                    ;;
+                            esac
+                        done
                         ;;
                 esac
                 ;;
             deeptune|deep-tune|bsp/deeptune|bsp/deep-tune)
                 for _arg in "$@"; do
                     case "$_arg" in
-                        status|--status) NEED_ROOT="false" ;;
+                        status|--status|--stage-dir|--stage-dir=*|--stage-only|--dry-run)
+                            NEED_ROOT="false"
+                            ;;
                     esac
                 done
                 ;;
@@ -90,6 +103,27 @@ if [[ $# -gt 0 ]]; then
                         -n|--dry-run) NEED_ROOT="false" ;;
                     esac
                 done
+                ;;
+            *)
+                for _arg in "$@"; do
+                    case "$_arg" in
+                        --stage-dir|--stage-dir=*|--stage-only|--dry-run)
+                            NEED_ROOT="false"
+                            ;;
+                        status|--status)
+                            case "$1" in
+                                bsp/*|boards/*|utils/*|util/*|install)
+                                    NEED_ROOT="false"
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                done
+                if [[ "$NEED_ROOT" == "true" && "$1" == "install" ]]; then
+                    case "${2:-}" in
+                        flash|boards/*/flash-*.sh|boards/*/flash-*) NEED_ROOT="false" ;;
+                    esac
+                fi
                 ;;
         esac
     fi
@@ -185,11 +219,11 @@ Core Commands:
   bsp                      Run Silicon BSP hardening (`bsp/<vendor>/<soc>/`)
   os                       Run OS normalization & IPv4 IP-Options Prerouting Drop Guard (`ip hdrlength > 20B`) & MPTCP Lockdown (`os/`)
   deeptune [--tune <t>]    Run multi-layer headless DeepTune (`os` -> `bsp` -> `boards`)
-                           Tunes: `data` (default) | `ai`, or `rvdk deeptune status`
+                           Tunes: `data` (default) | `ai` | `iot`, or `rvdk deeptune status`
   kit [status|--refresh]   Inspect or refresh cached hardware/OS Kit (`/etc/rvdk/kit.env`)
   storage <subcmd> [...]   Live LVM capacity manager (`status`, `grow`, `shrink`, `autotune`)
   quirk <name|list> [...]  Toggle board-specific hardware quirks (`boards/<board>/quirks/`)
-  flash <board> <medium>   Flash removable media on macOS/Linux (e.g. `rvdk flash p550 usb 4`)
+  flash <board> <medium>   Flash removable media on macOS/Linux (e.g. `rvdk flash p550 usb 4`, `rvdk flash p4 sd 4`)
   postgresql               Install or build PostgreSQL 18.6 (`--force-build` to compile)
   mods/<mod>               Converge storage/network mod (`nvme-4kn`, `btrfs-raid`, `mosquitto`, `ntfy`, `nfs-vault`, `tailscale`)
   utils/purge-user.sh      Migrate state & purge factory default user account
@@ -211,13 +245,14 @@ Day-0 / OS / BSP Stage Flags:
       --skip-upgrade       Skip initial full-upgrade on JH7110 Debian (BSP stage)
       --full-upgrade       Force apt-get full-upgrade re-run on JH7110 Debian (BSP stage)
       --debian-suite <s>   Target Debian suite on JH7110 (trixie|unstable) (BSP stage)
+      --stage-dir <dir>    Host-side staging directory for non-Linux/nommu targets (`esp32p4`)
 
 Global Add-On Flags:
-  --deeptune               Append multi-layer DeepTune to any Day-0 / BSP / Mod run
-  -t, --tune <data|ai>     Target workload tune (also implies --deeptune on non-deeptune commands)
-  --with-tailscale         Append Tailscale Mesh VPN module
-  --no-apt-update          Skip apt-get update calls
-  --noprogbar              Disable persistent bottom progress bar
+  --deeptune                 Append multi-layer DeepTune to any Day-0 / BSP / Mod run
+  -t, --tune <data|ai|iot>   Target workload tune (also implies --deeptune on non-deeptune commands)
+  --with-tailscale           Append Tailscale Mesh VPN module
+  --no-apt-update            Skip apt-get update calls
+  --noprogbar                Disable persistent bottom progress bar
 EOF
 }
 
@@ -308,8 +343,15 @@ if [[ -z "${_RVDK_KIT_SH_LOADED:-}" ]]; then
 fi
 
 # ==============================================================================
-# 2. Early Subcommands (`flash`, `kit`, `storage`, `quirk`, `utils/*`)
+# 2. Early Subcommands (`flash`, `kit`, `storage`, `quirk`, `bsp/*`, `boards/*`)
 # ==============================================================================
+
+# Reject absolute paths or path traversal in subcommand position before dispatch
+case "${1:-}" in
+    /*|*".."*)
+        log_fatal "Unsafe subcommand path rejected: $1"
+        ;;
+esac
 
 # 2.1 `rvdk flash [list | <board> <medium> <disk_or_flags...>]` (Host macOS/Linux Media Flashers)
 if [[ "${1:-}" == "flash" ]]; then
@@ -447,6 +489,60 @@ EOF
     exec bash "$QUIRK_SCRIPT" ${QUIRK_ARGS[@]+"${QUIRK_ARGS[@]}"}
 fi
 
+# 2.5 Direct BSP / Board / Quirk Script Dispatch:
+#     bsp/<vendor>/<soc>/<script>.sh
+#     boards/<vendor>/<board>/<script>.sh
+#     boards/<vendor>/<board>/quirks/<quirk>.sh
+_rvdk_dispatch_direct_script() {
+    local subcmd="$1"
+    shift || true
+
+    if [[ "$subcmd" == /* || "$subcmd" == *\\* || "$subcmd" =~ [[:cntrl:]] || "$subcmd" == *".."* || "$subcmd" == *"//"* || "$subcmd" == *"./"* || "$subcmd" == *"/." ]]; then
+        log_fatal "Unsafe subcommand path rejected: ${subcmd}"
+    fi
+
+    local re_bsp='^bsp/[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*\.sh$'
+    local re_board='^boards/[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*\.sh$'
+    local re_quirk='^boards/[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*/quirks/[a-zA-Z0-9][a-zA-Z0-9._-]*\.sh$'
+    if [[ ! "$subcmd" =~ $re_bsp && ! "$subcmd" =~ $re_board && ! "$subcmd" =~ $re_quirk ]]; then
+        log_fatal "Invalid BSP/board script subcommand: '${subcmd}' (expected bsp/<vendor>/<soc>/<script>.sh, boards/<vendor>/<board>/<script>.sh, or boards/<vendor>/<board>/quirks/<quirk>.sh)"
+    fi
+
+    local target="${LOCAL_ROOT}/${subcmd}"
+    [[ -f "$target" ]] || log_fatal "Script not found under ${LOCAL_ROOT}: ${subcmd}"
+
+    local root_real target_real
+    root_real="$(resolve_script_path "$LOCAL_ROOT")"
+    target_real="$(resolve_script_path "$target")"
+    if [[ "$target_real" != "${root_real}/bsp/"* && "$target_real" != "${root_real}/boards/"* ]]; then
+        log_fatal "Symlink escape outside ${root_real} rejected: ${subcmd}"
+    fi
+
+    _escalate_root_if_needed
+    exec bash "$target" "$@"
+}
+
+case "${1:-}" in
+    bsp/deeptune|bsp/deep-tune)
+        ;;
+    bsp/*|boards/*)
+        _direct_sub="$1"
+        shift
+        _rvdk_dispatch_direct_script "$_direct_sub" "$@"
+        ;;
+    install)
+        case "${2:-}" in
+            bsp/deeptune|bsp/deep-tune)
+                ;;
+            bsp/*|boards/*)
+                _direct_sub="$2"
+                shift 2
+                _rvdk_dispatch_direct_script "$_direct_sub" "$@"
+                ;;
+        esac
+        ;;
+esac
+
 # ==============================================================================
 # 3. Parse Standard Provisioning Subcommand & Stage-Classified Flags
 # ==============================================================================
@@ -494,6 +590,7 @@ esac
 CLI_SOC=""
 CLI_BOARD=""
 CLI_OS=""
+STAGE_DIR=""
 WITH_DEEPTUNE="false"
 DEEPTUNE_TUNE=""
 DEEPTUNE_STATUS_ONLY="false"
@@ -526,6 +623,13 @@ while [[ $# -gt 0 ]]; do
         --os)
             _require_opt_arg "$1" "${2:-}"
             CLI_OS="$2"; shift 2 ;;
+        --stage-dir)
+            _require_opt_arg "$1" "${2:-}"
+            STAGE_DIR="$2"; shift 2 ;;
+        --stage-dir=*)
+            STAGE_DIR="${1#*=}"
+            [[ -z "$STAGE_DIR" ]] && log_fatal "Option '--stage-dir=' requires a directory argument (try --help)"
+            shift ;;
         --no-apt-update|--skip-apt-update)
             export RVDK_NO_APT_UPDATE="1"
             COMMON_STAGE_ARGS+=("--no-apt-update")
@@ -551,9 +655,10 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --tune=*)
             DEEPTUNE_TUNE="${1#*=}"
+            [[ -z "$DEEPTUNE_TUNE" ]] && log_fatal "Option '--tune=' requires an argument (expected: data | ai | iot)"
             [[ "$MODULE" != "deeptune" ]] && WITH_DEEPTUNE="true"
             shift ;;
-        data|ai)
+        data|ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu)
             if [[ "$MODULE" == "deeptune" ]]; then
                 DEEPTUNE_TUNE="$1"
             elif [[ "$IS_CORE_STAGE" == "true" ]]; then
@@ -680,6 +785,31 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "$STAGE_DIR" ]]; then
+    if [[ "$STAGE_DIR" == "/" || "$STAGE_DIR" =~ [[:cntrl:]] ]]; then
+        log_fatal "Unsafe --stage-dir: '${STAGE_DIR}'."
+    fi
+    if [[ "$MODULE" == "os" ]]; then
+        log_fatal "Flag '--stage-dir' is not valid for 'rvdk os' (use 'rvdk deeptune', 'rvdk bsp', or 'rvdk day0')"
+    fi
+    if [[ "$MODULE" == "deeptune" || "$WITH_DEEPTUNE" == "true" ]]; then
+        DEEPTUNE_STAGE_ARGS+=("--stage-dir" "$STAGE_DIR")
+    fi
+    if [[ "$MODULE" == "day0" || "$MODULE" == "bsp" ]]; then
+        BSP_STAGE_ARGS+=("--stage-dir" "$STAGE_DIR")
+    fi
+    if [[ "$IS_CORE_STAGE" != "true" ]]; then
+        FORWARD_ARGS+=("--stage-dir" "$STAGE_DIR")
+    fi
+fi
+
+if [[ "$WANT_SUB_HELP" != "true" && -n "$DEEPTUNE_TUNE" ]]; then
+    case "$(tr '[:upper:]' '[:lower:]' <<< "$DEEPTUNE_TUNE")" in
+        data|ai|ml|edge-ai|edge-ml|iot|edge-iot|sensor|mcu) ;;
+        *) log_fatal "Invalid --tune '${DEEPTUNE_TUNE}' (expected: data | ai | iot)" ;;
+    esac
+fi
+
 # Reject stage-mismatched flags on single-stage invocations (`rvdk os` vs `rvdk bsp` vs `rvdk deeptune`)
 if [[ "$WANT_SUB_HELP" != "true" ]]; then
     if [[ "$MODULE" == "os" && ${#BSP_STAGE_ARGS[@]} -gt 0 ]]; then
@@ -744,15 +874,49 @@ if [[ "$WANT_SUB_HELP" == "true" ]]; then
     esac
 fi
 
-if [[ "$WANT_SUB_HELP" != "true" ]] && ! [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
-    _escalate_root_if_needed
-fi
+_rvdk_guard_nommu_modules() {
+    local arch="${RVDK_ARCH:-}"
+    local mmu="${RVDK_MMU:-}"
+    local soc_label="${BOARD_PATH:-${SOC_PATH:-unknown}}"
+    if [[ "$arch" == "riscv32" || "$mmu" == "none" ]]; then
+        if [[ "$WITH_TAILSCALE" == "true" ]]; then
+            log_fatal "Option '--with-tailscale' is unsupported on riscv32 / nommu (${soc_label}; arch=${arch:-unknown}, mmu=${mmu:-unknown}): Tailscale requires a Go linux/riscv64 runtime and MMU-backed Linux networking."
+        fi
+        case "$MODULE" in
+            postgresql|postgresql/*)
+                log_fatal "Module '${MODULE}' is unsupported on riscv32 / nommu (${soc_label}; arch=${arch:-unknown}, mmu=${mmu:-unknown}): PostgreSQL 18.6 io_uring requires riscv64 with hardware MMU (Sv39/Sv48/Sv57) and NVMe/LVM storage."
+                ;;
+            mods/nvme-4kn|mods/nvme-4kn/*|mods/btrfs-raid|mods/btrfs-raid/*|mods/nfs-vault|mods/nfs-vault/*)
+                log_fatal "Module '${MODULE}' is unsupported on riscv32 / nommu (${soc_label}; arch=${arch:-unknown}, mmu=${mmu:-unknown}): requires riscv64 with hardware MMU and PCIe/NVMe block storage."
+                ;;
+            mods/tailscale|mods/tailscale/*)
+                log_fatal "Module 'mods/tailscale' is unsupported on riscv32 / nommu (${soc_label}; arch=${arch:-unknown}, mmu=${mmu:-unknown}): Tailscale requires a Go linux/riscv64 runtime and MMU-backed Linux networking."
+                ;;
+            mods/ntfy|mods/ntfy/*)
+                log_fatal "Module '${MODULE}' is unsupported on riscv32 / nommu (${soc_label}; arch=${arch:-unknown}, mmu=${mmu:-unknown}): ntfy requires a Go linux/riscv64 runtime (GORISCV64) and MMU-backed Linux systemd service hosting."
+                ;;
+        esac
+    fi
+}
 
 # 4. Resolve Hardware & OS Kit (loads /etc/rvdk/kit.env fast-path or probes & caches)
 KIT_RESOLVE_ARGS=()
 [[ -n "$CLI_SOC" ]]   && KIT_RESOLVE_ARGS+=("--soc" "$CLI_SOC")
 [[ -n "$CLI_BOARD" ]] && KIT_RESOLVE_ARGS+=("--board" "$CLI_BOARD")
 [[ -n "$CLI_OS" ]]    && KIT_RESOLVE_ARGS+=("--os" "$CLI_OS")
+
+if [[ "$WANT_SUB_HELP" != "true" ]] && ! [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
+    if [[ "$NEED_ROOT" == "true" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+        (
+            rvdk_kit_resolve ${KIT_RESOLVE_ARGS[@]+"${KIT_RESOLVE_ARGS[@]}"} || true
+            SOC_PATH="${RVDK_SOC:-}"
+            BOARD_PATH="${RVDK_BOARD:-}"
+            _rvdk_guard_nommu_modules
+        ) || exit 1
+    fi
+    _escalate_root_if_needed
+fi
+
 rvdk_kit_resolve ${KIT_RESOLVE_ARGS[@]+"${KIT_RESOLVE_ARGS[@]}"}
 
 SOC_PATH="${RVDK_SOC:-}"
@@ -760,15 +924,19 @@ BOARD_PATH="${RVDK_BOARD:-}"
 OS_ID="${RVDK_OS_ID:-unknown}"
 DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
 
-[[ -z "$SOC_PATH" ]] && log_fatal "Unrecognized RISC-V Device Tree: '${DT_MODEL}'. Pass --soc <vendor/soc> or --board <board>."
-[[ -z "$OS_ID" || "$OS_ID" == "unknown" ]] && log_fatal "Cannot detect OS distribution. Pass --os <debian|ubuntu|bianbu|openwrt>."
+_rvdk_guard_nommu_modules
 
-DEEPTUNE_STATE_FILE="/etc/rvdk/deeptune.env"
+[[ -z "$SOC_PATH" ]] && log_fatal "Unrecognized RISC-V Device Tree: '${DT_MODEL}'. Pass --soc <vendor/soc> or --board <board>."
+[[ -z "$OS_ID" || "$OS_ID" == "unknown" ]] && log_fatal "Cannot detect OS distribution. Pass --os <debian|ubuntu|bianbu|openwrt|esp-idf|nuttx|buildroot|linux-nommu>."
+
+DEEPTUNE_STATE_FILE="${RVDK_DEEPTUNE_ENV:-/etc/rvdk/deeptune.env}"
 LEGACY_DEEPTUNE_STATE="/var/lib/rvdk/deeptune.conf"
 
 read_saved_tune() {
     local sf=""
-    if [[ -r "$DEEPTUNE_STATE_FILE" ]]; then
+    if [[ -n "$STAGE_DIR" && -r "${STAGE_DIR}/config/deeptune.env" ]]; then
+        sf="${STAGE_DIR}/config/deeptune.env"
+    elif [[ -r "$DEEPTUNE_STATE_FILE" ]]; then
         sf="$DEEPTUNE_STATE_FILE"
     elif [[ -r "$LEGACY_DEEPTUNE_STATE" ]]; then
         sf="$LEGACY_DEEPTUNE_STATE"
@@ -787,8 +955,16 @@ read_saved_tune() {
 # Handle `rvdk deeptune status` (read-only across all Kit layers)
 if [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
     SAVED_TUNE="$(read_saved_tune)"
-    THP_EN="$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo "unknown")"
-    THP_DEF="$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || echo "unknown")"
+    if [[ -d /sys/kernel/mm/transparent_hugepage ]]; then
+        THP_EN="$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo "unknown")"
+        THP_DEF="$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || echo "unknown")"
+    elif [[ "${RVDK_MMU:-}" == "none" ]]; then
+        THP_EN="unavailable (nommu)"
+        THP_DEF="unavailable (nommu)"
+    else
+        THP_EN="unknown"
+        THP_DEF="unknown"
+    fi
 
     DT_LAYERS=()
     while IFS= read -r s; do
@@ -797,13 +973,16 @@ if [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
     LAYERS_STR="$(IFS=' -> '; echo "${DT_LAYERS[*]:-none}")"
 
     printf "\033[1;36m[RVDK:DEEPTUNE]\033[0m Multi-Layer Kit DeepTune Status\n"
-    printf "  • Kit Identity      : board=%s | soc=%s | os=%s | nic=%s\n" "${BOARD_PATH:--}" "$SOC_PATH" "$OS_ID" "${RVDK_PRIMARY_NIC:-none}"
+    printf "  • Kit Identity      : board=%s | soc=%s | arch=%s | mmu=%s | os=%s | nic=%s\n" \
+        "${BOARD_PATH:--}" "$SOC_PATH" "${RVDK_ARCH:-unknown}" "${RVDK_MMU:-unknown}" "$OS_ID" "${RVDK_PRIMARY_NIC:-none}"
     printf "  • Active Workload   : %s\n" "${SAVED_TUNE:-unconfigured}"
     printf "  • DeepTune Chain    : %s\n" "$LAYERS_STR"
     printf "  • Layer 1 (OS THP)  : enabled=%s | defrag=%s\n" "$THP_EN" "$THP_DEF"
 
-    [[ -f "${LOCAL_ROOT}/bsp/${SOC_PATH}/deeptune.sh" ]] && bash "${LOCAL_ROOT}/bsp/${SOC_PATH}/deeptune.sh" status
-    [[ -n "$BOARD_PATH" && -f "${LOCAL_ROOT}/boards/${BOARD_PATH}/deeptune.sh" ]] && bash "${LOCAL_ROOT}/boards/${BOARD_PATH}/deeptune.sh" status
+    _dt_status_args=("status")
+    [[ -n "$STAGE_DIR" ]] && _dt_status_args+=("--stage-dir" "$STAGE_DIR")
+    [[ -f "${LOCAL_ROOT}/bsp/${SOC_PATH}/deeptune.sh" ]] && bash "${LOCAL_ROOT}/bsp/${SOC_PATH}/deeptune.sh" "${_dt_status_args[@]}"
+    [[ -n "$BOARD_PATH" && -f "${LOCAL_ROOT}/boards/${BOARD_PATH}/deeptune.sh" ]] && bash "${LOCAL_ROOT}/boards/${BOARD_PATH}/deeptune.sh" "${_dt_status_args[@]}"
     exit 0
 fi
 
@@ -895,9 +1074,10 @@ run_kit_deeptune() {
 
     local tune_mode tune_label
     case "$raw_tune" in
-        data)                  tune_mode="data"; tune_label="data" ;;
-        ai|ml|edge-ai|edge-ml) tune_mode="ai"; tune_label="ai" ;;
-        *) log_fatal "Invalid --tune '${raw_tune}' (expected: data | ai)" ;;
+        data)                    tune_mode="data"; tune_label="data" ;;
+        ai|ml|edge-ai|edge-ml)   tune_mode="ai";   tune_label="ai" ;;
+        iot|edge-iot|sensor|mcu) tune_mode="iot";  tune_label="iot" ;;
+        *) log_fatal "Invalid --tune '${raw_tune}' (expected: data | ai | iot)" ;;
     esac
 
     local dt_scripts=()
@@ -906,27 +1086,45 @@ run_kit_deeptune() {
         [[ -n "$s" ]] && dt_scripts+=("$s")
     done < <(rvdk_collect_deeptune_scripts "$LOCAL_ROOT")
 
-    if [[ ${#dt_scripts[@]} -eq 0 ]]; then
+    local exec_scripts=()
+    local rel
+    for s in ${dt_scripts[@]+"${dt_scripts[@]}"}; do
+        rel="${s#"${LOCAL_ROOT}"/}"
+        if [[ "$rel" == os/deeptune*.sh ]] && [[ -n "$STAGE_DIR" || ! -d /proc/sys || "$OS_ID" == "esp-idf" || "$OS_ID" == "nuttx" ]]; then
+            log_skip "Skipping ${rel} (stage-dir mode or Linux /proc/sys unavailable)"
+            continue
+        fi
+        exec_scripts+=("$s")
+    done
+
+    if [[ ${#exec_scripts[@]} -eq 0 ]]; then
         log_rvdk "[SKIP] No deeptune.sh layers found for ${SOC_PATH}"
         return 0
     fi
 
-    if [[ -n "$prev_tune" && "$prev_tune" != "$tune_label" ]]; then
-        log_rvdk "Flipping Kit DeepTune: '${prev_tune}' -> '${tune_label}' (${#dt_scripts[@]} layers)..."
-    else
-        log_rvdk "Applying Kit DeepTune (--tune ${tune_label} | ${#dt_scripts[@]} layers)..."
+    local effective_tune="$tune_label"
+    local effective_mode="$tune_mode"
+    if [[ "$SOC_PATH" == "espressif/esp32p4" && "$tune_label" == "data" ]]; then
+        effective_tune="iot"
+        effective_mode="iot"
     fi
 
-    local count="${#dt_scripts[@]}"
+    if [[ -n "$prev_tune" && "$prev_tune" != "$effective_tune" ]]; then
+        log_rvdk "Flipping Kit DeepTune: '${prev_tune}' -> '${effective_tune}' (${#exec_scripts[@]} layers)..."
+    else
+        log_rvdk "Applying Kit DeepTune (--tune ${effective_tune} | ${#exec_scripts[@]} layers)..."
+    fi
+
+    local count="${#exec_scripts[@]}"
     local idx=0
     local rel_layers=()
-    for s in "${dt_scripts[@]}"; do
+    for s in "${exec_scripts[@]}"; do
         sync_apt_stamp
         local l_base=$(( base_pct + (span_pct * idx) / count ))
         local l_next=$(( base_pct + (span_pct * (idx + 1)) / count ))
         local l_span=$(( l_next - l_base ))
         (( l_span < 1 )) && l_span=1
-        local rel="${s#"${LOCAL_ROOT}"/}"
+        rel="${s#"${LOCAL_ROOT}"/}"
         rel_layers+=("$rel")
 
         local layer_args=("--tune" "$tune_label")
@@ -934,21 +1132,48 @@ run_kit_deeptune() {
         [[ "${RVDK_NO_PROGBAR:-0}" == "1" ]] && layer_args+=("--noprogbar")
 
         log_rvdk "DeepTune Layer $((idx + 1))/${count}: ${rel} (--tune ${tune_label})..."
-        RVDK_TUNE="$tune_label" RVDK_PROG_BASE="$l_base" RVDK_PROG_SPAN="$l_span" \
-            bash "$s" "${layer_args[@]}" ${DEEPTUNE_STAGE_ARGS[@]+"${DEEPTUNE_STAGE_ARGS[@]}"}
+        if [[ "$rel" == os/deeptune*.sh ]]; then
+            RVDK_TUNE="$tune_label" RVDK_PROG_BASE="$l_base" RVDK_PROG_SPAN="$l_span" \
+                bash "$s" "${layer_args[@]}" ${DEEPTUNE_STAGE_ARGS[@]+"${DEEPTUNE_STAGE_ARGS[@]}"}
+        else
+            RVDK_TUNE="$tune_label" RVDK_PROG_BASE="$l_base" RVDK_PROG_SPAN="$l_span" \
+                bash "$s" "${layer_args[@]}" ${DEEPTUNE_STAGE_ARGS[@]+"${DEEPTUNE_STAGE_ARGS[@]}"}
+        fi
         idx=$((idx + 1))
     done
 
-    local layers_joined
-    layers_joined="$(IFS=','; echo "${rel_layers[*]}")"
-    rvdk_kv_write "$DEEPTUNE_STATE_FILE" 0644 "Managed by RVDK (rvdk deeptune)" \
-        "RVDK_TUNE=${tune_label}" \
-        "RVDK_TUNE_MODE=${tune_mode}" \
-        "RVDK_SOC=${SOC_PATH}" \
-        "RVDK_BOARD=${BOARD_PATH}" \
-        "RVDK_OS_ID=${OS_ID}" \
-        "RVDK_DEEPTUNE_LAYERS=${layers_joined}"
-    rm -f "$LEGACY_DEEPTUNE_STATE" 2>/dev/null || true
+    local state_target="$DEEPTUNE_STATE_FILE"
+    if [[ -n "$STAGE_DIR" ]]; then
+        state_target="${STAGE_DIR}/config/deeptune.env"
+    fi
+    local skip_state_write="false"
+    if [[ "$SOC_PATH" == "espressif/esp32p4" && -r "$state_target" ]]; then
+        local RVDK_TUNE="" RVDK_SDKCONFIG_FRAGMENT=""
+        if typeset -f rvdk_kv_load >/dev/null 2>&1; then
+            rvdk_kv_load "$state_target" RVDK_TUNE RVDK_SDKCONFIG_FRAGMENT || true
+        else
+            RVDK_TUNE="$(awk -F= '/^RVDK_TUNE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' "$state_target" 2>/dev/null || true)"
+            RVDK_SDKCONFIG_FRAGMENT="$(awk -F= '/^RVDK_SDKCONFIG_FRAGMENT=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' "$state_target" 2>/dev/null || true)"
+        fi
+        if [[ -n "$RVDK_SDKCONFIG_FRAGMENT" || "$RVDK_TUNE" == "$effective_tune" ]]; then
+            skip_state_write="true"
+        fi
+    fi
+
+    if [[ "$skip_state_write" != "true" ]]; then
+        local layers_joined
+        layers_joined="$(IFS=','; echo "${rel_layers[*]}")"
+        rvdk_kv_write "$state_target" 0644 "Managed by RVDK (rvdk deeptune)" \
+            "RVDK_TUNE=${effective_tune}" \
+            "RVDK_TUNE_MODE=${effective_mode}" \
+            "RVDK_SOC=${SOC_PATH}" \
+            "RVDK_BOARD=${BOARD_PATH}" \
+            "RVDK_OS_ID=${OS_ID}" \
+            "RVDK_DEEPTUNE_LAYERS=${layers_joined}"
+    fi
+    if [[ -z "$STAGE_DIR" ]]; then
+        rm -f "$LEGACY_DEEPTUNE_STATE" 2>/dev/null || true
+    fi
 }
 
 run_optional_deeptune() {
@@ -1003,31 +1228,43 @@ case "$MODULE" in
         else
             S1_SPAN=55; S2_BASE=55; S2_SPAN=45
         fi
-        OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
         BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
-        if bsp_requests_pre_os_order "$BSP_SCRIPT"; then
-            log_rvdk "Stage 1/2: Silicon BSP Pre-OS Hardening (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$BSP_SCRIPT" \
+        if [[ "$SOC_PATH" == "espressif/esp32p4" || "$OS_ID" == "esp-idf" || "$OS_ID" == "nuttx" || "$OS_ID" == "buildroot" || "$OS_ID" == "linux-nommu" ]]; then
+            log_skip "Skipping os/bootstrap-apt.sh for ${SOC_PATH} (os=${OS_ID}, arch=${RVDK_ARCH:-unknown}, mmu=${RVDK_MMU:-unknown})"
+            local_bsp_span=100
+            [[ "$WITH_DEEPTUNE" == "true" || "$WITH_TAILSCALE" == "true" ]] && local_bsp_span=75
+            log_rvdk "Stage 1/1: Silicon BSP Hardening (${BSP_SCRIPT})..."
+            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$local_bsp_span" bash "$BSP_SCRIPT" \
                 ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
                 ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
-            sync_apt_stamp
-            log_rvdk "Stage 2/2: OS Normalization & IPv4 IP-Options / MPTCP Guard (${OS_SCRIPT})..."
-            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" \
-                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
-                ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
         else
-            log_rvdk "Stage 1/2: OS Normalization & IPv4 IP-Options / MPTCP Guard (${OS_SCRIPT})..."
-            RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" \
-                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
-                ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
-            sync_apt_stamp
-            log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
-            RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" \
-                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
-                ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
+            OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
+            if bsp_requests_pre_os_order "$BSP_SCRIPT"; then
+                log_rvdk "Stage 1/2: Silicon BSP Pre-OS Hardening (${BSP_SCRIPT})..."
+                RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$BSP_SCRIPT" \
+                    ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                    ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
+                sync_apt_stamp
+                log_rvdk "Stage 2/2: OS Normalization & IPv4 IP-Options / MPTCP Guard (${OS_SCRIPT})..."
+                RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$OS_SCRIPT" \
+                    ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                    ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
+            else
+                log_rvdk "Stage 1/2: OS Normalization & IPv4 IP-Options / MPTCP Guard (${OS_SCRIPT})..."
+                RVDK_PROG_BASE=0 RVDK_PROG_SPAN="$S1_SPAN" bash "$OS_SCRIPT" \
+                    ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                    ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
+                sync_apt_stamp
+                log_rvdk "Stage 2/2: Silicon BSP Hardening (${BSP_SCRIPT})..."
+                RVDK_PROG_BASE="$S2_BASE" RVDK_PROG_SPAN="$S2_SPAN" bash "$BSP_SCRIPT" \
+                    ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                    ${BSP_STAGE_ARGS[@]+"${BSP_STAGE_ARGS[@]}"}
+            fi
         fi
-        # Refresh /etc/rvdk/kit.env after Day-0 networkd/interface changes
-        rvdk_kit_resolve --refresh
+        # Refresh /etc/rvdk/kit.env after Day-0 networkd/interface changes (skip on host-staged runs)
+        if [[ -z "$STAGE_DIR" ]]; then
+            rvdk_kit_resolve --refresh ${KIT_RESOLVE_ARGS[@]+"${KIT_RESOLVE_ARGS[@]}"}
+        fi
         run_addon_tail
         rvdk_prog 100 "Day-0 OS + Silicon BSP converged"
         ;;
@@ -1041,12 +1278,18 @@ case "$MODULE" in
         rvdk_prog 100 "Kit DeepTune (${BOARD_PATH:-$SOC_PATH}) converged"
         ;;
     os)
-        OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
-        bash "$OS_SCRIPT" \
-            ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
-            ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
-        run_addon_tail
-        rvdk_prog 100 "OS normalization converged"
+        if [[ "$SOC_PATH" == "espressif/esp32p4" || "${RVDK_ARCH:-}" == "riscv32" || "$OS_ID" == "esp-idf" || "$OS_ID" == "nuttx" || "$OS_ID" == "buildroot" || "$OS_ID" == "linux-nommu" ]]; then
+            log_skip "Skipping os/bootstrap-apt.sh for ${SOC_PATH} (os=${OS_ID}, arch=${RVDK_ARCH:-unknown}, mmu=${RVDK_MMU:-unknown})"
+            run_addon_tail
+            rvdk_prog 100 "OS stage skipped (non-APT target)"
+        else
+            OS_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/os")" || log_fatal "Missing OS script for ${OS_ID}"
+            bash "$OS_SCRIPT" \
+                ${COMMON_STAGE_ARGS[@]+"${COMMON_STAGE_ARGS[@]}"} \
+                ${OS_STAGE_ARGS[@]+"${OS_STAGE_ARGS[@]}"}
+            run_addon_tail
+            rvdk_prog 100 "OS normalization converged"
+        fi
         ;;
     bsp)
         BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
