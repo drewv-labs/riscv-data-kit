@@ -298,18 +298,21 @@ else
 
     rvdk_prog 60 "Tailscale: installing ${TS_VERSION} binaries & systemd units..."
     _TS_TMP_EXTRACT="$(mktemp -d)"
-    tar -xzf "$CACHED_TGZ" -C "$_TS_TMP_EXTRACT"
+    tar --no-same-owner --no-same-permissions -xzf "$CACHED_TGZ" -C "$_TS_TMP_EXTRACT"
     PKG_DIR="$(find "$_TS_TMP_EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -n1)"
-    if [[ -z "$PKG_DIR" || ! -f "${PKG_DIR}/tailscale" || ! -f "${PKG_DIR}/tailscaled" ]]; then
-        log_fatal "Unexpected archive layout inside ${CACHED_TGZ}"
+    if [[ -z "$PKG_DIR" || -L "$PKG_DIR" || ! -d "$PKG_DIR" || ! -f "${PKG_DIR}/tailscale" || -L "${PKG_DIR}/tailscale" || ! -f "${PKG_DIR}/tailscaled" || -L "${PKG_DIR}/tailscaled" || -L "${PKG_DIR}/systemd" ]]; then
+        log_fatal "Unexpected or symlinked archive layout inside ${CACHED_TGZ}"
     fi
 
     install -d -m 0755 /usr/bin /usr/sbin /etc/systemd/system /etc/default
-    install -m 0755 "${PKG_DIR}/tailscale" /usr/bin/tailscale
-    install -m 0755 "${PKG_DIR}/tailscaled" /usr/sbin/tailscaled
+    install -m 0755 -o root -g root "${PKG_DIR}/tailscale" /usr/bin/tailscale
+    install -m 0755 -o root -g root "${PKG_DIR}/tailscaled" /usr/sbin/tailscaled
     for unit_name in tailscaled.service tailscale-online.target tailscale-wait-online.service; do
+        if [[ -L "${PKG_DIR}/systemd/${unit_name}" ]]; then
+            log_fatal "Refusing symlinked systemd unit inside ${CACHED_TGZ}: ${unit_name}"
+        fi
         if [[ -f "${PKG_DIR}/systemd/${unit_name}" ]]; then
-            install -m 0644 "${PKG_DIR}/systemd/${unit_name}" "/etc/systemd/system/${unit_name}"
+            install -m 0644 -o root -g root "${PKG_DIR}/systemd/${unit_name}" "/etc/systemd/system/${unit_name}"
         fi
     done
     rm -rf "$_TS_TMP_EXTRACT"

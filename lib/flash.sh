@@ -37,9 +37,18 @@ _RVDK_FLASH_SH_LOADED=1
 _FLASH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _FLASH_REPO_ROOT="$(cd "${_FLASH_LIB_DIR}/.." && pwd)"
 
+# @RVDK_INLINE_LIBS: common storage_guard
 if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
-    # shellcheck source=lib/common.sh
-    source "${_FLASH_LIB_DIR}/common.sh"
+    if [[ -n "$_FLASH_LIB_DIR" && -f "${_FLASH_LIB_DIR}/common.sh" ]]; then
+        # shellcheck source=lib/common.sh
+        source "${_FLASH_LIB_DIR}/common.sh"
+    fi
+fi
+if [[ -z "${_RVDK_STORAGE_GUARD_SH_LOADED:-}" ]]; then
+    if [[ -n "$_FLASH_LIB_DIR" && -f "${_FLASH_LIB_DIR}/storage_guard.sh" ]]; then
+        # shellcheck source=lib/storage_guard.sh
+        source "${_FLASH_LIB_DIR}/storage_guard.sh"
+    fi
 fi
 rvdk_log_init "RVDK:FLASH"
 
@@ -228,6 +237,42 @@ _rvdk_udev_settle() {
     else
         sleep 1
     fi
+}
+
+_rvdk_flash_unmount_dev_children() {
+    local dev="$1"
+    local include_base="${2:-false}"
+    local child_part
+    while IFS= read -r child_part; do
+        [[ -n "$child_part" ]] || continue
+        _rvdk_run_priv umount "$child_part" 2>/dev/null || true
+    done < <(rvdk_list_child_partitions "$dev")
+    if [[ "$include_base" == "true" ]]; then
+        _rvdk_run_priv umount "$dev" 2>/dev/null || true
+    fi
+}
+
+_rvdk_flash_dev_in_target_set() {
+    local cand="$1"
+    local base_dev="$2"
+    shift 2
+    local cand_real base_real item item_real
+    cand_real="$(readlink -f "$cand" 2>/dev/null || printf '%s' "$cand")"
+    base_real="$(readlink -f "$base_dev" 2>/dev/null || printf '%s' "$base_dev")"
+    if [[ "$cand" == "$base_dev" || ( -n "$cand_real" && -n "$base_real" && "$cand_real" == "$base_real" ) ]]; then
+        return 0
+    fi
+    for item in "$@"; do
+        [[ -n "$item" ]] || continue
+        if [[ "$cand" == "$item" ]]; then
+            return 0
+        fi
+        item_real="$(readlink -f "$item" 2>/dev/null || printf '%s' "$item")"
+        if [[ -n "$cand_real" && -n "$item_real" && "$cand_real" == "$item_real" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 rvdk_flash_list() {
@@ -820,11 +865,7 @@ _rvdk_flash_postprocess_raw() {
     _rvdk_run_priv partprobe "$block_dev" 2>/dev/null || _rvdk_run_priv blockdev --rereadpt "$block_dev" 2>/dev/null || true
     _rvdk_udev_settle
 
-    local p_node
-    for p_node in "${block_dev}"*; do
-        [[ "$p_node" == "$block_dev" ]] && continue
-        _rvdk_run_priv umount "$p_node" 2>/dev/null || true
-    done
+    _rvdk_flash_unmount_dev_children "$block_dev" "false"
 
     # De-collide MBR 32-bit disk identifier when regenerating UUID so PARTUUID (`ubootpart=`) is unique across SD & eMMC
     if [[ "$regen_uuid" == "true" ]] && command -v sfdisk >/dev/null 2>&1; then
@@ -848,10 +889,10 @@ _rvdk_flash_postprocess_raw() {
     debugfs_bin="$(command -v debugfs || echo /sbin/debugfs)"
 
     local linux_parts=()
-    local lp_path lp_type
-    while IFS=' ' read -r lp_path lp_type; do
-        [[ "$lp_type" == "part" && -b "$lp_path" ]] && linux_parts+=("$lp_path")
-    done < <(lsblk -ln -o PATH,TYPE "$block_dev" 2>/dev/null || true)
+    local lp_path
+    while IFS= read -r lp_path; do
+        [[ -n "$lp_path" && -b "$lp_path" ]] && linux_parts+=("$lp_path")
+    done < <(rvdk_list_child_partitions "$block_dev")
 
     if (( ${#linux_parts[@]} == 0 )); then
         [[ -n "$root_label" && "$board_arch" != "riscv32" ]] && log_warn "No child partitions detected on ${block_dev}; skipping post-flash filesystem hygiene."
@@ -876,7 +917,10 @@ _rvdk_flash_postprocess_raw() {
     if [[ -n "$old_uuid" ]]; then
         local other_dev
         while IFS= read -r other_dev; do
-            [[ -z "$other_dev" || "$other_dev" == "$root_slice" || "$other_dev" == "${block_dev}"* ]] && continue
+            [[ -z "$other_dev" || "$other_dev" == "$root_slice" ]] && continue
+            if _rvdk_flash_dev_in_target_set "$other_dev" "$block_dev" "${linux_parts[@]}"; then
+                continue
+            fi
             uuid_collision="true"
             break
         done < <(_rvdk_run_priv blkid -t "UUID=${old_uuid}" -o device 2>/dev/null || true)
@@ -1336,7 +1380,6 @@ PY
         esac
         block_dev="$target_arg"
         raw_dev="$target_arg"
-        [[ ! -b "$block_dev" ]] && log_fatal "Block device not found: ${block_dev}"
 
         case "$block_dev" in
             *boot[0-9]|*rpmb)
@@ -1344,21 +1387,17 @@ PY
                 ;;
         esac
 
+        if [[ "$block_dev" == /* || -b "$block_dev" ]] && rvdk_device_backs_os_or_swap "$block_dev"; then
+            log_fatal "Safety Interlock: ${block_dev} backs a critical OS filesystem or active SWAP! Aborting."
+        fi
+
+        [[ ! -b "$block_dev" ]] && log_fatal "Block device not found: ${block_dev}"
+
         local dev_type=""
         dev_type="$(lsblk -dn -o TYPE "$block_dev" 2>/dev/null | head -n1 | xargs || true)"
         if [[ "$dev_type" == "part" ]]; then
             log_fatal "Specify a whole-disk block device, not partition '${block_dev}'."
         fi
-
-        local mnt
-        while IFS= read -r mnt; do
-            [[ -z "$mnt" ]] && continue
-            case "$mnt" in
-                /|/boot|/boot/*|/usr|/var|/home|"[SWAP]")
-                    log_fatal "Safety Interlock: ${block_dev} backs critical system mount/swap (${mnt})! Aborting."
-                    ;;
-            esac
-        done < <(lsblk -rn -o MOUNTPOINTS "$block_dev" 2>/dev/null || lsblk -rn -o MOUNTPOINT "$block_dev" 2>/dev/null || true)
 
         if [[ "$allow_non_removable" != "true" ]]; then
             local rm_flag hotplug_flag tran_type dev_base is_mmc_target="false"
@@ -1503,7 +1542,7 @@ PY
         local stage_dir="${cache_dir}/${board_tag}-${medium}-stage"
         mkdir -p "$stage_dir"
         local staged_img="${stage_dir}/${uboot_payload}"
-        local stage_stamp="${staged_img}.rvdk-stage.sha256"
+        local stage_stamp="${cache_dir}/${board_tag}-${medium}-stage.rvdk-stage.sha256"
 
         if [[ "$image_path" == "$staged_img" ]]; then
             log_info "Using uncompressed payload at ${staged_img}"
@@ -1530,10 +1569,12 @@ PY
             fi
 
             if [[ "$stage_reuse" == "true" ]]; then
+                rm -f "${staged_img}.rvdk-stage.sha256" 2>/dev/null || true
                 log_ok "Reusing verified decompressed staging payload: ${staged_img}"
             else
                 log_info "Decompressing U-Boot payload to ${staged_img}..."
                 _rvdk_flash_register_cleanup
+                rm -f "$stage_stamp" 2>/dev/null || true
                 find "$stage_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
                 local tmp_img decomp_rc=0
                 tmp_img="$(mktemp "${staged_img}.tmp.XXXXXX")"
@@ -1559,6 +1600,7 @@ PY
                 local staged_sha256
                 staged_sha256="$(rvdk_sha256_file "$staged_img")"
                 printf '%s %s\n' "$src_sha256" "$staged_sha256" | rvdk_atomic_write "$stage_stamp" 0644
+                chown "$REAL_USER" "$stage_stamp" 2>/dev/null || true
                 chown -R "$REAL_USER" "$stage_dir" 2>/dev/null || true
                 log_ok "Staged payload: ${staged_img}"
             fi
@@ -1576,10 +1618,7 @@ PY
             diskutil eject "$block_dev"
         else
             log_info "Unmounting ${block_dev}, formatting U-Boot ext4 (${fs_label}), and staging payload..."
-            local part
-            for part in "${block_dev}"*; do
-                _rvdk_run_priv umount "$part" 2>/dev/null || true
-            done
+            _rvdk_flash_unmount_dev_children "$block_dev" "true"
             _rvdk_run_priv wipefs -a "$block_dev"
             _rvdk_run_priv "$mkfs_ext4" -F -b 4096 -L "$fs_label" \
                 -O ^metadata_csum_seed,^orphan_file \
@@ -1600,10 +1639,7 @@ PY
             diskutil unmountDisk "$block_dev"
         else
             log_info "Unmounting active partitions on ${block_dev}..."
-            local part
-            for part in "${block_dev}"*; do
-                _rvdk_run_priv umount "$part" 2>/dev/null || true
-            done
+            _rvdk_flash_unmount_dev_children "$block_dev" "true"
         fi
 
         [[ "$need_sudo" == "true" ]] && sudo -v

@@ -302,6 +302,7 @@ class TestFstabConvergence:
         pass_script = f"""
 set -Eeuo pipefail
 source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/storage_guard.sh"
 {fn_body}
 converge_fstab_entry "LABEL=RVDK_NVME" "/mnt/nvme_data" "xfs" "{pri_entry}" "{fstab}"
 converge_fstab_entry "LABEL=RVDK_SECONDARY" "/mnt/nvme_secondary" "btrfs" "{sec_entry}" "{fstab}"
@@ -349,6 +350,7 @@ converge_fstab_entry "LABEL=RVDK_SECONDARY" "/mnt/nvme_secondary" "btrfs" "{sec_
         pass_script = f"""
 set -Eeuo pipefail
 source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/storage_guard.sh"
 {fn_body}
 _btrfs_converge_fstab_entry "LABEL=RVDK_RAID10" "/mnt/raid_warm" "{arr1}" "{fstab}"
 _btrfs_converge_fstab_entry "LABEL=RVDK_RAID1" "/mnt/raid_cold" "{arr2}" "{fstab}"
@@ -371,6 +373,45 @@ _btrfs_converge_fstab_entry "LABEL=RVDK_RAID1" "/mnt/raid_cold" "{arr2}" "{fstab
         run2 = _run_bash(pass_script, env=env)
         assert run2.returncode == 0, run2.stderr
         assert run2.stdout.count("[SKIP]") == 2
+        assert "[OK]" not in run2.stdout
+        assert fstab.read_text(encoding="utf-8") == expected
+        assert not spy_log.exists()
+
+    def test_rvdk_converge_fstab_entry_preserves_octal_040_escaped_mountpoints(self, tmp_path: Path) -> None:
+        bin_dir, spy_log = self._make_systemctl_spy(tmp_path)
+        fstab = tmp_path / "fstab"
+        fstab.write_text(
+            "# Header comment\n"
+            "UUID=root-1234  /  ext4  defaults  0  1\n"
+            r"LABEL=OLD_SPACE  /mnt/my\040data  ext4  defaults  0  2" + "\n"
+            r"LABEL=OTHER_SPACE  /mnt/other\040vol  xfs  defaults  0  2" + "\n",
+            encoding="utf-8",
+        )
+
+        new_entry = r"LABEL=RVDK_SPACE  /mnt/my\040data  xfs  rw,noatime,nodiratime,nofail  0  2"
+        pass_script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/storage_guard.sh"
+rvdk_converge_fstab_entry 'LABEL=RVDK_SPACE' '/mnt/my\\040data' 'xfs' '{new_entry}' "{fstab}"
+"""
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        run1 = _run_bash(pass_script, env=env)
+        assert run1.returncode == 0, run1.stderr
+        assert "[OK]" in run1.stdout
+        assert not spy_log.exists()
+
+        expected = (
+            "# Header comment\n"
+            "UUID=root-1234  /  ext4  defaults  0  1\n"
+            f"{new_entry}\n"
+            r"LABEL=OTHER_SPACE  /mnt/other\040vol  xfs  defaults  0  2" + "\n"
+        )
+        assert fstab.read_text(encoding="utf-8") == expected
+
+        run2 = _run_bash(pass_script, env=env)
+        assert run2.returncode == 0, run2.stderr
+        assert "[SKIP]" in run2.stdout
         assert "[OK]" not in run2.stdout
         assert fstab.read_text(encoding="utf-8") == expected
         assert not spy_log.exists()
@@ -1503,3 +1544,672 @@ _rvdk_prog_validate_sub_state "/run/rvdk/valid.state"
             env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
         )
         assert accept_proc.returncode == 0, accept_proc.stderr
+
+
+class TestRvdkJoinBy:
+    def test_empty_single_multichar_and_format_char_safety(self) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+printf 'ZERO=<%s>\\n' "$(rvdk_join_by " -> ")"
+printf 'ONE=<%s>\\n' "$(rvdk_join_by " -> " "alpha")"
+printf 'THREE=<%s>\\n' "$(rvdk_join_by " -> " "os/deeptune.sh" "bsp/k1/deeptune.sh" "boards/rv2/deeptune.sh")"
+printf 'FMT=<%s>\\n' "$(rvdk_join_by "%s%n" "%s_one" "%x_two" "plain\\\\three")"
+printf 'NOARGS=<%s>\\n' "$(rvdk_join_by)"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.splitlines() == [
+            "ZERO=<>",
+            "ONE=<alpha>",
+            "THREE=<os/deeptune.sh -> bsp/k1/deeptune.sh -> boards/rv2/deeptune.sh>",
+            r"FMT=<%s_one%s%n%x_two%s%nplain\three>",
+            "NOARGS=<>",
+        ]
+
+
+class TestRvdkSudoPreserve:
+    def _make_sudo_mock(
+        self,
+        tmp_path: Path,
+        *,
+        deny_setenv: bool = False,
+        simulate_env_reset: bool = True,
+    ) -> tuple[Path, Path, Path]:
+        bin_dir = tmp_path / "bin"
+        sudo_log = tmp_path / "sudo_invocations.log"
+        target_log = tmp_path / "target_runs.log"
+
+        _write_exe(
+            bin_dir / "sudo",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{sudo_log}"
+non_interactive=0
+validate_only=0
+preserve_csv=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n)
+            non_interactive=1
+            shift
+            ;;
+        -v)
+            validate_only=1
+            shift
+            ;;
+        -E)
+            printf 'sudo: -E must never be called\\n' >&2
+            exit 99
+            ;;
+        --preserve-env=*)
+            preserve_csv="${{1#--preserve-env=}}"
+            shift
+            ;;
+        --preserve-env)
+            preserve_csv="${{2:-}}"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+if [[ -n "$preserve_csv" && "{1 if deny_setenv else 0}" == "1" ]]; then
+    printf 'sudo: sorry, you are not allowed to set the following environment variables: %s\\n' "$preserve_csv" >&2
+    exit 1
+fi
+if [[ "$validate_only" == "1" ]]; then
+    exit 0
+fi
+if [[ "{1 if simulate_env_reset else 0}" == "1" ]]; then
+    clean_env=("PATH=/usr/bin:/bin")
+    if [[ -n "$preserve_csv" ]]; then
+        IFS=',' read -r -a keep_vars <<< "$preserve_csv"
+        for k in "${{keep_vars[@]}}"; do
+            if [[ -n "${{!k+x}}" ]]; then
+                clean_env+=("${{k}}=${{!k}}")
+            fi
+        done
+    fi
+    exec env -i "${{clean_env[@]}}" "$@"
+fi
+exec "$@"
+""",
+        )
+        return bin_dir, sudo_log, target_log
+
+    def test_excludes_dangerous_vars_and_preserves_allowlisted_rvdk_vars(self, tmp_path: Path) -> None:
+        bin_dir, sudo_log, _ = self._make_sudo_mock(tmp_path, deny_setenv=False)
+        probe_script = tmp_path / "probe.sh"
+        _write_exe(
+            probe_script,
+            """#!/usr/bin/env bash
+printf 'XDG=%s|LD=%s|BASH_ENV=%s|PROGBAR_LIB=%s|BOARD=%s|TUNE=%s|CACHE=%s\\n' \\
+    "${XDG_CACHE_HOME:-UNSET}" "${LD_PRELOAD:-UNSET}" "${BASH_ENV:-UNSET}" \\
+    "${RVDK_PROGBAR_LIB:-UNSET}" "${RVDK_BOARD:-UNSET}" "${RVDK_TUNE:-UNSET}" "${RVDK_CACHE_DIR:-UNSET}"
+""",
+        )
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "XDG_CACHE_HOME": "/tmp/evil_xdg",
+            "LD_PRELOAD": "/tmp/evil.so",
+            "LD_LIBRARY_PATH": "/tmp/evil_lib",
+            "BASH_ENV": "/tmp/evil_bashenv.sh",
+            "RVDK_PROGBAR_LIB": "/tmp/evil_progbar.sh",
+            "RVDK_APT_LIB": "/tmp/evil_apt.sh",
+            "RVDK_BOARD": "waveshare/esp32-p4-wifi6",
+            "RVDK_TUNE": "iot",
+            "RVDK_CACHE_DIR": "/var/cache/rvdk",
+        }
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_sudo_preserve "{BASH_BIN}" "{probe_script}"
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == (
+            "XDG=UNSET|LD=UNSET|BASH_ENV=UNSET|PROGBAR_LIB=UNSET|"
+            "BOARD=waveshare/esp32-p4-wifi6|TUNE=iot|CACHE=/var/cache/rvdk"
+        )
+        sudo_calls = sudo_log.read_text(encoding="utf-8").splitlines()
+        assert len(sudo_calls) == 2
+        assert "--preserve-env=" in sudo_calls[0]
+        assert "--preserve-env=" in sudo_calls[1]
+        for forbidden in ("XDG_CACHE_HOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "PATH", "RVDK_PROGBAR_LIB", "RVDK_APT_LIB"):
+            assert forbidden not in sudo_calls[1]
+        assert "RVDK_BOARD" in sudo_calls[1]
+        assert "RVDK_TUNE" in sudo_calls[1]
+        assert "RVDK_CACHE_DIR" in sudo_calls[1]
+
+    def test_no_double_execution_on_real_command_failure_when_setenv_allowed(self, tmp_path: Path) -> None:
+        bin_dir, _, target_log = self._make_sudo_mock(tmp_path, deny_setenv=False)
+        failing_script = tmp_path / "fail_once.sh"
+        _write_exe(
+            failing_script,
+            f"""#!/usr/bin/env bash
+printf 'RAN\\n' >> "{target_log}"
+exit 42
+""",
+        )
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_TUNE": "iot",
+        }
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rc=0
+rvdk_sudo_preserve "{BASH_BIN}" "{failing_script}" || rc=$?
+printf 'RC=%d\\n' "$rc"
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "RC=42"
+        assert target_log.read_text(encoding="utf-8").splitlines() == ["RAN"]
+
+    def test_setenv_fallback_runs_plain_sudo_once_even_on_command_failure(self, tmp_path: Path) -> None:
+        bin_dir, sudo_log, target_log = self._make_sudo_mock(tmp_path, deny_setenv=True)
+        failing_script = tmp_path / "fail_after_fallback.sh"
+        _write_exe(
+            failing_script,
+            f"""#!/usr/bin/env bash
+printf 'RAN\\n' >> "{target_log}"
+exit 17
+""",
+        )
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_TUNE": "iot",
+            "XDG_CACHE_HOME": "/tmp/evil_xdg",
+        }
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rc=0
+rvdk_sudo_preserve "{BASH_BIN}" "{failing_script}" || rc=$?
+printf 'RC=%d\\n' "$rc"
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "RC=17"
+        assert target_log.read_text(encoding="utf-8").splitlines() == ["RAN"]
+        calls = sudo_log.read_text(encoding="utf-8").splitlines()
+        assert "--preserve-env=" in calls[0]
+        assert calls[-1] == f"{BASH_BIN} {failing_script}"
+
+    def test_adopted_in_require_root_bootstrap_and_install_cli(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        sudo_log = tmp_path / "escalate.log"
+        _write_exe(
+            bin_dir / "sudo",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{sudo_log}"
+exit 0
+""",
+        )
+        if os.geteuid() == 0:
+            pytest.skip("Unprivileged escalation path requires non-root UID")
+
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "XDG_CACHE_HOME": "/tmp/evil_xdg",
+            "LD_PRELOAD": "/tmp/evil.so",
+            "RVDK_TUNE": "iot",
+            "RVDK_BOARD": "sifive/p550",
+        }
+
+        dummy_target = tmp_path / "dummy.sh"
+        _write_exe(dummy_target, "#!/usr/bin/env bash\nexit 0\n")
+
+        # 1. lib/common.sh rvdk_require_root
+        p_req = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_require_root "{dummy_target}" --flag
+""",
+            env=env,
+        )
+        assert p_req.returncode == 0, p_req.stderr
+
+        # 2. bootstrap.sh _escalate_root_if_needed (via `day0` unprivileged invocation)
+        p_boot = subprocess.run(
+            [BASH_BIN, str(REPO_ROOT / "bootstrap.sh"), "day0", "--board", "p550", "--os", "debian"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert p_boot.returncode == 0, p_boot.stderr
+
+        # 3. install-cli.sh privilege escalation
+        p_inst = subprocess.run(
+            [BASH_BIN, str(REPO_ROOT / "install-cli.sh"), "--quiet"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert p_inst.returncode == 0, p_inst.stderr
+
+        log_lines = sudo_log.read_text(encoding="utf-8").splitlines()
+        assert len(log_lines) == 6  # 3 probes + 3 escalated invocations
+        for line in log_lines:
+            assert " -E " not in f" {line} "
+            assert "XDG_CACHE_HOME" not in line
+            assert "LD_PRELOAD" not in line
+            assert "--preserve-env=" in line
+            assert "RVDK_TUNE" in line
+            assert "RVDK_BOARD" in line
+
+
+class TestRvdkBackupFile:
+    def test_first_touch_orig_and_path_sidecar_idempotency_and_symlink_rejection(self, tmp_path: Path) -> None:
+        backup_root = tmp_path / "backups"
+        target_dir = tmp_path / "etc__like" / "sub__dir"
+        target_dir.mkdir(parents=True)
+        src_file = target_dir / "test__mod.conf"
+        src_file.write_text("original-content\n", encoding="utf-8")
+        src_file.chmod(0o640)
+
+        sym_file = target_dir / "sym.conf"
+        sym_file.symlink_to(src_file)
+
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+export RVDK_BACKUP_ROOT="{backup_root}"
+rvdk_backup_file "{src_file}"
+printf 'MUTATED\n' > "{src_file}"
+rvdk_backup_file "{src_file}"
+! rvdk_backup_file "{sym_file}"
+! rvdk_backup_file "relative/path.conf"
+! rvdk_backup_file "{src_file}" "../evil"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+
+        encoded = str(src_file).lstrip("/").replace("/", "__")
+        orig_path = backup_root / "deeptune" / f"{encoded}.orig"
+        sidecar_path = backup_root / "deeptune" / f"{encoded}.path"
+
+        assert orig_path.is_file() and not orig_path.is_symlink()
+        assert orig_path.read_text(encoding="utf-8") == "original-content\n"
+        assert sidecar_path.is_file() and not sidecar_path.is_symlink()
+        assert (sidecar_path.stat().st_mode & 0o777) == 0o644
+        assert sidecar_path.read_text(encoding="utf-8") == f"{src_file}\n"
+
+
+class TestMotdSecurityAndRendering:
+    def _render_motd_script(self, tmp_path: Path) -> Path:
+        motd_sh = tmp_path / "motd_render.sh"
+        gen = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/motd.sh"
+{{
+    printf '#!/bin/sh\\n'
+    _rvdk_emit_motd_renderer_body
+    printf '_rvdk_motd_render\\n'
+}} > "{motd_sh}"
+chmod +x "{motd_sh}"
+"""
+        )
+        assert gen.returncode == 0, gen.stderr
+        return motd_sh
+
+    @pytest.mark.parametrize("bad_board", ["../../tmp", "../etc", "foo/..", "./foo", "foo/.", "a/b/c", "foo/bar;id"])
+    def test_rejects_traversal_in_kit_board_before_motd_quirks_exec(
+        self, tmp_path: Path, bad_board: str
+    ) -> None:
+        motd_sh = self._render_motd_script(tmp_path)
+        eng_dir = tmp_path / "engine"
+        pwn_flag = tmp_path / "pwned_motd"
+
+        # Place canary scripts at every target the traversal could reach
+        for canary_dir in (
+            tmp_path / "tmp",
+            tmp_path / "etc",
+            eng_dir / "boards",
+            eng_dir / "boards" / "foo",
+            eng_dir / "boards" / "a" / "b" / "c",
+            eng_dir / "boards" / "foo" / "bar;id",
+            eng_dir / "boards" / ".." / ".." / "tmp",
+            eng_dir / "boards" / ".." / "etc",
+            eng_dir / "boards" / "foo" / "..",
+        ):
+            canary_dir.mkdir(parents=True, exist_ok=True)
+            _write_exe(
+                canary_dir / "motd-quirks.sh",
+                f"#!/bin/sh\ntouch '{pwn_flag}'\necho PWNED\n",
+            )
+        # Also place directly under tmp_path / "motd-quirks.sh" for engine/boards/../../.. escapes
+        _write_exe(tmp_path / "motd-quirks.sh", f"#!/bin/sh\ntouch '{pwn_flag}'\necho PWNED\n")
+
+        kit_env = tmp_path / "kit.env"
+        kit_env.write_text(
+            'RVDK_KIT_SCHEMA="1"\n'
+            'RVDK_DT_MODEL="Test Board"\n'
+            'RVDK_SOC="spacemit/k1"\n'
+            f'RVDK_BOARD="{bad_board}"\n'
+            'RVDK_ARCH="riscv64"\n'
+            'RVDK_MMU="sv39"\n'
+            'RVDK_OS_ID="debian"\n',
+            encoding="utf-8",
+        )
+
+        run = subprocess.run(
+            ["/bin/sh", str(motd_sh)],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": os.environ["PATH"],
+                "RVDK_KIT_CACHE_FILE": str(kit_env),
+                "RVDK_DEEPTUNE_ENV": str(tmp_path / "no_dt.env"),
+                "RVDK_ENGINE_DIR": str(eng_dir),
+            },
+            check=False,
+        )
+        assert run.returncode == 0, run.stderr
+        assert not pwn_flag.exists()
+        assert "PWNED" not in run.stdout
+        assert "Board Quirks      : none" in run.stdout
+
+    def test_environ_awk_rendering_preserves_backslashes_and_escapes(self, tmp_path: Path) -> None:
+        motd_sh = self._render_motd_script(tmp_path)
+        eng_dir = tmp_path / "engine"
+        quirk_script = eng_dir / "boards" / "acme" / "board_1.2" / "motd-quirks.sh"
+        _write_exe(
+            quirk_script,
+            r"""#!/bin/sh
+printf '%s\n' 'hdmi:off\nfusb:on\tirq\\040\x41'
+""",
+        )
+        kit_path = tmp_path / "kit\\npath\\test.env"
+        kit_path.write_text(
+            'RVDK_KIT_SCHEMA="1"\n'
+            'RVDK_DT_MODEL="Acme Backslash\\\\Model"\n'
+            'RVDK_SOC="spacemit/k1"\n'
+            'RVDK_SOC_SLUG="spacemit-k1"\n'
+            'RVDK_BOARD="acme/board_1.2"\n'
+            'RVDK_BOARD_TAG="b12"\n'
+            'RVDK_ARCH="riscv64"\n'
+            'RVDK_MMU="sv39"\n'
+            'RVDK_OS_ID="debian"\n'
+            'RVDK_OS_VERSION_ID="12"\n'
+            'RVDK_PRIMARY_NIC="end0"\n'
+            'RVDK_CPU_HARTS="8"\n'
+            r'RVDK_DEEPTUNE_CHAIN="os\ndeeptune.sh -> bsp\tlayer\\1"' + "\n",
+            encoding="utf-8",
+        )
+
+        run = subprocess.run(
+            ["/bin/sh", str(motd_sh)],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": os.environ["PATH"],
+                "RVDK_KIT_CACHE_FILE": str(kit_path),
+                "RVDK_DEEPTUNE_ENV": str(tmp_path / "no_dt.env"),
+                "RVDK_ENGINE_DIR": str(eng_dir),
+            },
+            check=False,
+        )
+        assert run.returncode == 0, run.stderr
+        assert f"  • Kit Cache File    : {kit_path} (cached)" in run.stdout
+        assert r"  • Device Tree Model : Acme Backslash\Model" in run.stdout
+        assert r"  • DeepTune Chain    : os\ndeeptune.sh -> bsp\tlayer\\1" in run.stdout
+        assert r"  • Board Quirks      : hdmi:off\nfusb:on\tirq\\040\x41" in run.stdout
+
+
+class TestBootstrapCapabilitiesAndEsp32P4Board:
+    def test_deeptune_status_joins_layers_with_multichar_arrow(self, tmp_path: Path) -> None:
+        repo = tmp_path / "rvdk"
+        shutil.copytree(REPO_ROOT / "lib", repo / "lib")
+        shutil.copy2(REPO_ROOT / "bootstrap.sh", repo / "bootstrap.sh")
+        (repo / "bootstrap.sh").chmod(0o755)
+        for rel in (
+            "os/deeptune.sh",
+            "bsp/spacemit/k1/deeptune.sh",
+            "boards/orangepi/rv2/deeptune.sh",
+        ):
+            _write_exe(repo / rel, "#!/usr/bin/env bash\necho \"status:$*\"\n")
+
+        dt_env = tmp_path / "deeptune.env"
+        dt_env.write_text('RVDK_TUNE="data"\n', encoding="utf-8")
+        proc = subprocess.run(
+            [
+                BASH_BIN,
+                str(repo / "bootstrap.sh"),
+                "deeptune",
+                "status",
+                "--board",
+                "rv2",
+                "--os",
+                "debian",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": os.environ["PATH"],
+                "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env"),
+                "RVDK_DEEPTUNE_ENV": str(dt_env),
+            },
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert (
+            "  • DeepTune Chain    : os/deeptune.sh -> bsp/spacemit/k1/deeptune.sh -> boards/orangepi/rv2/deeptune.sh"
+            in proc.stdout
+        )
+
+    def test_capability_based_nommu_and_riscv32_checks_without_esp32p4_soc(self, tmp_path: Path) -> None:
+        repo = tmp_path / "rvdk"
+        shutil.copytree(REPO_ROOT / "lib", repo / "lib")
+        shutil.copy2(REPO_ROOT / "bootstrap.sh", repo / "bootstrap.sh")
+        (repo / "bootstrap.sh").chmod(0o755)
+
+        spy_log = tmp_path / "cap_spy.log"
+        _write_exe(
+            repo / "os" / "bootstrap-apt.sh",
+            f"#!/usr/bin/env bash\necho OS_BOOTSTRAP >> '{spy_log}'\nexit 1\n",
+        )
+        _write_exe(
+            repo / "os" / "deeptune.sh",
+            f"#!/usr/bin/env bash\necho OS_DEEPTUNE >> '{spy_log}'\nexit 1\n",
+        )
+        _write_exe(
+            repo / "bsp" / "acme" / "nommu-soc" / "forge.sh",
+            f"#!/usr/bin/env bash\necho BSP_FORGE $* >> '{spy_log}'\n",
+        )
+        _write_exe(
+            repo / "bsp" / "acme" / "nommu-soc" / "deeptune.sh",
+            f"""#!/usr/bin/env bash
+echo BSP_DT $* >> '{spy_log}'
+stage_dir=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --stage-dir) stage_dir="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+mkdir -p "${{stage_dir}}/config"
+cat > "${{stage_dir}}/config/deeptune.env" <<'EOF'
+RVDK_TUNE="iot"
+RVDK_SDKCONFIG_FRAGMENT="custom.nommu.defaults"
+EOF
+""",
+        )
+
+        # Mock uname -m -> riscv32 on Linux so capability check triggers even with --os buildroot
+        bin_dir = tmp_path / "bin"
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-m" ]]; then
+    printf 'riscv32\\n'
+    exit 0
+fi
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+
+        stage_dir = tmp_path / "stage_nommu"
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_KIT_CACHE_FILE": str(tmp_path / "none.env"),
+            "RVDK_DEEPTUNE_ENV": str(tmp_path / "none_dt.env"),
+        }
+
+        # 1. day0 with non-esp32p4 SoC + --tune data + --os linux-nommu
+        p_day0 = subprocess.run(
+            [
+                BASH_BIN,
+                str(repo / "bootstrap.sh"),
+                "day0",
+                "--soc",
+                "acme/nommu-soc",
+                "--board",
+                "acme/nommu-board",
+                "--os",
+                "linux-nommu",
+                "--tune",
+                "data",
+                "--stage-dir",
+                str(stage_dir),
+                "--noprogbar",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert p_day0.returncode == 0, p_day0.stderr
+        assert "Skipping os/bootstrap-apt.sh" in p_day0.stdout
+        dt_env_text = (stage_dir / "config" / "deeptune.env").read_text(encoding="utf-8")
+        assert 'RVDK_SDKCONFIG_FRAGMENT="custom.nommu.defaults"' in dt_env_text
+        assert 'RVDK_TUNE="iot"' in dt_env_text
+        calls = spy_log.read_text(encoding="utf-8").splitlines()
+        assert not any(c.startswith("OS_") for c in calls)
+        assert any(c.startswith("BSP_FORGE") for c in calls)
+        assert any(c.startswith("BSP_DT") for c in calls)
+
+        # 2. `os` stage skips os/bootstrap-apt.sh based on capability (arch=riscv32 / mmu=none)
+        boot_os_copy = repo / "bootstrap_os_unpriv.sh"
+        boot_src = (REPO_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+        assert 'NEED_ROOT="true"' in boot_src
+        boot_os_copy.write_text(boot_src.replace('NEED_ROOT="true"', 'NEED_ROOT="false"', 1), encoding="utf-8")
+        boot_os_copy.chmod(0o755)
+        p_os = subprocess.run(
+            [
+                BASH_BIN,
+                str(boot_os_copy),
+                "os",
+                "--soc",
+                "acme/nommu-soc",
+                "--board",
+                "acme/nommu-board",
+                "--os",
+                "buildroot",
+                "--noprogbar",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **env,
+                "RVDK_APT_STAMP_FILE": str(tmp_path / "apt.stamp"),
+            },
+            check=False,
+        )
+        assert p_os.returncode == 0, p_os.stderr
+        assert "Skipping os/bootstrap-apt.sh" in p_os.stdout
+        assert not spy_log.exists() or "OS_BOOTSTRAP" not in spy_log.read_text(encoding="utf-8")
+
+    def test_esp32p4_forge_respects_rvdk_board_and_cli_board_with_default_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        forge = REPO_ROOT / "bsp" / "espressif" / "esp32p4" / "forge.sh"
+
+        # 1. RVDK_BOARD override
+        stage_env = tmp_path / "stage_env"
+        p_env = subprocess.run(
+            [BASH_BIN, str(forge), "--stage-dir", str(stage_env), "--noprogbar"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": f"{Path(BASH_BIN).parent}:{os.environ['PATH']}",
+                "RVDK_BOARD": "acme/p4-sensor-node",
+            },
+            check=False,
+        )
+        assert p_env.returncode == 0, p_env.stderr
+        kit_env = (stage_env / "config" / "rvdk-kit.env").read_text(encoding="utf-8")
+        assert 'RVDK_BOARD="acme/p4-sensor-node"' in kit_env
+        assert 'RVDK_BOARD_TAG="p4-sensor-node"' in kit_env
+
+        # 2. Explicit --board overrides RVDK_BOARD
+        stage_cli = tmp_path / "stage_cli"
+        p_cli = subprocess.run(
+            [BASH_BIN, str(forge), "--board", "acme/p4-cli-kit", "--stage-dir", str(stage_cli), "--noprogbar"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": f"{Path(BASH_BIN).parent}:{os.environ['PATH']}",
+                "RVDK_BOARD": "acme/p4-sensor-node",
+            },
+            check=False,
+        )
+        assert p_cli.returncode == 0, p_cli.stderr
+        kit_cli = (stage_cli / "config" / "rvdk-kit.env").read_text(encoding="utf-8")
+        assert 'RVDK_BOARD="acme/p4-cli-kit"' in kit_cli
+        assert 'RVDK_BOARD_TAG="p4-cli-kit"' in kit_cli
+
+        # 3. Neither set -> default waveshare/esp32-p4-wifi6
+        stage_def = tmp_path / "stage_def"
+        p_def = subprocess.run(
+            [BASH_BIN, str(forge), "--stage-dir", str(stage_def), "--noprogbar"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env={"PATH": f"{Path(BASH_BIN).parent}:{os.environ['PATH']}"},
+            check=False,
+        )
+        assert p_def.returncode == 0, p_def.stderr
+        kit_def = (stage_def / "config" / "rvdk-kit.env").read_text(encoding="utf-8")
+        assert 'RVDK_BOARD="waveshare/esp32-p4-wifi6"' in kit_def
+        assert 'RVDK_BOARD_TAG="p4"' in kit_def
+
+        # 4. Malformed traversal board rejected
+        p_bad = subprocess.run(
+            [BASH_BIN, str(forge), "--stage-dir", str(tmp_path / "stage_bad"), "--noprogbar"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": f"{Path(BASH_BIN).parent}:{os.environ['PATH']}",
+                "RVDK_BOARD": "../../etc",
+            },
+            check=False,
+        )
+        assert p_bad.returncode != 0

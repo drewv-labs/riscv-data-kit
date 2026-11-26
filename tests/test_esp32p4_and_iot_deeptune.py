@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OWNED_SH_FILES = [
     REPO_ROOT / "os" / "deeptune.sh",
     REPO_ROOT / "bsp" / "eswin" / "eic7700x" / "deeptune.sh",
+    REPO_ROOT / "bsp" / "eswin" / "eic7700x" / "bootstrap-ubuntu.sh",
     REPO_ROOT / "bsp" / "spacemit" / "k1" / "deeptune.sh",
     REPO_ROOT / "boards" / "sifive" / "p550" / "deeptune.sh",
     REPO_ROOT / "bsp" / "espressif" / "esp32p4" / "forge.sh",
@@ -690,3 +691,367 @@ class TestExistingLayersIotDeepTuneParity:
         )
         assert r_k1_fb.returncode == 0, r_k1_fb.stderr
         assert (cpu0 / "scaling_governor").read_text(encoding="utf-8").strip() == "ondemand"
+
+
+class TestDeepTuneSecurityReversibilityAndIsolation:
+    def _patch_eic_script(self, tmp_path: Path, fake_root: Path) -> Path:
+        src = (REPO_ROOT / "bsp" / "eswin" / "eic7700x" / "deeptune.sh").read_text(encoding="utf-8")
+        p_src = (
+            src.replace('if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then', "if false; then", 1)
+            .replace("/etc/modprobe.d", str(fake_root / "etc" / "modprobe.d"))
+            .replace("/etc/systemd/system", str(fake_root / "etc" / "systemd" / "system"))
+            .replace("/etc/default/cpufrequtils", str(fake_root / "etc" / "default" / "cpufrequtils"))
+            .replace("/etc/rvdk/deeptune.env", str(fake_root / "etc" / "rvdk" / "deeptune.env"))
+            .replace("/usr/local/sbin", str(fake_root / "usr" / "local" / "sbin"))
+            .replace("/sys/devices/system/cpu", str(fake_root / "sys" / "devices" / "system" / "cpu"))
+            .replace("/proc/modules", str(tmp_path / "no_modules"))
+            .replace("/proc/interrupts", str(tmp_path / "no_interrupts"))
+        )
+        patched = tmp_path / "eic_dt_test.sh"
+        patched.write_text(p_src, encoding="utf-8")
+        return patched
+
+    def _patch_k1_script(self, tmp_path: Path, fake_root: Path) -> Path:
+        src = (REPO_ROOT / "bsp" / "spacemit" / "k1" / "deeptune.sh").read_text(encoding="utf-8")
+        p_src = (
+            src.replace('if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then', "if false; then", 1)
+            .replace("/etc/modprobe.d", str(fake_root / "etc" / "modprobe.d"))
+            .replace("/etc/modules", str(fake_root / "etc" / "modules"))
+            .replace("/etc/systemd/system", str(fake_root / "etc" / "systemd" / "system"))
+            .replace("/lib/systemd/system", str(fake_root / "lib" / "systemd" / "system"))
+            .replace("/usr/lib/systemd/system", str(fake_root / "usr" / "lib" / "systemd" / "system"))
+            .replace("/etc/default/cpufrequtils", str(fake_root / "etc" / "default" / "cpufrequtils"))
+            .replace("/etc/rvdk/deeptune.env", str(fake_root / "etc" / "rvdk" / "deeptune.env"))
+            .replace("/usr/local/sbin", str(fake_root / "usr" / "local" / "sbin"))
+            .replace("/sys/devices/system/cpu", str(fake_root / "sys" / "devices" / "system" / "cpu"))
+            .replace("/etc/openwrt_release", str(fake_root / "etc" / "openwrt_release"))
+            .replace("/proc/modules", str(tmp_path / "no_modules"))
+            .replace("/proc/interrupts", str(tmp_path / "no_interrupts"))
+        )
+        patched = tmp_path / "k1_dt_test.sh"
+        patched.write_text(p_src, encoding="utf-8")
+        return patched
+
+    def _setup_fake_bin(self, tmp_path: Path) -> Path:
+        bin_dir = tmp_path / "bin"
+        _write_exe(bin_dir / "systemctl", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "modprobe", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "pgrep", "#!/usr/bin/env bash\nexit 1\n")
+        return bin_dir
+
+    @pytest.mark.parametrize("target", ["eic7700x", "k1"])
+    @pytest.mark.parametrize("env_key", ["RVDK_PRIMARY_NIC", "RVDK_SECONDARY_NIC", "SECONDARY_NIC"])
+    def test_malicious_nic_fails_closed_without_command_injection(
+        self, tmp_path: Path, target: str, env_key: str
+    ) -> None:
+        fake_root = tmp_path / f"{target}_root"
+        (fake_root / "etc" / "modprobe.d").mkdir(parents=True)
+        (fake_root / "etc" / "systemd" / "system").mkdir(parents=True)
+        (fake_root / "usr" / "local" / "sbin").mkdir(parents=True)
+        bin_dir = self._setup_fake_bin(tmp_path)
+
+        if target == "eic7700x":
+            patched = self._patch_eic_script(tmp_path, fake_root)
+            soc = "eswin/eic7700x"
+            irq_helper = fake_root / "usr" / "local" / "sbin" / "rvdk-eic7700x-irq-tune"
+        else:
+            patched = self._patch_k1_script(tmp_path, fake_root)
+            soc = "spacemit/k1"
+            irq_helper = fake_root / "usr" / "local" / "sbin" / "rvdk-spacemit-k1-irq-tune"
+
+        pwn_tmp = tmp_path / "pwn"
+        for payload in (
+            f'end0"; touch {pwn_tmp}; #',
+            f"end0$(touch {pwn_tmp})",
+            "eth0123456789012",
+            "end0\ntouch /tmp/should_not_run",
+            "..",
+        ):
+            res = _run_script(
+                patched,
+                ["--tune", "data", "--force", "--noprogbar"],
+                env={
+                    "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    "RVDK_SOC": soc,
+                    "RVDK_OS_ID": "ubuntu",
+                    env_key: payload,
+                },
+            )
+            assert res.returncode != 0
+            assert "Invalid" in res.stderr
+            assert not pwn_tmp.exists()
+            assert not irq_helper.exists()
+
+        # Verify canonical payload string fails closed even without RVDK_KIT_SCHEMA pre-populated
+        canon_res = _run_script(
+            patched,
+            ["--tune", "data", "--force", "--noprogbar"],
+            env={
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "RVDK_SOC": soc,
+                "RVDK_OS_ID": "ubuntu",
+                env_key: 'end0"; touch /tmp/pwn; #',
+            },
+        )
+        assert canon_res.returncode != 0
+        assert "Invalid" in canon_res.stderr
+        assert not irq_helper.exists()
+
+        # Valid NIC renders safely quoted helper and executes cleanly
+        valid_res = _run_script(
+            patched,
+            ["--tune", "data", "--force", "--noprogbar"],
+            env={
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "RVDK_KIT_SCHEMA": "1",
+                "RVDK_SOC": soc,
+                "RVDK_OS_ID": "ubuntu",
+                "RVDK_PRIMARY_NIC": "enp1s0f0",
+                "RVDK_SECONDARY_NIC": "enp2s0f0",
+            },
+        )
+        assert valid_res.returncode == 0, valid_res.stderr
+        assert irq_helper.is_file()
+        irq_text = irq_helper.read_text(encoding="utf-8")
+        assert "PRIMARY_NIC=enp1s0f0" in irq_text
+        assert 'pin_irq "$PRIMARY_NIC"' in irq_text
+        syn = subprocess.run([BASH_BIN, "-n", str(irq_helper)], capture_output=True, text=True, check=False)
+        assert syn.returncode == 0, syn.stderr
+
+    def test_k1_data_to_iot_restores_bcmdhd_with_backups_and_orangepi_guard(self, tmp_path: Path) -> None:
+        fake_root = tmp_path / "k1_root"
+        (fake_root / "etc" / "modprobe.d").mkdir(parents=True)
+        (fake_root / "etc" / "modules-load.d").mkdir(parents=True)
+        (fake_root / "etc" / "systemd" / "system").mkdir(parents=True)
+        (fake_root / "usr" / "local" / "sbin").mkdir(parents=True)
+
+        etc_modules = fake_root / "etc" / "modules"
+        orig_etc_modules = "loop\nbcmdhd\ndhd_static_buf nvram_path=/etc/fw.txt\n"
+        etc_modules.write_text(orig_etc_modules, encoding="utf-8")
+
+        opi_conf = fake_root / "etc" / "modules-load.d" / "orangepirv2.conf"
+        orig_opi_conf = "bcmdhd\n"
+        opi_conf.write_text(orig_opi_conf, encoding="utf-8")
+
+        backup_root = tmp_path / "backups"
+        bin_dir = self._setup_fake_bin(tmp_path)
+        patched = self._patch_k1_script(tmp_path, fake_root)
+
+        # 1. Orange Pi RV2: data -> disables bcmdhd/dhd_static_buf & writes pristine backups
+        opi_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_KIT_SCHEMA": "1",
+            "RVDK_SOC": "spacemit/k1",
+            "RVDK_BOARD": "orangepi/rv2",
+            "RVDK_OS_ID": "ubuntu",
+            "RVDK_PRIMARY_NIC": "end0",
+            "RVDK_BACKUP_ROOT": str(backup_root),
+        }
+        r_data = _run_script(patched, ["--tune", "data", "--force", "--noprogbar"], env=opi_env)
+        assert r_data.returncode == 0, r_data.stderr
+        assert "# disabled by RVDK spacemit/k1 deeptune" in etc_modules.read_text(encoding="utf-8")
+        assert "# disabled by RVDK spacemit/k1 deeptune" in opi_conf.read_text(encoding="utf-8")
+        assert "blacklist bcmdhd" in (fake_root / "etc" / "modprobe.d" / "90-rvdk-spacemit-k1-deeptune.conf").read_text(encoding="utf-8")
+
+        etc_enc = str(etc_modules).lstrip("/").replace("/", "__")
+        opi_enc = str(opi_conf).lstrip("/").replace("/", "__")
+        etc_orig = backup_root / "deeptune" / f"{etc_enc}.orig"
+        etc_sidecar = backup_root / "deeptune" / f"{etc_enc}.path"
+        opi_orig = backup_root / "deeptune" / f"{opi_enc}.orig"
+        assert etc_orig.read_text(encoding="utf-8") == orig_etc_modules
+        assert etc_sidecar.read_text(encoding="utf-8").strip() == str(etc_modules)
+        assert opi_orig.read_text(encoding="utf-8") == orig_opi_conf
+
+        # 2. Orange Pi RV2: data -> iot restores bcmdhd & dhd_static_buf cleanly
+        r_iot = _run_script(patched, ["--tune", "iot", "--force", "--noprogbar"], env=opi_env)
+        assert r_iot.returncode == 0, r_iot.stderr
+        assert etc_modules.read_text(encoding="utf-8") == orig_etc_modules
+        assert opi_conf.read_text(encoding="utf-8") == orig_opi_conf
+        assert "blacklist bcmdhd" not in (fake_root / "etc" / "modprobe.d" / "90-rvdk-spacemit-k1-deeptune.conf").read_text(encoding="utf-8")
+        assert etc_orig.read_text(encoding="utf-8") == orig_etc_modules
+
+        iot_unit = (fake_root / "etc" / "systemd" / "system" / "spacemit-k1-cpufreq-iot.service").read_text(encoding="utf-8")
+        irq_unit = (fake_root / "etc" / "systemd" / "system" / "spacemit-k1-irq-affinity.service").read_text(encoding="utf-8")
+        assert "orangepi-hardware-optimize.service" in iot_unit
+        assert "orangepi-hardware-optimize.service" in irq_unit
+
+        # 3. Repeat iot -> idempotent
+        r_iot2 = _run_script(patched, ["--tune", "iot", "--force", "--noprogbar"], env=opi_env)
+        assert r_iot2.returncode == 0, r_iot2.stderr
+        assert etc_modules.read_text(encoding="utf-8") == orig_etc_modules
+
+        # 4. Non-OrangePi board (bananapi/f3): never touches orangepirv2.conf or references orangepi-hardware-optimize.service
+        bpi_root = tmp_path / "bpi_root"
+        (bpi_root / "etc" / "modprobe.d").mkdir(parents=True)
+        (bpi_root / "etc" / "modules-load.d").mkdir(parents=True)
+        (bpi_root / "etc" / "systemd" / "system").mkdir(parents=True)
+        (bpi_root / "usr" / "local" / "sbin").mkdir(parents=True)
+        bpi_opi_conf = bpi_root / "etc" / "modules-load.d" / "orangepirv2.conf"
+        bpi_opi_conf.write_text("bcmdhd\n", encoding="utf-8")
+        bpi_patched = self._patch_k1_script(tmp_path, bpi_root)
+        bpi_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_KIT_SCHEMA": "1",
+            "RVDK_SOC": "spacemit/k1",
+            "RVDK_BOARD": "bananapi/f3",
+            "RVDK_DT_MODEL": "Banana Pi BPI-F3",
+            "RVDK_OS_ID": "ubuntu",
+            "RVDK_PRIMARY_NIC": "end0",
+            "RVDK_BACKUP_ROOT": str(backup_root),
+        }
+        r_bpi_data = _run_script(bpi_patched, ["--tune", "data", "--force", "--noprogbar"], env=bpi_env)
+        assert r_bpi_data.returncode == 0, r_bpi_data.stderr
+        assert bpi_opi_conf.read_text(encoding="utf-8") == "bcmdhd\n"
+        r_bpi_iot = _run_script(bpi_patched, ["--tune", "iot", "--force", "--noprogbar"], env=bpi_env)
+        assert r_bpi_iot.returncode == 0, r_bpi_iot.stderr
+        bpi_iot_unit = (bpi_root / "etc" / "systemd" / "system" / "spacemit-k1-cpufreq-iot.service").read_text(encoding="utf-8")
+        bpi_irq_unit = (bpi_root / "etc" / "systemd" / "system" / "spacemit-k1-irq-affinity.service").read_text(encoding="utf-8")
+        assert "orangepi-hardware-optimize.service" not in bpi_iot_unit
+        assert "orangepi-hardware-optimize.service" not in bpi_irq_unit
+
+    def test_p550_symmetric_hdmi_transition_and_idempotency(self, tmp_path: Path) -> None:
+        board_dir = tmp_path / "boards" / "sifive" / "p550"
+        quirks_dir = board_dir / "quirks"
+        quirks_dir.mkdir(parents=True)
+        hdmi_log = tmp_path / "hdmi_calls.log"
+        fusb_log = tmp_path / "fusb_calls.log"
+        plat_dir = tmp_path / "plat_drivers"
+        (plat_dir / "dw-hdmi-eswin" / "502a0000.hdmi").mkdir(parents=True)
+
+        _write_exe(
+            quirks_dir / "fusb.sh",
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{fusb_log}"\nexit 0\n',
+        )
+        _write_exe(
+            quirks_dir / "hdmi.sh",
+            f"""#!/usr/bin/env bash
+printf "%s\\n" "$*" >> "{hdmi_log}"
+if [[ "${{1:-}}" == "off" ]]; then
+    rm -rf "{plat_dir}/dw-hdmi-eswin/502a0000.hdmi"
+elif [[ "${{1:-}}" == "on" ]]; then
+    mkdir -p "{plat_dir}/dw-hdmi-eswin/502a0000.hdmi"
+fi
+exit 0
+""",
+        )
+
+        modprobe_dir = tmp_path / "etc" / "modprobe.d"
+        modprobe_dir.mkdir(parents=True)
+        dt_env = tmp_path / "etc" / "rvdk" / "deeptune.env"
+        dt_env.parent.mkdir(parents=True)
+        state_file = tmp_path / "run" / "rvdk-p550-hdmi.state"
+
+        src = (REPO_ROOT / "boards" / "sifive" / "p550" / "deeptune.sh").read_text(encoding="utf-8")
+        patched_src = (
+            src.replace('if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then', "if false; then", 1)
+            .replace("/etc/modprobe.d", str(modprobe_dir))
+            .replace("/etc/rvdk/deeptune.env", str(dt_env))
+            .replace("/proc/modules", str(tmp_path / "no_modules"))
+            .replace("/sys/bus/i2c/drivers/fusb303b", str(tmp_path / "no_i2c"))
+        )
+        patched = board_dir / "deeptune.sh"
+        patched.write_text(patched_src, encoding="utf-8")
+
+        env = {
+            "RVDK_P550_HDMI_STATE_FILE": str(state_file),
+            "RVDK_P550_PLAT_DRV_BASE": str(plat_dir),
+        }
+
+        # Initial --tune data: does not invoke hdmi.sh
+        r_data1 = _run_script(patched, ["--tune", "data", "--noprogbar"], env=env)
+        assert r_data1.returncode == 0, r_data1.stderr
+        assert not hdmi_log.exists()
+
+        # data -> iot: calls hdmi.sh off once
+        r_iot1 = _run_script(patched, ["--tune", "iot", "--noprogbar"], env=env)
+        assert r_iot1.returncode == 0, r_iot1.stderr
+        assert hdmi_log.read_text(encoding="utf-8").splitlines() == ["off"]
+
+        # iot -> iot: idempotent [SKIP], no extra call
+        r_iot2 = _run_script(patched, ["--tune", "iot", "--noprogbar"], env=env)
+        assert r_iot2.returncode == 0, r_iot2.stderr
+        assert hdmi_log.read_text(encoding="utf-8").splitlines() == ["off"]
+
+        # iot -> data: restores via hdmi.sh on
+        r_data2 = _run_script(patched, ["--tune", "data", "--noprogbar"], env=env)
+        assert r_data2.returncode == 0, r_data2.stderr
+        assert hdmi_log.read_text(encoding="utf-8").splitlines() == ["off", "on"]
+
+        # data -> data: idempotent [SKIP]
+        r_data3 = _run_script(patched, ["--tune", "data", "--noprogbar"], env=env)
+        assert r_data3.returncode == 0, r_data3.stderr
+        assert hdmi_log.read_text(encoding="utf-8").splitlines() == ["off", "on"]
+
+        # data -> iot -> ai -> ai
+        r_iot3 = _run_script(patched, ["--tune", "iot", "--noprogbar"], env=env)
+        assert r_iot3.returncode == 0, r_iot3.stderr
+        r_ai1 = _run_script(patched, ["--tune", "ai", "--noprogbar"], env=env)
+        assert r_ai1.returncode == 0, r_ai1.stderr
+        r_ai2 = _run_script(patched, ["--tune", "ai", "--noprogbar"], env=env)
+        assert r_ai2.returncode == 0, r_ai2.stderr
+        assert hdmi_log.read_text(encoding="utf-8").splitlines() == ["off", "on", "off", "on"]
+
+    def test_eic7700x_bootstrap_gates_fancontrol_to_sifive_p550(self, tmp_path: Path) -> None:
+        fake_root = tmp_path / "bsp_root"
+        (fake_root / "etc" / "apt" / "apt.conf.d").mkdir(parents=True)
+        (fake_root / "etc" / "sysctl.d").mkdir(parents=True)
+        (fake_root / "etc" / "systemd" / "system").mkdir(parents=True)
+        (fake_root / "etc" / "netplan").mkdir(parents=True)
+
+        apt_log = tmp_path / "apt_calls.log"
+        bin_dir = tmp_path / "bin"
+        _write_exe(bin_dir / "apt-cache", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "dpkg", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(bin_dir / "dpkg-query", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(
+            bin_dir / "apt-get",
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{apt_log}"\nexit 0\n',
+        )
+        _write_exe(bin_dir / "systemctl", "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"is-enabled\" ]]; then echo masked; fi\nexit 0\n")
+        _write_exe(bin_dir / "sysctl", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "ip", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(bin_dir / "locale", "#!/usr/bin/env bash\nprintf 'C.UTF-8\\n'\n")
+
+        src = (REPO_ROOT / "bsp" / "eswin" / "eic7700x" / "bootstrap-ubuntu.sh").read_text(encoding="utf-8")
+        # Render standalone so lib/apt.sh and lib/bsp.sh paths also redirect cleanly
+        rvdk_ci = _load_rvdk_ci()
+        rendered = rvdk_ci.render_standalone_script(src, REPO_ROOT)
+        p_rendered = (
+            rendered.replace('rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}', "true", 1)
+            .replace("/etc/apt/apt.conf.d", str(fake_root / "etc" / "apt" / "apt.conf.d"))
+            .replace("/etc/apt/sources.list", str(fake_root / "etc" / "apt" / "sources.list"))
+            .replace("/etc/sysctl.d", str(fake_root / "etc" / "sysctl.d"))
+            .replace("/etc/systemd/system", str(fake_root / "etc" / "systemd" / "system"))
+            .replace("/etc/default/cpufrequtils", str(fake_root / "etc" / "default" / "cpufrequtils"))
+            .replace("/etc/netplan", str(fake_root / "etc" / "netplan"))
+            .replace("/etc/network", str(fake_root / "etc" / "network"))
+            .replace("/etc/os-release", str(fake_root / "etc" / "os-release"))
+            .replace("/etc/ssl/certs/ca-certificates.crt", str(fake_root / "etc" / "ssl" / "ca.crt"))
+            .replace("/var/lib/apt/lists", str(fake_root / "var" / "lib" / "apt" / "lists"))
+            .replace("/var/lib/rvdk/backups", str(fake_root / "var" / "lib" / "rvdk" / "backups"))
+            .replace("/boot/extlinux/extlinux.conf", str(fake_root / "boot" / "extlinux" / "extlinux.conf"))
+            .replace("/boot/efi/extlinux.conf", str(fake_root / "boot" / "efi" / "extlinux.conf"))
+            .replace("/etc/openwrt_release", str(fake_root / "etc" / "openwrt_release"))
+            .replace("/proc/sys/kernel", str(tmp_path / "no_proc_sys_kernel"))
+        )
+        patched = tmp_path / "eic_bsp_test.sh"
+        patched.write_text(p_rendered, encoding="utf-8")
+
+        base_env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RVDK_NO_APT_UPDATE": "1", "RVDK_KEEP_VENDOR_MIRRORS": "1"}
+
+        # Non-P550 (milkv/megrez and unset): fancontrol-config-p550-premier must NOT be installed
+        r_megrez = _run_script(patched, ["--noprogbar"], env={**base_env, "RVDK_BOARD": "milkv/megrez"})
+        assert r_megrez.returncode == 0, r_megrez.stderr
+        assert "Skipping fancontrol-config-p550-premier" in r_megrez.stdout
+        assert not apt_log.exists()
+
+        r_unset = _run_script(patched, ["--noprogbar"], env=base_env)
+        assert r_unset.returncode == 0, r_unset.stderr
+        assert "Skipping fancontrol-config-p550-premier" in r_unset.stdout
+        assert not apt_log.exists()
+
+        # SiFive P550: fancontrol-config-p550-premier IS installed
+        r_p550 = _run_script(patched, ["--noprogbar"], env={**base_env, "RVDK_BOARD": "sifive/p550"})
+        assert r_p550.returncode == 0, r_p550.stderr
+        assert "Installed fancontrol-config-p550-premier" in r_p550.stdout
+        assert "fancontrol-config-p550-premier" in apt_log.read_text(encoding="utf-8")

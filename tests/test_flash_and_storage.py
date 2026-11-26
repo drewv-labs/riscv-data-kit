@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -191,7 +194,7 @@ rvdk_flash_main vf2 sd /dev/disk4 --image "{tiny_img}" -y
 class TestUbootExt4AtomicStaging:
     def _setup_p550_uboot_ext4_env(
         self, tmp_path: Path
-    ) -> tuple[dict[str, str], Path, Path, str, Path, Path, Path]:
+    ) -> tuple[dict[str, str], Path, Path, Path, str, Path, Path, Path, Path]:
         bin_dir = tmp_path / "bin"
         _make_darwin_uname_shim(bin_dir)
         _make_diskutil_shim(
@@ -207,10 +210,18 @@ class TestUbootExt4AtomicStaging:
 
         e2fs_prefix = tmp_path / "e2fsprogs"
         mkfs_log = tmp_path / "mkfs.log"
+        mkfs_contents_log = tmp_path / "mkfs_contents.log"
         _write_exe(
             e2fs_prefix / "sbin" / "mkfs.ext4",
             f"""#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "{mkfs_log}"
+prev=""
+for arg in "$@"; do
+    if [[ "$prev" == "-d" ]]; then
+        ls -A "$arg" >> "{mkfs_contents_log}"
+    fi
+    prev="$arg"
+done
 exit 0
 """,
         )
@@ -254,39 +265,46 @@ printf 'UBOOT_EXT4_STAGED_PAYLOAD_BYTES\\n'
         cache_dir = tmp_path / "cache"
         stage_dir = cache_dir / "p550-usb-stage"
         staged_img = stage_dir / "ubuntu-24.04-preinstalled-server-riscv64.img"
-        stage_stamp = stage_dir / "ubuntu-24.04-preinstalled-server-riscv64.img.rvdk-stage.sha256"
+        stage_stamp = cache_dir / "p550-usb-stage.rvdk-stage.sha256"
 
         env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "RVDK_CACHE_DIR": str(cache_dir),
         }
-        return env, src_img, staged_img, src_sha, stage_stamp, zstd_log, mkfs_log
+        return env, src_img, stage_dir, staged_img, src_sha, stage_stamp, zstd_log, mkfs_log, mkfs_contents_log
 
     def test_uboot_ext4_atomic_staging_create_reuse_and_recover(self, tmp_path: Path) -> None:
-        env, src_img, staged_img, src_sha, stage_stamp, zstd_log, mkfs_log = (
+        env, src_img, stage_dir, staged_img, src_sha, stage_stamp, zstd_log, mkfs_log, mkfs_contents_log = (
             self._setup_p550_uboot_ext4_env(tmp_path)
         )
         expected_staged_sha = hashlib.sha256(b"UBOOT_EXT4_STAGED_PAYLOAD_BYTES\n").hexdigest()
+        payload_name = "ubuntu-24.04-preinstalled-server-riscv64.img"
+        legacy_internal_stamp = stage_dir / f"{payload_name}.rvdk-stage.sha256"
 
         flash_cmd = f"""
 set -Eeuo pipefail
 source "{REPO_ROOT}/lib/flash.sh"
 rvdk_flash_main p550 usb /dev/disk4 --image "{src_img}" --sha256 "{src_sha}" -y
 """
-        # 1. Initial atomic decompression creates .rvdk-stage.sha256 (<src_sha256> <staged_sha256>)
+        # 1. Initial atomic decompression writes external .rvdk-stage.sha256 and leaves ONLY .img in stage_dir
         run1 = _run_bash(flash_cmd, env=env)
         assert run1.returncode == 0, run1.stderr
         assert staged_img.is_file()
         assert stage_stamp.is_file()
+        assert stage_stamp.parent != stage_dir
+        assert not legacy_internal_stamp.exists()
+        assert [p.name for p in stage_dir.iterdir()] == [payload_name]
         assert stage_stamp.read_text(encoding="utf-8").strip() == f"{src_sha} {expected_staged_sha}"
         assert len(zstd_log.read_text(encoding="utf-8").splitlines()) == 1
         assert "-O ^metadata_csum_seed,^orphan_file" in mkfs_log.read_text(encoding="utf-8")
 
-        # 2. Valid re-run reuses cached image without re-decompressing
+        # 2. Valid re-run reuses cached image without re-decompressing and purges any stale internal stamp
+        legacy_internal_stamp.write_text("stale\n", encoding="utf-8")
         run2 = _run_bash(flash_cmd, env=env)
         assert run2.returncode == 0, run2.stderr
         assert "Reusing verified decompressed staging payload" in run2.stdout
         assert len(zstd_log.read_text(encoding="utf-8").splitlines()) == 1
+        assert [p.name for p in stage_dir.iterdir()] == [payload_name]
 
         # 3. Tampered/truncated staged image is rejected with warning and atomically re-decompressed
         staged_img.write_bytes(b"CORRUPT")
@@ -295,6 +313,7 @@ rvdk_flash_main p550 usb /dev/disk4 --image "{src_img}" --sha256 "{src_sha}" -y
         assert "failed SHA-256 verification" in run3.stdout
         assert len(zstd_log.read_text(encoding="utf-8").splitlines()) == 2
         assert staged_img.read_bytes() == b"UBOOT_EXT4_STAGED_PAYLOAD_BYTES\n"
+        assert [p.name for p in stage_dir.iterdir()] == [payload_name]
         assert stage_stamp.read_text(encoding="utf-8").strip() == f"{src_sha} {expected_staged_sha}"
 
         # 4. Missing sidecar is rejected with warning and atomically re-decompressed
@@ -303,6 +322,7 @@ rvdk_flash_main p550 usb /dev/disk4 --image "{src_img}" --sha256 "{src_sha}" -y
         assert run4.returncode == 0, run4.stderr
         assert "is missing verification sidecar" in run4.stdout
         assert len(zstd_log.read_text(encoding="utf-8").splitlines()) == 3
+        assert [p.name for p in stage_dir.iterdir()] == [payload_name]
         assert stage_stamp.read_text(encoding="utf-8").strip() == f"{src_sha} {expected_staged_sha}"
 
         # 5. Mismatched sidecar is rejected with warning and atomically re-decompressed
@@ -311,7 +331,9 @@ rvdk_flash_main p550 usb /dev/disk4 --image "{src_img}" --sha256 "{src_sha}" -y
         assert run5.returncode == 0, run5.stderr
         assert "does not match source archive SHA-256" in run5.stdout
         assert len(zstd_log.read_text(encoding="utf-8").splitlines()) == 4
+        assert [p.name for p in stage_dir.iterdir()] == [payload_name]
         assert stage_stamp.read_text(encoding="utf-8").strip() == f"{src_sha} {expected_staged_sha}"
+        assert mkfs_contents_log.read_text(encoding="utf-8").splitlines() == [payload_name] * 5
 
 
 class TestRewriteLabelToken:
@@ -691,8 +713,6 @@ exit 0
         if min_image_mib is not None:
             sd_spec["min_image_mib"] = min_image_mib
 
-        import json
-
         manifest = {
             "schema_version": 1,
             "board": "waveshare/esp32-p4-wifi6",
@@ -861,3 +881,522 @@ exec "$@"
         )
         assert fail_def.returncode != 0
         assert "(< 100 MiB)" in fail_def.stderr
+
+
+def _load_rvdk_ci() -> ModuleType:
+    ci_path = REPO_ROOT / "tools" / "rvdk_ci.py"
+    spec = importlib.util.spec_from_file_location("rvdk_ci", ci_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _make_linux_uname_shim(bin_dir: Path) -> None:
+    real_uname = shutil.which("uname") or "/usr/bin/uname"
+    _write_exe(
+        bin_dir / "uname",
+        f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+    )
+
+
+class TestFlashPrefixGlobAndLinuxOsGuards:
+    def test_mmcblk1_never_unmounts_or_skips_uuid_collision_for_mmcblk10p1(
+        self, tmp_path: Path
+    ) -> None:
+        dev_dir = tmp_path / "dev"
+        dev_dir.mkdir()
+        mmc1 = dev_dir / "mmcblk1"
+        mmc1p1 = dev_dir / "mmcblk1p1"
+        mmc10 = dev_dir / "mmcblk10"
+        mmc10p1 = dev_dir / "mmcblk10p1"
+        for node in (mmc1, mmc1p1, mmc10, mmc10p1):
+            node.write_text("", encoding="utf-8")
+
+        rvdk_ci = _load_rvdk_ci()
+        flash_rendered = rvdk_ci.render_standalone_script(
+            (REPO_ROOT / "lib" / "flash.sh").read_text(encoding="utf-8"),
+            REPO_ROOT,
+        )
+        needle = '[[ -n "$lp_path" && -b "$lp_path" ]]'
+        assert needle in flash_rendered
+        patched_flash = tmp_path / "flash_standalone.sh"
+        patched_flash.write_text(
+            flash_rendered.replace(needle, '[[ -n "$lp_path" && -e "$lp_path" ]]', 1),
+            encoding="utf-8",
+        )
+
+        bin_dir = tmp_path / "bin"
+        _make_linux_uname_shim(bin_dir)
+        umount_log = tmp_path / "umount.log"
+        tune2fs_log = tmp_path / "tune2fs.log"
+        blkid_mode_file = tmp_path / "blkid_mode"
+        blkid_mode_file.write_text("collide", encoding="utf-8")
+        cur_label_file = tmp_path / "cur_label"
+        cur_label_file.write_text("armbi_root", encoding="utf-8")
+
+        _write_exe(bin_dir / "sudo", '#!/usr/bin/env bash\nexec "$@"\n')
+        _write_exe(bin_dir / "partprobe", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "blockdev", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "udevadm", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "sync", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "mount", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "e2fsck", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "debugfs", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "uuidgen",
+            "#!/usr/bin/env bash\nprintf '22222222-3333-4444-5555-666666666666\\n'\n",
+        )
+        _write_exe(
+            bin_dir / "umount",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{umount_log}"
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "lsblk",
+            f"""#!/usr/bin/env bash
+if [[ "$*" == *"PATH,TYPE"* ]]; then
+    printf '%s disk\\n%s part\\n' "{mmc1}" "{mmc1p1}"
+    exit 0
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "tune2fs",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{tune2fs_log}"
+if [[ "${{1:-}}" == "-l" ]]; then
+    lbl="$(cat "{cur_label_file}")"
+    cat <<EOF
+Filesystem volume name:   ${{lbl}}
+Filesystem magic number:  0xEF53
+Filesystem features:      has_journal ext_attr resize_inode metadata_csum
+Default mount options:    user_xattr acl
+Block count:              131072
+Block size:               4096
+EOF
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "e2label",
+            f"""#!/usr/bin/env bash
+if [[ $# -ge 2 ]]; then
+    printf '%s' "$2" > "{cur_label_file}"
+    exit 0
+fi
+cat "{cur_label_file}"
+printf '\\n'
+""",
+        )
+        _write_exe(
+            bin_dir / "blkid",
+            f"""#!/usr/bin/env bash
+case "$*" in
+    *"-s UUID -o value"*)
+        printf '11111111-2222-3333-4444-555555555555\\n'
+        ;;
+    *"-s LABEL -o value"*)
+        cat "{cur_label_file}"
+        printf '\\n'
+        ;;
+    *"-t UUID=11111111-2222-3333-4444-555555555555 -o device"*)
+        if [[ "$(cat "{blkid_mode_file}")" == "collide" ]]; then
+            printf '%s\\n%s\\n' "{mmc1p1}" "{mmc10p1}"
+        else
+            printf '%s\\n%s\\n' "{mmc1}" "{mmc1p1}"
+        fi
+        ;;
+esac
+exit 0
+""",
+        )
+
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        proc_collide = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{patched_flash}"
+_rvdk_flash_unmount_dev_children "{mmc1}" "true"
+_rvdk_flash_postprocess_raw "Linux" "{mmc1}" "1" "rvdk_sd_root" "false" "false" "riscv64"
+""",
+            env=env,
+        )
+        assert proc_collide.returncode == 0, proc_collide.stderr
+        umounted = umount_log.read_text(encoding="utf-8").splitlines()
+        assert str(mmc1p1) in umounted
+        assert str(mmc1) in umounted
+        assert all("mmcblk10" not in entry for entry in umounted), umounted
+        assert (
+            f"Assigned unique ext4 UUID on {mmc1p1}: 22222222-3333-4444-5555-666666666666"
+            in proc_collide.stdout
+        )
+        assert (
+            f"-U 22222222-3333-4444-5555-666666666666 {mmc1p1}"
+            in tune2fs_log.read_text(encoding="utf-8")
+        )
+
+        # Sibling partition/base device on the same disk does NOT trigger false collision
+        tune2fs_log.unlink()
+        cur_label_file.write_text("rvdk_sd_root", encoding="utf-8")
+        blkid_mode_file.write_text("self_only", encoding="utf-8")
+        proc_self = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{patched_flash}"
+_rvdk_flash_postprocess_raw "Linux" "{mmc1}" "1" "rvdk_sd_root" "false" "false" "riscv64"
+""",
+            env=env,
+        )
+        assert proc_self.returncode == 0, proc_self.stderr
+        assert "Assigned unique ext4 UUID" not in proc_self.stdout
+        assert "-U " not in tune2fs_log.read_text(encoding="utf-8")
+
+    def test_flash_emmc_and_flash_sd_never_unmount_mmcblk10p1_for_mmcblk1(
+        self, tmp_path: Path
+    ) -> None:
+        dev_dir = tmp_path / "dev"
+        dev_dir.mkdir()
+        mmc1 = dev_dir / "mmcblk1"
+        mmc1p1 = dev_dir / "mmcblk1p1"
+        mmc10p1 = dev_dir / "mmcblk10p1"
+        sd_root = dev_dir / "mmcblk0p1"
+        for node in (mmc1, mmc1p1, mmc10p1, sd_root):
+            node.write_text("", encoding="utf-8")
+
+        bin_dir = tmp_path / "bin"
+        _make_linux_uname_shim(bin_dir)
+        umount_log = tmp_path / "umount.log"
+        _write_exe(
+            bin_dir / "umount",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{umount_log}"
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "lsblk",
+            f"""#!/usr/bin/env bash
+case "$*" in
+    *"-rn -o PATH,TYPE"*)
+        printf '%s disk\\n%s part\\n' "{mmc1}" "{mmc1p1}"
+        ;;
+    *"-no PKNAME"*)
+        printf 'mmcblk0\\n'
+        ;;
+    *"-dn -o TYPE"*)
+        printf 'disk\\n'
+        ;;
+    *"-dn -o RM"*)
+        printf '1\\n'
+        ;;
+    *"-dn -o HOTPLUG"*)
+        printf '1\\n'
+        ;;
+    *"-dn -o TRAN"*)
+        printf 'mmc\\n'
+        ;;
+    *"-b -dn -o SIZE"*)
+        printf '8589934592\\n'
+        ;;
+    *"-dn -o SIZE"*)
+        printf '8G\\n'
+        ;;
+    *"-dn -o VENDOR,MODEL,SIZE"*)
+        printf 'Fake MMC 8G\\n'
+        ;;
+esac
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "findmnt",
+            f"""#!/usr/bin/env bash
+if [[ "$*" == *"-n -o SOURCE /"* && "$*" != *"/boot"* && "$*" != *"/usr"* && "$*" != *"/var"* && "$*" != *"/home"* && "$*" != *"/etc"* && "$*" != *"/opt"* && "$*" != *"/root"* && "$*" != *"/srv"* ]]; then
+    printf '%s\\n' "{sd_root}"
+fi
+exit 0
+""",
+        )
+        for cmd_name in ("partprobe", "blockdev", "udevadm", "wipefs", "parted", "mkfs.vfat", "mkfs.ext4", "mount", "cp", "sync", "eject", "rsync", "dd", "blkid", "e2label"):
+            _write_exe(bin_dir / cmd_name, "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "df", "#!/usr/bin/env bash\nprintf 'Filesystem 1M-blocks Used\\n/dev/root 8000 1000\\n'\n")
+        _write_exe(bin_dir / "sudo", '#!/usr/bin/env bash\nexec "$@"\n')
+        _write_exe(bin_dir / "id", '#!/usr/bin/env bash\nif [[ "${1:-}" == "-u" ]]; then printf "0\\n"; else printf "root\\n"; fi\n')
+
+        rvdk_ci = _load_rvdk_ci()
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RVDK_NO_PROGBAR": "1"}
+
+        # 1. boards/waveshare/esp32-p4-wifi6/flash-sd.sh unmount isolation
+        p4_src = rvdk_ci.render_standalone_script(
+            (REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "flash-sd.sh").read_text(
+                encoding="utf-8"
+            ),
+            REPO_ROOT,
+        )
+        p4_patched = tmp_path / "p4_flash_sd.sh"
+        p4_text = (
+            p4_src.replace('[[ -b "$arg" ]]', '[[ -e "$arg" ]]')
+            .replace('[[ -b "$PART_DEV" ]]', '[[ -e "$PART_DEV" ]]')
+            .replace('_stage_p4_tree "$STAGE_SOURCE"', 'mkdir -p "${STAGE_SOURCE}/config"')
+        )
+        p4_patched.write_text(p4_text, encoding="utf-8")
+        proc_p4 = _run_bash(f'bash "{p4_patched}" "{mmc1}" -y', env=env)
+        assert proc_p4.returncode == 0, proc_p4.stderr
+        p4_umounts = umount_log.read_text(encoding="utf-8").splitlines()
+        assert str(mmc1p1) in p4_umounts
+        assert str(mmc1) in p4_umounts
+        assert all("mmcblk10" not in entry for entry in p4_umounts), p4_umounts
+
+        # 2. boards/orangepi/rv2/flash-emmc.sh unmount isolation (stops cleanly at blkid empty UUID after unmount)
+        umount_log.unlink()
+        uboot_dir = tmp_path / "uboot"
+        uboot_dir.mkdir()
+        for fn in ("bootinfo_emmc.bin", "bootinfo_sd.bin", "FSBL.bin", "u-boot-opensbi.itb"):
+            (uboot_dir / fn).write_bytes(b"uboot")
+
+        emmc_src = rvdk_ci.render_standalone_script(
+            (REPO_ROOT / "boards" / "orangepi" / "rv2" / "flash-emmc.sh").read_text(
+                encoding="utf-8"
+            ),
+            REPO_ROOT,
+        )
+        emmc_patched = tmp_path / "rv2_flash_emmc.sh"
+        emmc_text = (
+            emmc_src.replace(
+                'rvdk_require_root "${BASH_SOURCE[0]:-}" ${orig_args[@]+"${orig_args[@]}"}',
+                "true",
+                1,
+            )
+            .replace('! -b "$live_root"', '! -e "$live_root"')
+            .replace('! -b "$target_dev"', '! -e "$target_dev"')
+            .replace('! -b "$emmc_part"', '! -e "$emmc_part"')
+            .replace("/usr/lib/u-boot/platform_install.sh", str(tmp_path / "no_platform_install.sh"))
+            .replace("/usr/lib/linux-u-boot-*", str(uboot_dir))
+            .replace("/etc/fstab", str(tmp_path / "no_fstab"))
+        )
+        emmc_patched.write_text(emmc_text, encoding="utf-8")
+        proc_emmc = _run_bash(f'bash "{emmc_patched}" --force -y "{mmc1}"', env=env)
+        # Fails later at empty blkid UUID, AFTER executing the unmount + parted steps
+        assert proc_emmc.returncode != 0
+        emmc_umounts = umount_log.read_text(encoding="utf-8").splitlines()
+        assert str(mmc1p1) in emmc_umounts
+        assert str(mmc1) in emmc_umounts
+        assert all("mmcblk10" not in entry for entry in emmc_umounts), emmc_umounts
+
+    def test_linux_flashers_reject_x0a_multimount_boot_bypass(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        _make_linux_uname_shim(bin_dir)
+        _write_exe(bin_dir / "findmnt", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "lsblk",
+            r"""#!/usr/bin/env bash
+if [[ "$*" == *"MOUNTPOINTS"* ]]; then
+    printf '%s\n' '/mnt/tmp\x0a/boot'
+    exit 0
+fi
+if [[ "$*" == *"-dn -o TYPE"* ]]; then
+    printf 'disk\n'
+    exit 0
+fi
+exit 0
+""",
+        )
+
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        tiny_img = tmp_path / "dummy.img"
+        tiny_img.write_bytes(b"dummy")
+
+        # 1. lib/flash.sh rejects \x0a-separated /mnt/tmp\x0a/boot
+        proc_flash = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/flash.sh"
+rvdk_flash_main vf2 sd /dev/sdb --image "{tiny_img}" -y
+""",
+            env=env,
+        )
+        assert proc_flash.returncode != 0
+        assert "Safety Interlock:" in proc_flash.stderr
+        assert "backs a critical OS filesystem or active SWAP" in proc_flash.stderr
+
+        # 2. boards/waveshare/esp32-p4-wifi6/flash-sd.sh rejects \x0a-separated /mnt/tmp\x0a/boot
+        flash_sd = REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "flash-sd.sh"
+        proc_sd = _run_bash(f'bash "{flash_sd}" /dev/sdb --dry-run', env=env)
+        assert proc_sd.returncode != 0
+        assert "Safety Interlock:" in proc_sd.stderr
+        assert "backs critical system mount" in proc_sd.stderr
+
+        # Verify flash-sd.sh does NOT trigger "${arg}"* false positive when '/' is /dev/mmcblk10p1 and arg is /dev/mmcblk1
+        bin_dir_pfx = tmp_path / "bin_pfx"
+        _make_linux_uname_shim(bin_dir_pfx)
+        _write_exe(
+            bin_dir_pfx / "findmnt",
+            """#!/usr/bin/env bash
+if [[ "$*" == *"-rn -o TARGET,SOURCE"* ]]; then
+    printf '/ /dev/mmcblk10p1\\n'
+elif [[ "$*" == *"-n -o SOURCE /"* && "$*" != *"/boot"* && "$*" != *"/usr"* && "$*" != *"/var"* && "$*" != *"/home"* && "$*" != *"/etc"* && "$*" != *"/opt"* && "$*" != *"/root"* && "$*" != *"/srv"* ]]; then
+    printf '/dev/mmcblk10p1\\n'
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir_pfx / "lsblk",
+            """#!/usr/bin/env bash
+if [[ "$*" == *"PKNAME"* ]]; then
+    printf 'mmcblk10\\n'
+fi
+exit 0
+""",
+        )
+        pfx_env = {"PATH": f"{bin_dir_pfx}:{os.environ['PATH']}"}
+        proc_sd_mmc1 = _run_bash(f'bash "{flash_sd}" /dev/mmcblk1 --dry-run', env=pfx_env)
+        assert proc_sd_mmc1.returncode != 0
+        assert "backs critical system mount" not in proc_sd_mmc1.stderr
+        assert "Block device not found: /dev/mmcblk1" in proc_sd_mmc1.stderr
+
+        proc_sd_mmc10 = _run_bash(f'bash "{flash_sd}" /dev/mmcblk10 --dry-run', env=pfx_env)
+        assert proc_sd_mmc10.returncode != 0
+        assert "Safety Interlock:" in proc_sd_mmc10.stderr
+        assert "backs critical system mount" in proc_sd_mmc10.stderr
+
+        # 3. boards/orangepi/rv2/flash-emmc.sh rejects \x0a-separated /mnt/tmp\x0a/boot
+        fake_sd_p1 = tmp_path / "mmcblk0p1"
+        fake_sd_p1.write_text("", encoding="utf-8")
+        bin_dir_emmc = tmp_path / "bin_emmc"
+        _make_linux_uname_shim(bin_dir_emmc)
+        _write_exe(
+            bin_dir_emmc / "findmnt",
+            f"""#!/usr/bin/env bash
+if [[ "$*" == *"-n -o SOURCE /"* && "$*" != *"/boot"* && "$*" != *"/usr"* && "$*" != *"/var"* && "$*" != *"/home"* && "$*" != *"/etc"* && "$*" != *"/opt"* && "$*" != *"/root"* && "$*" != *"/srv"* ]]; then
+    printf '%s\\n' "{fake_sd_p1}"
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir_emmc / "lsblk",
+            r"""#!/usr/bin/env bash
+if [[ "$*" == *"PKNAME"* ]]; then
+    printf 'mmcblk0\n'
+    exit 0
+fi
+if [[ "$*" == *"MOUNTPOINTS"* ]]; then
+    printf '%s\n' '/mnt/tmp\x0a/boot'
+    exit 0
+fi
+exit 0
+""",
+        )
+        rvdk_ci = _load_rvdk_ci()
+        emmc_rendered = rvdk_ci.render_standalone_script(
+            (REPO_ROOT / "boards" / "orangepi" / "rv2" / "flash-emmc.sh").read_text(
+                encoding="utf-8"
+            ),
+            REPO_ROOT,
+        )
+        emmc_check = tmp_path / "emmc_x0a.sh"
+        emmc_check.write_text(
+            emmc_rendered.replace('! -b "$live_root"', '! -e "$live_root"'),
+            encoding="utf-8",
+        )
+        proc_emmc = _run_bash(
+            f'bash "{emmc_check}" --force --dry-run /dev/mmcblk2',
+            env={"PATH": f"{bin_dir_emmc}:{os.environ['PATH']}"},
+        )
+        assert proc_emmc.returncode != 0
+        assert "Safety Interlock:" in proc_emmc.stderr
+        assert "backs a critical OS filesystem or active SWAP" in proc_emmc.stderr
+
+    def test_flash_emmc_literal_etc_hosts_replacement_regex_metachars(
+        self, tmp_path: Path
+    ) -> None:
+        emmc_script = REPO_ROOT / "boards" / "orangepi" / "rv2" / "flash-emmc.sh"
+
+        # 1. host.1 in hostname must replace ONLY literal host.1, never hostX1, host.1.local, host.10, or comments
+        hosts1 = tmp_path / "hosts1"
+        hosts1.write_text(
+            "127.0.0.1\tlocalhost hostX1\n"
+            "10.0.0.2\thost.1 host.1.local host.10\n"
+            "# host.1 comment\n",
+            encoding="utf-8",
+        )
+        proc1 = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{emmc_script}"
+_rvdk_emmc_update_etc_hosts "{hosts1}" "host.1" "rv2-node-01"
+""",
+        )
+        assert proc1.returncode == 0, proc1.stderr
+        assert hosts1.read_text(encoding="utf-8") == (
+            "127.0.0.1\tlocalhost hostX1\n"
+            "10.0.0.2\trv2-node-01 host.1.local host.10\n"
+            "# host.1 comment\n"
+        )
+
+        # 2. When only hostX1 exists (no literal host.1), hostX1 is untouched and 127.0.1.1 entry is appended
+        hosts2 = tmp_path / "hosts2"
+        hosts2.write_text("127.0.0.1\tlocalhost hostX1\n", encoding="utf-8")
+        proc2 = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{emmc_script}"
+_rvdk_emmc_update_etc_hosts "{hosts2}" "host.1" "rv2-node-01"
+""",
+        )
+        assert proc2.returncode == 0, proc2.stderr
+        assert hosts2.read_text(encoding="utf-8") == (
+            "127.0.0.1\tlocalhost hostX1\n"
+            "127.0.1.1\trv2-node-01\n"
+        )
+
+        # 3. Existing 127.0.1.1 line is updated cleanly without regex/backref corruption
+        hosts3 = tmp_path / "hosts3"
+        hosts3.write_text("127.0.0.1\tlocalhost\n127.0.1.1\thost.1\n", encoding="utf-8")
+        proc3 = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{emmc_script}"
+_rvdk_emmc_update_etc_hosts "{hosts3}" "host.1" "rv2-node-02"
+""",
+        )
+        assert proc3.returncode == 0, proc3.stderr
+        assert hosts3.read_text(encoding="utf-8") == (
+            "127.0.0.1\tlocalhost\n"
+            "127.0.1.1\trv2-node-02\n"
+        )
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            "lib/flash.sh",
+            "boards/orangepi/rv2/flash-emmc.sh",
+            "boards/waveshare/esp32-p4-wifi6/flash-sd.sh",
+        ],
+    )
+    def test_flashers_inline_storage_guard_and_have_no_prefix_globs(
+        self, rel_path: str
+    ) -> None:
+        raw = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for bad_glob in ('"${block_dev}"*', '"${target_dev}"*', '"${RESOLVED_BLOCK_DEV}"*', '"${arg}"*'):
+            assert bad_glob not in raw, f"{rel_path} still contains prefix glob {bad_glob}"
+
+        rvdk_ci = _load_rvdk_ci()
+        rendered = rvdk_ci.render_standalone_script(raw, REPO_ROOT)
+        assert "# --- BEGIN INLINED lib/storage_guard.sh ---" in rendered
+        assert 'source "${_FLASH_LIB_DIR}/storage_guard.sh"' not in rendered
+        assert 'source "${_REPO_ROOT}/lib/storage_guard.sh"' not in rendered
+        syn = subprocess.run([BASH_BIN, "-n"], input=rendered, capture_output=True, text=True, check=False)
+        assert syn.returncode == 0, syn.stderr

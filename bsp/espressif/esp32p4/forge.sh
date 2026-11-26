@@ -21,6 +21,7 @@ set -Eeuo pipefail
 
 ORIG_ARGS=("$@")
 STAGE_DIR=""
+CLI_BOARD=""
 
 _SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -86,6 +87,16 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --board)
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires a board argument."
+            CLI_BOARD="$2"
+            shift 2
+            ;;
+        --board=*)
+            CLI_BOARD="${1#*=}"
+            [[ -z "$CLI_BOARD" ]] && log_fatal "Option '--board=' requires a non-empty board."
+            shift
+            ;;
         --stage-dir)
             [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires a directory argument."
             STAGE_DIR="$2"
@@ -126,8 +137,25 @@ if [[ -z "$STAGE_DIR" ]]; then
 fi
 rvdk_sanitize_locale
 
+_CALLER_BOARD="${CLI_BOARD:-${RVDK_BOARD:-}}"
+TARGET_BOARD="${_CALLER_BOARD:-waveshare/esp32-p4-wifi6}"
 if typeset -f rvdk_kit_resolve >/dev/null 2>&1; then
-    rvdk_kit_resolve --no-cache --soc "espressif/esp32p4" --board "waveshare/esp32-p4-wifi6" || true
+    rvdk_kit_resolve --no-cache --soc "espressif/esp32p4" --board "$TARGET_BOARD" || true
+fi
+RESOLVED_BOARD="${RVDK_BOARD:-}"
+RESOLVED_TAG="${RVDK_BOARD_TAG:-}"
+if [[ -z "$RESOLVED_BOARD" ]] && ! typeset -f rvdk_kit_resolve >/dev/null 2>&1; then
+    RESOLVED_BOARD="$TARGET_BOARD"
+fi
+if [[ ! "$RESOLVED_BOARD" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ || "$RESOLVED_BOARD" == *..* ]]; then
+    log_fatal "Invalid board identifier '${TARGET_BOARD}'."
+fi
+if [[ -z "$RESOLVED_TAG" ]]; then
+    if [[ "$RESOLVED_BOARD" == "waveshare/esp32-p4-wifi6" ]]; then
+        RESOLVED_TAG="p4"
+    else
+        RESOLVED_TAG="${RESOLVED_BOARD##*/}"
+    fi
 fi
 
 rvdk_prog_init "ESP32-P4 BSP: probing toolchain & converging kit provenance..."
@@ -208,8 +236,8 @@ WANT_KIT_ENV="# Managed by RVDK (bsp/espressif/esp32p4/forge.sh)
 RVDK_KIT_SCHEMA=\"1\"
 RVDK_SOC=\"espressif/esp32p4\"
 RVDK_SOC_SLUG=\"espressif-esp32p4\"
-RVDK_BOARD=\"waveshare/esp32-p4-wifi6\"
-RVDK_BOARD_TAG=\"p4\"
+RVDK_BOARD=\"${RESOLVED_BOARD}\"
+RVDK_BOARD_TAG=\"${RESOLVED_TAG}\"
 RVDK_ARCH=\"riscv32\"
 RVDK_MMU=\"none\"
 RVDK_CPU_HARTS=\"2\"

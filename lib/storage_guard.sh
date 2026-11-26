@@ -15,37 +15,51 @@ _RVDK_STORAGE_GUARD_SH_LOADED=1
 # Recursively resolve a kernel block name (`dm-0`, `nvme0n1p1`, `nvme0n1`) to its
 # leaf whole-disk kernel names via `/sys/class/block/<kname>/slaves` and `lsblk`.
 _rvdk_collect_leaf_disks() {
-    local kname="$1"
+    local kname="${1:-}"
+    local depth="${2:-0}"
+    local visited="${3:-|}"
     [[ -n "$kname" ]] || return 0
+    (( depth < 32 )) || return 0
+    [[ "$visited" == *"|${kname}|"* ]] && return 0
+    visited="${visited}${kname}|"
 
     local slave_dir="/sys/class/block/${kname}/slaves"
     if [[ -d "$slave_dir" ]] && compgen -G "${slave_dir}/*" >/dev/null 2>&1; then
-        local s
+        local s s_base
         for s in "${slave_dir}"/*; do
             [[ -e "$s" ]] || continue
-            _rvdk_collect_leaf_disks "$(basename "$s")"
+            s_base="$(basename "$s")"
+            [[ -n "$s_base" ]] && _rvdk_collect_leaf_disks "$s_base" "$(( depth + 1 ))" "$visited"
         done
         return 0
     fi
 
-    local pk=""
+    local pk_out="" pk="" found_pk="false"
     if command -v lsblk >/dev/null 2>&1 && [[ -b "/dev/${kname}" ]]; then
-        pk="$(lsblk -ndo PKNAME "/dev/${kname}" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+        pk_out="$(lsblk -ndo PKNAME "/dev/${kname}" 2>/dev/null || true)"
+        while IFS= read -r pk; do
+            pk="${pk#"${pk%%[![:space:]]*}"}"
+            pk="${pk%"${pk##*[![:space:]]}"}"
+            [[ -n "$pk" && "$pk" != "$kname" ]] || continue
+            found_pk="true"
+            _rvdk_collect_leaf_disks "$pk" "$(( depth + 1 ))" "$visited"
+        done <<< "$pk_out"
     fi
-    if [[ -z "$pk" && -L "/sys/class/block/${kname}" ]]; then
+    if [[ "$found_pk" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ -L "/sys/class/block/${kname}" ]]; then
         local sys_real parent_base
         sys_real="$(readlink -f "/sys/class/block/${kname}" 2>/dev/null || true)"
         parent_base="$(basename "$(dirname "$sys_real")")"
-        if [[ -n "$parent_base" && "$parent_base" != "block" && -e "/sys/block/${parent_base}" ]]; then
-            pk="$parent_base"
+        if [[ -n "$parent_base" && "$parent_base" != "block" && -e "/sys/block/${parent_base}" && "$parent_base" != "$kname" ]]; then
+            _rvdk_collect_leaf_disks "$parent_base" "$(( depth + 1 ))" "$visited"
+            return 0
         fi
     fi
 
-    if [[ -n "$pk" && "$pk" != "$kname" ]]; then
-        _rvdk_collect_leaf_disks "$pk"
-    else
-        printf '%s\n' "$kname"
-    fi
+    printf '%s\n' "$kname"
 }
 
 # Returns 0 only if <dev_path> (whole disk, partition, or dm/LVM LV) resides
@@ -155,20 +169,193 @@ _rvdk_storage_parse_lsblk_line() {
     done
 }
 
+# Returns 0 if <mnt> matches a critical OS/swap mountpoint.
+_rvdk_is_critical_mountpoint() {
+    local mnt="${1:-}"
+    [[ -n "$mnt" ]] || return 1
+    while [[ "$mnt" != "/" && "$mnt" == */ ]]; do
+        mnt="${mnt%/}"
+    done
+    case "$mnt" in
+        /|/boot|/boot/*|/usr|/var|/var/log|/var/lib|/home|/etc|/opt|/root|/srv|"[SWAP]")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Recursively resolve a mount/swap source device <src> via `lsblk -no PKNAME`
+# (and sysfs slaves for multi-disk mdraid/LVM on Linux) to check whether it
+# resides on <target_dev>, bounded by cycle and depth guards.
+_rvdk_source_backs_disk() {
+    local src="${1:-}"
+    local target_dev="${2:-}"
+    local depth="${3:-0}"
+    local visited="${4:- }"
+
+    [[ -n "$src" && -n "$target_dev" ]] || return 1
+    (( depth < 16 )) || return 1
+
+    local src_real target_real src_kname src_orig_kname target_kname target_orig_kname
+    src_real="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+    target_real="$(readlink -f "$target_dev" 2>/dev/null || echo "$target_dev")"
+    src_kname="${src_real##*/}"
+    src_orig_kname="${src##*/}"
+    target_kname="${target_real##*/}"
+    target_orig_kname="${target_dev##*/}"
+
+    if [[ "$src" == "$target_dev" || "$src_real" == "$target_real" \
+          || ( -n "$src_kname" && "$src_kname" == "$target_kname" ) \
+          || ( -n "$src_orig_kname" && "$src_orig_kname" == "$target_orig_kname" ) ]]; then
+        return 0
+    fi
+
+    local visit_key="${src_kname:-$src}"
+    [[ "$visited" == *" ${visit_key} "* ]] && return 1
+    visited="${visited}${visit_key} "
+    if [[ -n "$src_orig_kname" && "$src_orig_kname" != "$visit_key" ]]; then
+        visited="${visited}${src_orig_kname} "
+    fi
+
+    local -a parent_candidates=()
+    if command -v lsblk >/dev/null 2>&1; then
+        local pk_out="" pk_line
+        pk_out="$(lsblk -ndo PKNAME "$src" 2>/dev/null || true)"
+        if [[ -z "$pk_out" && "$src_real" != "$src" ]]; then
+            pk_out="$(lsblk -ndo PKNAME "$src_real" 2>/dev/null || true)"
+        fi
+        # Support mocks that match `lsblk -no PKNAME` (without `-d`), while
+        # ignoring descendant lines emitted when line 1 (self PKNAME) is blank.
+        if [[ -z "$pk_out" ]]; then
+            local raw_no_out="" first_no_line=""
+            raw_no_out="$(lsblk -no PKNAME "$src" 2>/dev/null || true)"
+            if [[ -z "$raw_no_out" && "$src_real" != "$src" ]]; then
+                raw_no_out="$(lsblk -no PKNAME "$src_real" 2>/dev/null || true)"
+            fi
+            if [[ -n "$raw_no_out" ]]; then
+                IFS= read -r first_no_line <<< "$raw_no_out"
+                first_no_line="${first_no_line#"${first_no_line%%[![:space:]]*}"}"
+                first_no_line="${first_no_line%"${first_no_line##*[![:space:]]}"}"
+                if [[ -n "$first_no_line" ]]; then
+                    pk_out="$raw_no_out"
+                fi
+            fi
+        fi
+
+        while IFS= read -r pk_line; do
+            pk_line="${pk_line#"${pk_line%%[![:space:]]*}"}"
+            pk_line="${pk_line%"${pk_line##*[![:space:]]}"}"
+            [[ -n "$pk_line" ]] || continue
+            if [[ "$pk_line" == /* ]]; then
+                parent_candidates+=("$pk_line")
+            else
+                parent_candidates+=("/dev/${pk_line}")
+            fi
+        done <<< "$pk_out"
+    fi
+
+    # Multi-slave virtual block devices (mdraid, multi-PV LVM) expose all backing
+    # members in `/sys/class/block/<kname>/slaves` even when PKNAME omits extras.
+    local slave_dir="/sys/class/block/${src_kname}/slaves"
+    if [[ -n "$src_kname" && -d "$slave_dir" ]] && compgen -G "${slave_dir}/*" >/dev/null 2>&1; then
+        local _s
+        for _s in "${slave_dir}"/*; do
+            [[ -e "$_s" ]] || continue
+            parent_candidates+=("/dev/$(basename "$_s")")
+        done
+    fi
+
+    local cand cand_kname
+    for cand in ${parent_candidates[@]+"${parent_candidates[@]}"}; do
+        [[ -n "$cand" ]] || continue
+        cand_kname="${cand##*/}"
+        if [[ "$cand_kname" == "$visit_key" || "$cand_kname" == "$src_orig_kname" ]]; then
+            continue
+        fi
+        if _rvdk_source_backs_disk "$cand" "$target_dev" $(( depth + 1 )) "$visited"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# List exact child partition device paths for <dev> without shell prefix globbing.
+# Usage: rvdk_list_child_partitions <dev>
+rvdk_list_child_partitions() {
+    local dev="${1:-}"
+    [[ -n "$dev" ]] || return 0
+    command -v lsblk >/dev/null 2>&1 || return 0
+    lsblk -rn -o PATH,TYPE "$dev" 2>/dev/null | awk '$2 == "part" {print $1}' || true
+}
+
 # Returns 0 if any partition/LV on <dev> backs a critical OS mountpoint or active swap
 rvdk_device_backs_os_or_swap() {
-    local dev="$1"
+    local dev="${1:-}"
+    [[ -n "$dev" ]] || return 1
+
     local mnt
     while IFS= read -r mnt; do
         [[ -z "$mnt" ]] && continue
-        case "$mnt" in
-            /|/boot|/boot/*|/usr|/var|/var/log|/home|"[SWAP]")
-                return 0
-                ;;
-        esac
+        if _rvdk_is_critical_mountpoint "$mnt"; then
+            return 0
+        fi
     done < <(_rvdk_lsblk_mountpoints "$dev")
 
-    # Cross-check /proc/swaps against child block nodes
+    # Cross-check critical OS mounts via findmnt and resolve parent disks
+    # recursively so stacked LVM/LUKS/mdraid OS devices fail closed.
+    if command -v findmnt >/dev/null 2>&1; then
+        local tgt src
+        while IFS=' ' read -r tgt src; do
+            [[ -n "$tgt" && -n "$src" ]] || continue
+            src="${src%%\[*}"
+            [[ "$src" == /* ]] || continue
+            if _rvdk_is_critical_mountpoint "$tgt" && _rvdk_source_backs_disk "$src" "$dev"; then
+                return 0
+            fi
+        done < <(findmnt -rn -o TARGET,SOURCE 2>/dev/null || true)
+
+        local -a crit_targets=(
+            /
+            /boot
+            /boot/efi
+            /boot/firmware
+            /usr
+            /var
+            /var/log
+            /var/lib
+            /home
+            /etc
+            /opt
+            /root
+            /srv
+        )
+        local _b_sub
+        if [[ -d /boot ]]; then
+            for _b_sub in /boot/*; do
+                [[ -d "$_b_sub" ]] || continue
+                case "$_b_sub" in
+                    /boot/efi|/boot/firmware) ;;
+                    *) crit_targets+=("$_b_sub") ;;
+                esac
+            done
+        fi
+
+        local mp
+        for mp in "${crit_targets[@]}"; do
+            while IFS= read -r src; do
+                src="${src#"${src%%[![:space:]]*}"}"
+                src="${src%"${src##*[![:space:]]}"}"
+                src="${src%%\[*}"
+                [[ "$src" == /* ]] || continue
+                if _rvdk_source_backs_disk "$src" "$dev"; then
+                    return 0
+                fi
+            done < <(findmnt -n -o SOURCE "$mp" 2>/dev/null || true)
+        done
+    fi
+
+    # Cross-check /proc/swaps against child block nodes and parent chains
     if [[ -r /proc/swaps ]]; then
         local kname
         while IFS= read -r kname; do
@@ -177,6 +364,14 @@ rvdk_device_backs_os_or_swap() {
                 return 0
             fi
         done < <(lsblk -nr -o KNAME "$dev" 2>/dev/null || true)
+
+        local swap_src
+        while IFS= read -r swap_src; do
+            [[ "$swap_src" == /* ]] || continue
+            if _rvdk_source_backs_disk "$swap_src" "$dev"; then
+                return 0
+            fi
+        done < <(awk 'NR>1 {print $1}' /proc/swaps 2>/dev/null || true)
     fi
 
     return 1
@@ -292,8 +487,11 @@ rvdk_converge_fstab_entry() {
     local want_fstab=""
 
     if [[ -s "$fstab_file" ]]; then
-        want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
+        want_fstab="$(RVDK_FSTAB_SPEC="$spec" RVDK_FSTAB_MNT="$mnt" RVDK_FSTAB_LINE="$entry" awk '
             BEGIN {
+                sp = ENVIRON["RVDK_FSTAB_SPEC"]
+                mp = ENVIRON["RVDK_FSTAB_MNT"]
+                line = ENVIRON["RVDK_FSTAB_LINE"]
                 replaced = 0
                 while (length(mp) > 1 && substr(mp, length(mp), 1) == "/") {
                     mp = substr(mp, 1, length(mp) - 1)

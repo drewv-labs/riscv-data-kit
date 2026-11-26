@@ -27,7 +27,7 @@ fi
 _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 
-# @RVDK_INLINE_LIBS: common apt
+# @RVDK_INLINE_LIBS: common apt storage_guard
 if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
     if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
         # shellcheck source=lib/common.sh
@@ -45,6 +45,14 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
             [[ ${#h} -ge 1 && ${#h} -le 253 ]] || return 1
             [[ "$h" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
         }
+        rvdk_atomic_write() {
+            local _dst="$1" _mode="${2:-0644}" _tmp
+            mkdir -p "$(dirname "$_dst")"
+            _tmp="$(mktemp "$(dirname "$_dst")/.$(basename "$_dst").rvdk.XXXXXX")"
+            cat > "$_tmp"
+            chmod "$_mode" "$_tmp"
+            mv -f "$_tmp" "$_dst"
+        }
         rvdk_sync_cold_clock() { :; }
     fi
 fi
@@ -52,6 +60,12 @@ if [[ -z "${_RVDK_APT_SH_LOADED:-}" ]]; then
     if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
         # shellcheck source=lib/apt.sh
         source "${_REPO_ROOT}/lib/apt.sh"
+    fi
+fi
+if [[ -z "${_RVDK_STORAGE_GUARD_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/storage_guard.sh" ]]; then
+        # shellcheck source=lib/storage_guard.sh
+        source "${_REPO_ROOT}/lib/storage_guard.sh"
     fi
 fi
 
@@ -79,6 +93,72 @@ _rvdk_emmc_cleanup() {
     fi
     if typeset -f _rvdk_cleanup_tmpfiles >/dev/null 2>&1; then
         _rvdk_cleanup_tmpfiles || true
+    fi
+}
+
+_rvdk_emmc_update_etc_hosts() {
+    local hosts_file="$1"
+    local old_host="$2"
+    local target_hostname="$3"
+    [[ -f "$hosts_file" ]] || return 0
+
+    if grep -qE '^127\.0\.1\.1[[:space:]]' "$hosts_file"; then
+        local rendered_hosts=""
+        rendered_hosts="$(RVDK_NEW_HOST="$target_hostname" awk '
+            BEGIN { new_h = ENVIRON["RVDK_NEW_HOST"] }
+            /^127\.0\.1\.1[[:space:]]/ { print "127.0.1.1\t" new_h; next }
+            { print }
+        ' "$hosts_file")"
+        printf '%s\n' "$rendered_hosts" | rvdk_atomic_write "$hosts_file" 0644
+    elif [[ -n "$old_host" ]]; then
+        local awk_out="" rendered_hosts=""
+        awk_out="$(RVDK_OLD_HOST="$old_host" RVDK_NEW_HOST="$target_hostname" awk '
+            BEGIN {
+                old_h = ENVIRON["RVDK_OLD_HOST"]
+                new_h = ENVIRON["RVDK_NEW_HOST"]
+                olen = length(old_h)
+                changed = 0
+            }
+            {
+                if (olen == 0 || $0 ~ /^[[:space:]]*#/) {
+                    print $0
+                    next
+                }
+                cmt = ""
+                body = $0
+                cpos = index($0, "#")
+                if (cpos > 0) {
+                    body = substr($0, 1, cpos - 1)
+                    cmt = substr($0, cpos)
+                }
+                s = body
+                out = ""
+                while ((pos = index(s, old_h)) > 0) {
+                    out = out substr(s, 1, pos - 1)
+                    prev = (length(out) > 0) ? substr(out, length(out), 1) : ""
+                    after = substr(s, pos + olen, 1)
+                    if ((prev == "" || prev ~ /[[:space:]]/) && (after == "" || after ~ /[[:space:]]/)) {
+                        out = out new_h
+                        changed = 1
+                    } else {
+                        out = out old_h
+                    }
+                    s = substr(s, pos + olen)
+                }
+                print out s cmt
+            }
+            END {
+                print "__RVDK_CHANGED__=" changed
+            }
+        ' "$hosts_file")"
+        if [[ "$awk_out" == *$'\n__RVDK_CHANGED__=1' ]]; then
+            rendered_hosts="${awk_out%$'\n__RVDK_CHANGED__=1'}"
+            printf '%s\n' "$rendered_hosts" | rvdk_atomic_write "$hosts_file" 0644
+        else
+            printf "127.0.1.1\t%s\n" "$target_hostname" >> "$hosts_file"
+        fi
+    else
+        printf "127.0.1.1\t%s\n" "$target_hostname" >> "$hosts_file"
     fi
 }
 
@@ -207,25 +287,21 @@ main() {
     fi
 
     [[ -z "$target_dev" ]] && log_fatal "No onboard eMMC device (/sys/block/mmcblk*/device/type == MMC) detected. Verify the eMMC module is seated onto the RV2 socket."
-    [[ ! -b "$target_dev" ]] && log_fatal "Target eMMC block device not found: ${target_dev}"
 
     case "$target_dev" in
         *boot[0-9]|*rpmb) log_fatal "Specify whole eMMC device (e.g. /dev/mmcblk2), not hardware sub-partition '${target_dev}'." ;;
     esac
+    [[ "$target_dev" == "$live_disk" ]] && log_fatal "Safety Interlock: target '${target_dev}' is the currently booted root disk!"
+
+    if [[ "$target_dev" == /* || -b "$target_dev" ]] && rvdk_device_backs_os_or_swap "$target_dev"; then
+        log_fatal "Safety Interlock: ${target_dev} backs a critical OS filesystem or active SWAP! Aborting."
+    fi
+
+    [[ ! -b "$target_dev" ]] && log_fatal "Target eMMC block device not found: ${target_dev}"
+
     local target_type=""
     target_type="$(lsblk -dn -o TYPE "$target_dev" 2>/dev/null | head -n1 | xargs || true)"
     [[ "$target_type" == "part" ]] && log_fatal "Specify whole eMMC device (e.g. /dev/mmcblk2), not partition '${target_dev}'."
-    [[ "$target_dev" == "$live_disk" ]] && log_fatal "Safety Interlock: target '${target_dev}' is the currently booted root disk!"
-
-    local mnt_chk
-    while IFS= read -r mnt_chk; do
-        [[ -z "$mnt_chk" ]] && continue
-        case "$mnt_chk" in
-            /|/boot|/boot/*|/usr|/var|/home|"[SWAP]")
-                log_fatal "Safety Interlock: ${target_dev} backs active system mount/swap (${mnt_chk})! Aborting."
-                ;;
-        esac
-    done < <(lsblk -rn -o MOUNTPOINTS "$target_dev" 2>/dev/null || lsblk -rn -o MOUNTPOINT "$target_dev" 2>/dev/null || true)
 
     local emmc_bytes=0 min_bytes=$(( 8 * 1024 * 1024 * 1024 ))
     emmc_bytes="$(lsblk -b -dn -o SIZE "$target_dev" 2>/dev/null | head -n1 | tr -dc '0-9' || echo 0)"
@@ -334,10 +410,11 @@ main() {
     # --------------------------------------------------------------------------
     log_info "Unmounting and partitioning ${target_dev} (msdos | ${first_sector}s..${last_sector}s)..."
     local sub_p
-    for sub_p in "${target_dev}"*; do
-        [[ "$sub_p" == "$target_dev" ]] && continue
+    while IFS= read -r sub_p; do
+        [[ -n "$sub_p" ]] || continue
         umount "$sub_p" 2>/dev/null || umount -l "$sub_p" 2>/dev/null || true
-    done
+    done < <(rvdk_list_child_partitions "$target_dev")
+    umount "$target_dev" 2>/dev/null || umount -l "$target_dev" 2>/dev/null || true
 
     command -v wipefs >/dev/null 2>&1 && wipefs -af "$target_dev" >/dev/null 2>&1 || true
     dd if=/dev/zero of="$target_dev" bs=512 seek=$(( total_sectors - 2048 )) count=2048 status=none 2>/dev/null || true
@@ -524,15 +601,7 @@ main() {
         local old_host=""
         [[ -f "${_EMMC_TMP_MNT}/etc/hostname" ]] && old_host="$(tr -d '[:space:]' < "${_EMMC_TMP_MNT}/etc/hostname" || true)"
         printf "%s\n" "$target_hostname" > "${_EMMC_TMP_MNT}/etc/hostname"
-        if [[ -f "${_EMMC_TMP_MNT}/etc/hosts" ]]; then
-            if grep -qE '^127\.0\.1\.1[[:space:]]' "${_EMMC_TMP_MNT}/etc/hosts"; then
-                sed -i -E "s|^127\.0\.1\.1[[:space:]].*$|127.0.1.1\t${target_hostname}|" "${_EMMC_TMP_MNT}/etc/hosts"
-            elif [[ -n "$old_host" ]] && grep -qw "$old_host" "${_EMMC_TMP_MNT}/etc/hosts"; then
-                sed -i "s|${old_host}|${target_hostname}|g" "${_EMMC_TMP_MNT}/etc/hosts"
-            else
-                printf "127.0.1.1\t%s\n" "$target_hostname" >> "${_EMMC_TMP_MNT}/etc/hosts"
-            fi
-        fi
+        _rvdk_emmc_update_etc_hosts "${_EMMC_TMP_MNT}/etc/hosts" "$old_host" "$target_hostname"
         log_ok "Configured eMMC hostname -> ${target_hostname} (preserved SSH host keys for seamless role switching)"
     fi
 
@@ -599,4 +668,6 @@ main() {
     printf "    • Power off & eject SD   -> Boots onboard eMMC role (%s)\n" "$verified_emmc_lbl"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main "$@"
+fi

@@ -132,7 +132,9 @@ fi
 _escalate_root_if_needed() {
     if [[ "$NEED_ROOT" == "true" && "${EUID:-$(id -u)}" -ne 0 ]]; then
         if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
-            exec sudo -E bash "$SCRIPT_SELF" ${ORIG_ALL_ARGS[@]+"${ORIG_ALL_ARGS[@]}"}
+            local _sudo_rc=0
+            rvdk_sudo_preserve bash "$SCRIPT_SELF" ${ORIG_ALL_ARGS[@]+"${ORIG_ALL_ARGS[@]}"} || _sudo_rc=$?
+            exit "$_sudo_rc"
         else
             echo "[RVDK:FATAL] Run as root or pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/bootstrap.sh | sudo bash" >&2
             exit 1
@@ -184,6 +186,18 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
         rvdk_sanitize_locale() { export LANG="C" LC_ALL="C"; }
         rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; REAL_HOME="/root"; export REAL_USER REAL_GRP REAL_HOME; }
         rvdk_sync_cold_clock() { :; }
+        rvdk_sudo_preserve() { sudo "$@"; }
+        rvdk_join_by() {
+            local sep="${1-}"
+            shift || return 0
+            [[ $# -eq 0 ]] && return 0
+            printf '%s' "$1"
+            shift
+            local item
+            for item in "$@"; do
+                printf '%s%s' "$sep" "$item"
+            done
+        }
     fi
 fi
 
@@ -970,7 +984,11 @@ if [[ "$MODULE" == "deeptune" && "$DEEPTUNE_STATUS_ONLY" == "true" ]]; then
     while IFS= read -r s; do
         [[ -n "$s" ]] && DT_LAYERS+=("${s#"${LOCAL_ROOT}"/}")
     done < <(rvdk_collect_deeptune_scripts "$LOCAL_ROOT")
-    LAYERS_STR="$(IFS=' -> '; echo "${DT_LAYERS[*]:-none}")"
+    if (( ${#DT_LAYERS[@]} > 0 )); then
+        LAYERS_STR="$(rvdk_join_by " -> " "${DT_LAYERS[@]}")"
+    else
+        LAYERS_STR="none"
+    fi
 
     printf "\033[1;36m[RVDK:DEEPTUNE]\033[0m Multi-Layer Kit DeepTune Status\n"
     printf "  • Kit Identity      : board=%s | soc=%s | arch=%s | mmu=%s | os=%s | nic=%s\n" \
@@ -1104,7 +1122,7 @@ run_kit_deeptune() {
 
     local effective_tune="$tune_label"
     local effective_mode="$tune_mode"
-    if [[ "$SOC_PATH" == "espressif/esp32p4" && "$tune_label" == "data" ]]; then
+    if [[ ( "${RVDK_MMU:-}" == "none" || "${RVDK_ARCH:-}" == "riscv32" ) && "$tune_label" == "data" ]]; then
         effective_tune="iot"
         effective_mode="iot"
     fi
@@ -1132,13 +1150,8 @@ run_kit_deeptune() {
         [[ "${RVDK_NO_PROGBAR:-0}" == "1" ]] && layer_args+=("--noprogbar")
 
         log_rvdk "DeepTune Layer $((idx + 1))/${count}: ${rel} (--tune ${tune_label})..."
-        if [[ "$rel" == os/deeptune*.sh ]]; then
-            RVDK_TUNE="$tune_label" RVDK_PROG_BASE="$l_base" RVDK_PROG_SPAN="$l_span" \
-                bash "$s" "${layer_args[@]}" ${DEEPTUNE_STAGE_ARGS[@]+"${DEEPTUNE_STAGE_ARGS[@]}"}
-        else
-            RVDK_TUNE="$tune_label" RVDK_PROG_BASE="$l_base" RVDK_PROG_SPAN="$l_span" \
-                bash "$s" "${layer_args[@]}" ${DEEPTUNE_STAGE_ARGS[@]+"${DEEPTUNE_STAGE_ARGS[@]}"}
-        fi
+        RVDK_TUNE="$tune_label" RVDK_PROG_BASE="$l_base" RVDK_PROG_SPAN="$l_span" \
+            bash "$s" "${layer_args[@]}" ${DEEPTUNE_STAGE_ARGS[@]+"${DEEPTUNE_STAGE_ARGS[@]}"}
         idx=$((idx + 1))
     done
 
@@ -1147,7 +1160,7 @@ run_kit_deeptune() {
         state_target="${STAGE_DIR}/config/deeptune.env"
     fi
     local skip_state_write="false"
-    if [[ "$SOC_PATH" == "espressif/esp32p4" && -r "$state_target" ]]; then
+    if [[ ( "${RVDK_MMU:-}" == "none" || "${RVDK_ARCH:-}" == "riscv32" ) && -r "$state_target" ]]; then
         local RVDK_TUNE="" RVDK_SDKCONFIG_FRAGMENT=""
         if typeset -f rvdk_kv_load >/dev/null 2>&1; then
             rvdk_kv_load "$state_target" RVDK_TUNE RVDK_SDKCONFIG_FRAGMENT || true
@@ -1229,7 +1242,7 @@ case "$MODULE" in
             S1_SPAN=55; S2_BASE=55; S2_SPAN=45
         fi
         BSP_SCRIPT="$(resolve_os_script "${LOCAL_ROOT}/bsp/${SOC_PATH}")" || log_fatal "Missing BSP script for ${SOC_PATH} (${OS_ID})"
-        if [[ "$SOC_PATH" == "espressif/esp32p4" || "$OS_ID" == "esp-idf" || "$OS_ID" == "nuttx" || "$OS_ID" == "buildroot" || "$OS_ID" == "linux-nommu" ]]; then
+        if [[ "${RVDK_MMU:-}" == "none" || "${RVDK_ARCH:-}" == "riscv32" || "$OS_ID" == "esp-idf" || "$OS_ID" == "nuttx" || "$OS_ID" == "buildroot" || "$OS_ID" == "linux-nommu" ]]; then
             log_skip "Skipping os/bootstrap-apt.sh for ${SOC_PATH} (os=${OS_ID}, arch=${RVDK_ARCH:-unknown}, mmu=${RVDK_MMU:-unknown})"
             local_bsp_span=100
             [[ "$WITH_DEEPTUNE" == "true" || "$WITH_TAILSCALE" == "true" ]] && local_bsp_span=75
@@ -1278,7 +1291,7 @@ case "$MODULE" in
         rvdk_prog 100 "Kit DeepTune (${BOARD_PATH:-$SOC_PATH}) converged"
         ;;
     os)
-        if [[ "$SOC_PATH" == "espressif/esp32p4" || "${RVDK_ARCH:-}" == "riscv32" || "$OS_ID" == "esp-idf" || "$OS_ID" == "nuttx" || "$OS_ID" == "buildroot" || "$OS_ID" == "linux-nommu" ]]; then
+        if [[ "${RVDK_MMU:-}" == "none" || "${RVDK_ARCH:-}" == "riscv32" || "$OS_ID" == "esp-idf" || "$OS_ID" == "nuttx" || "$OS_ID" == "buildroot" || "$OS_ID" == "linux-nommu" ]]; then
             log_skip "Skipping os/bootstrap-apt.sh for ${SOC_PATH} (os=${OS_ID}, arch=${RVDK_ARCH:-unknown}, mmu=${RVDK_MMU:-unknown})"
             run_addon_tail
             rvdk_prog 100 "OS stage skipped (non-APT target)"

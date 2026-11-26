@@ -15,7 +15,7 @@
 #
 #   • Full Purge (`sudo rvdk uninstall --purge` / `sudo rvdk purge`):
 #       Removes everything above PLUS restores preserved vendor configuration
-#       backups under `/var/lib/rvdk/backups/{apt,boot,dns,ntp,openwrt,registries}`
+#       backups under `/var/lib/rvdk/backups/{apt,boot,deeptune,dns,ntp,openwrt,registries}`
 #       (unless `--no-restore-backups` is passed), removes `/etc/rvdk/`,
 #       OS/BSP state under `/var/lib/rvdk/`, and all OS/BSP RVDK-authored
 #       systemd/procd tuning units, sysctl/modprobe/journald/APT drop-ins, and
@@ -166,6 +166,129 @@ if ! typeset -f rvdk_assert_safe_managed_dir >/dev/null 2>&1; then
     }
 fi
 
+_rvdk_uninstall_normalize_path() {
+    local p="${1:-}"
+    while [[ "$p" == *//* ]]; do
+        p="${p//\/\///}"
+    done
+    while [[ "$p" != "/" && "$p" == */ ]]; do
+        p="${p%/}"
+    done
+    printf '%s\n' "$p"
+}
+
+_rvdk_uninstall_has_symlink_component() {
+    local norm_p="${1:-}"
+    [[ -n "$norm_p" && "$norm_p" == /* ]] || return 0
+    local cur="" seg rest="${norm_p#/}"
+    while [[ -n "$rest" ]]; do
+        if [[ "$rest" == */* ]]; then
+            seg="${rest%%/*}"
+            rest="${rest#*/}"
+        else
+            seg="$rest"
+            rest=""
+        fi
+        [[ -z "$seg" ]] && continue
+        cur="${cur}/${seg}"
+        if [[ -L "$cur" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+_rvdk_uninstall_canonical_path() {
+    local raw_p="${1:-}"
+    [[ -n "$raw_p" && "$raw_p" == /* ]] || return 1
+    local norm_p
+    norm_p="$(_rvdk_uninstall_normalize_path "$raw_p")"
+
+    local probe="$norm_p" suffix="" base=""
+    while [[ "$probe" != "/" && ! -e "$probe" && ! -L "$probe" ]]; do
+        base="${probe##*/}"
+        if [[ -n "$suffix" ]]; then
+            suffix="${base}/${suffix}"
+        else
+            suffix="$base"
+        fi
+        probe="${probe%/*}"
+        [[ -z "$probe" ]] && probe="/"
+    done
+
+    local canon_probe=""
+    if [[ -L "$probe" ]]; then
+        if command -v realpath >/dev/null 2>&1; then
+            canon_probe="$(realpath "$probe" 2>/dev/null || true)"
+        fi
+        if [[ -z "$canon_probe" ]] && command -v readlink >/dev/null 2>&1; then
+            canon_probe="$(readlink -f "$probe" 2>/dev/null || true)"
+        fi
+        [[ -n "$canon_probe" ]] || return 1
+    elif [[ -d "$probe" ]]; then
+        canon_probe="$(cd -P -- "$probe" 2>/dev/null && pwd -P)" || return 1
+    elif [[ -e "$probe" ]]; then
+        local pdir pbase
+        pdir="$(dirname "$probe")"
+        pbase="$(basename "$probe")"
+        canon_probe="$(cd -P -- "$pdir" 2>/dev/null && pwd -P)" || return 1
+        if [[ "$canon_probe" == "/" ]]; then
+            canon_probe="/${pbase}"
+        else
+            canon_probe="${canon_probe}/${pbase}"
+        fi
+    else
+        return 1
+    fi
+
+    if [[ -z "$suffix" ]]; then
+        printf '%s\n' "$canon_probe"
+    elif [[ "$canon_probe" == "/" ]]; then
+        printf '/%s\n' "$suffix"
+    else
+        printf '%s/%s\n' "$canon_probe" "$suffix"
+    fi
+}
+
+_rvdk_uninstall_resolve_safe_home_subpath() {
+    local cand_raw="${1:-}"
+    local home_raw="${2:-}"
+    local var_name="${3:-XDG_CACHE_HOME}"
+
+    [[ -n "$cand_raw" && -n "$home_raw" && "$home_raw" == /* ]] || return 1
+    if [[ "$cand_raw" =~ [[:cntrl:]] || "$cand_raw" == *$'\n'* || "$cand_raw" == *$'\r'* ]]; then
+        return 1
+    fi
+    if [[ "$home_raw" =~ [[:cntrl:]] || "$home_raw" == *$'\n'* || "$home_raw" == *$'\r'* ]]; then
+        return 1
+    fi
+
+    local norm_home norm_cand
+    norm_home="$(_rvdk_uninstall_normalize_path "$home_raw")"
+    [[ -n "$norm_home" && "$norm_home" != "/" ]] || return 1
+
+    if ! ( rvdk_assert_safe_managed_dir "$cand_raw" "$var_name" >/dev/null 2>&1 ); then
+        return 1
+    fi
+
+    norm_cand="$(_rvdk_uninstall_normalize_path "$cand_raw")"
+    if _rvdk_uninstall_has_symlink_component "$norm_cand"; then
+        return 1
+    fi
+
+    local canon_home canon_cand
+    canon_home="$(_rvdk_uninstall_canonical_path "$norm_home")" || return 1
+    canon_cand="$(_rvdk_uninstall_canonical_path "$norm_cand")" || return 1
+    [[ -n "$canon_home" && "$canon_home" != "/" && -n "$canon_cand" ]] || return 1
+
+    # Strictly inside "${REAL_HOME}/" (prevents /var/lib, /etc, /home/other, and ${REAL_HOME}2)
+    [[ "$norm_cand" == "${norm_home}/"* ]] || return 1
+    [[ "$canon_cand" == "${canon_home}/"* ]] || return 1
+    [[ "$canon_cand" == "$norm_cand" ]] || return 1
+
+    printf '%s\n' "$canon_cand"
+}
+
 print_uninstall_help() {
     cat <<'EOF'
 Usage:
@@ -248,6 +371,7 @@ main() {
     local sys_engine="${RVDK_ENGINE_DIR:-/usr/local/share/rvdk/engine}"
     local sys_cache="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
     local state_root="${RVDK_STATE_DIR:-/var/lib/rvdk}"
+    local systemd_unit_dir="${RVDK_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
     local os_type
     os_type="$(uname -s)"
 
@@ -255,12 +379,20 @@ main() {
     rvdk_assert_safe_managed_dir "$sys_engine" "RVDK_ENGINE_DIR"
     rvdk_assert_safe_managed_dir "$sys_cache" "RVDK_CACHE_DIR"
     rvdk_assert_safe_managed_dir "$state_root" "RVDK_STATE_DIR"
+    if [[ -n "${RVDK_SYSTEMD_UNIT_DIR:-}" ]]; then
+        rvdk_assert_safe_managed_dir "$systemd_unit_dir" "RVDK_SYSTEMD_UNIT_DIR"
+        if _rvdk_uninstall_has_symlink_component "$(_rvdk_uninstall_normalize_path "$systemd_unit_dir")"; then
+            log_fatal "Unsafe RVDK_SYSTEMD_UNIT_DIR: '${systemd_unit_dir}' contains a symbolic link component."
+        fi
+    fi
     while [[ "$sys_engine" == *//* ]]; do sys_engine="${sys_engine//\/\///}"; done
     while [[ "$sys_engine" != "/" && "$sys_engine" == */ ]]; do sys_engine="${sys_engine%/}"; done
     while [[ "$sys_cache" == *//* ]]; do sys_cache="${sys_cache//\/\///}"; done
     while [[ "$sys_cache" != "/" && "$sys_cache" == */ ]]; do sys_cache="${sys_cache%/}"; done
     while [[ "$state_root" == *//* ]]; do state_root="${state_root//\/\///}"; done
     while [[ "$state_root" != "/" && "$state_root" == */ ]]; do state_root="${state_root%/}"; done
+    while [[ "$systemd_unit_dir" == *//* ]]; do systemd_unit_dir="${systemd_unit_dir//\/\///}"; done
+    while [[ "$systemd_unit_dir" != "/" && "$systemd_unit_dir" == */ ]]; do systemd_unit_dir="${systemd_unit_dir%/}"; done
 
     local backup_root="${RVDK_BACKUP_ROOT:-${state_root}/backups}"
     if [[ -n "${RVDK_BACKUP_ROOT:-}" ]]; then
@@ -330,7 +462,7 @@ main() {
 
     stop_disable_systemd_unit() {
         local unit_name="$1"
-        local unit_file="/etc/systemd/system/${unit_name}"
+        local unit_file="${systemd_unit_dir}/${unit_name}"
         [[ -L "$unit_file" || -f "$unit_file" ]] || return 0
         if [[ "$dry_run" == "true" ]]; then
             log_info "[DRY-RUN] Would disable & remove systemd unit: ${unit_file}"
@@ -361,19 +493,50 @@ main() {
     restore_preserved_backups() {
         [[ -d "$backup_root" && ! -L "$backup_root" ]] || return 0
         local cat_name cat_dir bfile bbase stem dest bmode bowner
+        local path_sidecar sidecar_line sidecar_extra _seg _rest _has_dot_seg _seg_cnt
         local openwrt_uci_restored="false"
 
-        for cat_name in apt boot dns ntp openwrt registries; do
+        for cat_name in apt boot deeptune dns ntp openwrt registries; do
             cat_dir="${backup_root}/${cat_name}"
-            [[ -d "$cat_dir" ]] || continue
+            [[ -d "$cat_dir" && ! -L "$cat_dir" ]] || continue
 
             for bfile in "${cat_dir}"/*.orig; do
                 [[ -f "$bfile" && ! -L "$bfile" ]] || continue
                 bbase="$(basename "$bfile")"
                 stem="${bbase%.orig}"
                 dest=""
+                path_sidecar=""
 
-                if [[ "$stem" == *__* ]]; then
+                if [[ -e "${cat_dir}/${stem}.path" || -L "${cat_dir}/${stem}.path" ]]; then
+                    path_sidecar="${cat_dir}/${stem}.path"
+                elif [[ -e "${bfile}.path" || -L "${bfile}.path" ]]; then
+                    path_sidecar="${bfile}.path"
+                fi
+
+                if [[ -n "$path_sidecar" ]]; then
+                    if [[ ! -f "$path_sidecar" || -L "$path_sidecar" ]]; then
+                        log_warn "Skipped backup ${bfile}: unsafe sidecar ${path_sidecar}"
+                        continue
+                    fi
+                    sidecar_line=""
+                    sidecar_extra=""
+                    _has_dot_seg="false"
+                    {
+                        IFS= read -r sidecar_line || true
+                        while IFS= read -r sidecar_extra || [[ -n "$sidecar_extra" ]]; do
+                            if [[ -n "${sidecar_extra%$'\r'}" ]]; then
+                                _has_dot_seg="true"
+                                break
+                            fi
+                        done
+                    } < "$path_sidecar"
+                    sidecar_line="${sidecar_line%$'\r'}"
+                    if [[ "$_has_dot_seg" == "true" ]]; then
+                        log_warn "Skipped backup ${bfile}: multiline sidecar ${path_sidecar}"
+                        continue
+                    fi
+                    dest="$sidecar_line"
+                elif [[ "$stem" == *__* ]]; then
                     dest="/${stem//__//}"
                 else
                     case "$cat_name" in
@@ -410,11 +573,37 @@ main() {
                     esac
                 fi
 
-                [[ -n "$dest" && "$dest" == /* && "$dest" != *".."* ]] || continue
-                # Hard safety invariant: NEVER touch `/etc/config/network` on OpenWrt
-                [[ "$dest" == "/etc/config/network" ]] && continue
-                # Do not clobber symlinks (e.g. systemd-resolved stub /etc/resolv.conf)
-                [[ -L "$dest" ]] && continue
+                if [[ -z "$dest" || "$dest" != /* || "$dest" == */ || "$dest" == *"//"* || "$dest" =~ [[:cntrl:]] || "$dest" == *$'\n'* || "$dest" == *$'\r'* ]]; then
+                    continue
+                fi
+                _rest="${dest#/}"
+                _has_dot_seg="false"
+                _seg_cnt=0
+                while [[ -n "$_rest" ]]; do
+                    if [[ "$_rest" == */* ]]; then
+                        _seg="${_rest%%/*}"
+                        _rest="${_rest#*/}"
+                    else
+                        _seg="$_rest"
+                        _rest=""
+                    fi
+                    if [[ "$_seg" == "." || "$_seg" == ".." ]]; then
+                        _has_dot_seg="true"
+                        break
+                    fi
+                    _seg_cnt=$(( _seg_cnt + 1 ))
+                done
+                [[ "$_has_dot_seg" == "true" ]] && continue
+                (( _seg_cnt >= 2 )) || continue
+
+                # Hard safety invariant: NEVER touch `/etc/config/network` on OpenWrt or kernel/virtual trees
+                case "$dest" in
+                    /etc/config/network|/dev/*|/proc/*|/sys/*|/run/*)
+                        continue
+                        ;;
+                esac
+                # Do not clobber symlinks (e.g. systemd-resolved stub /etc/resolv.conf) or existing directories
+                [[ -L "$dest" || -d "$dest" ]] && continue
 
                 if [[ "$dry_run" == "true" ]]; then
                     log_info "[DRY-RUN] Would restore backup: ${bfile} -> ${dest}"
@@ -457,9 +646,30 @@ main() {
     if [[ "$os_type" == "Darwin" && -n "$REAL_HOME" ]]; then
         remove_path "${REAL_HOME}/Library/Caches/rvdk"
     elif [[ -n "$REAL_HOME" ]]; then
-        remove_path "${XDG_CACHE_HOME:-${REAL_HOME}/.cache}/rvdk"
+        local norm_real_home user_cache_dir fallback_cache_dir
+        norm_real_home="$(_rvdk_uninstall_normalize_path "$REAL_HOME")"
+        fallback_cache_dir="${norm_real_home}/.cache/rvdk"
+        user_cache_dir=""
+        if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+            if user_cache_dir="$(_rvdk_uninstall_resolve_safe_home_subpath "${XDG_CACHE_HOME}/rvdk" "$norm_real_home" "XDG_CACHE_HOME")"; then
+                remove_path "$user_cache_dir"
+            else
+                log_warn "Ignoring unsafe XDG_CACHE_HOME='${XDG_CACHE_HOME}'; falling back to ${fallback_cache_dir}."
+                if user_cache_dir="$(_rvdk_uninstall_resolve_safe_home_subpath "$fallback_cache_dir" "$norm_real_home" "USER_CACHE_DIR")"; then
+                    remove_path "$user_cache_dir"
+                else
+                    log_warn "Skipped unsafe fallback user cache directory '${fallback_cache_dir}'."
+                fi
+            fi
+        else
+            if user_cache_dir="$(_rvdk_uninstall_resolve_safe_home_subpath "$fallback_cache_dir" "$norm_real_home" "USER_CACHE_DIR")"; then
+                remove_path "$user_cache_dir"
+            else
+                log_warn "Skipped unsafe user cache directory '${fallback_cache_dir}'."
+            fi
+        fi
     fi
-    if [[ -n "$REAL_HOME" && -d "${REAL_HOME}/.rvdk" ]]; then
+    if [[ -n "$REAL_HOME" && ! -L "$REAL_HOME" && -d "${REAL_HOME}/.rvdk" && ! -L "${REAL_HOME}/.rvdk" ]]; then
         remove_path "${REAL_HOME}/.rvdk"
     fi
 
@@ -497,15 +707,17 @@ main() {
                 spacemit-k1-irq-affinity.service \
                 rvdk-p550-hdmi-off.service \
                 eic7700x-cpufreq-performance.service \
+                eic7700x-cpufreq-iot.service \
                 jh7110-cpufreq-performance.service \
                 fu740-cpufreq-performance.service \
                 spacemit-k1-cpufreq-performance.service \
+                spacemit-k1-cpufreq-iot.service \
                 spacemit-k3-cpufreq-performance.service \
                 dp1000-cpufreq-performance.service \
                 atlantis-cpufreq-performance.service \
                 ultrarisc-dp1000-cpufreq-performance.service \
                 tenstorrent-atlantis-cpufreq-performance.service; do
-                if [[ -L "/etc/systemd/system/${unit_base}" || -f "/etc/systemd/system/${unit_base}" ]]; then
+                if [[ -L "${systemd_unit_dir}/${unit_base}" || -f "${systemd_unit_dir}/${unit_base}" ]]; then
                     stop_disable_systemd_unit "$unit_base"
                     systemd_dirty="true"
                 fi
@@ -691,12 +903,12 @@ main() {
                 fi
             done
 
-            if [[ -L /etc/systemd/system/rvdk-tailscale-gro.service || -f /etc/systemd/system/rvdk-tailscale-gro.service ]]; then
+            if [[ -L "${systemd_unit_dir}/rvdk-tailscale-gro.service" || -f "${systemd_unit_dir}/rvdk-tailscale-gro.service" ]]; then
                 if [[ "$include_workloads" == "true" ]]; then
                     stop_disable_systemd_unit "rvdk-tailscale-gro.service"
                     systemd_dirty="true"
                 else
-                    log_skip "Preserved workload systemd unit /etc/systemd/system/rvdk-tailscale-gro.service (pass '--include-workloads' to purge)"
+                    log_skip "Preserved workload systemd unit ${systemd_unit_dir}/rvdk-tailscale-gro.service (pass '--include-workloads' to purge)"
                 fi
             fi
 

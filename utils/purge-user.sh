@@ -222,7 +222,7 @@ _rvdk_purge_validate_safe_kv() {
             [[ ${#val} -ge 1 && ${#val} -le 253 && "$val" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
             ;;
         RVDK_TUNE)
-            [[ "$val" == "data" || "$val" == "ai" ]]
+            [[ "$val" == "data" || "$val" == "ai" || "$val" == "iot" ]]
             ;;
         MOUNT_POINT|SECONDARY_MOUNT_POINT|NFS_MOUNT_POINT)
             [[ "$val" != *..* && "$val" != */. && "$val" != */.. && "$val" =~ ^/(mnt|srv)/[A-Za-z0-9._-]+$ ]]

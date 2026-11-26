@@ -231,9 +231,39 @@ _rvdk_motd_render() {
                     ;;
             esac
         done < "$kit_file"
-        case "$kit_sc" in *..*|/*) kit_sc="" ;; esac
-        case "$kit_bd" in *..*|/*) kit_bd="" ;; esac
-        case "$kit_oi" in *..*|*/*) kit_oi="" ;; esac
+        if [ -n "$kit_sc" ]; then
+            _sc_vendor="${kit_sc%%/*}"
+            _sc_slug="${kit_sc#*/}"
+            case "$kit_sc" in
+                */*/*|/*|*/) kit_sc="" ;;
+                */*) ;;
+                *) kit_sc="" ;;
+            esac
+            case "$_sc_vendor" in
+                ''|.|..|*..*|*[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) kit_sc="" ;;
+            esac
+            case "$_sc_slug" in
+                ''|.|..|*..*|*[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) kit_sc="" ;;
+            esac
+        fi
+        if [ -n "$kit_bd" ]; then
+            _bd_vendor="${kit_bd%%/*}"
+            _bd_slug="${kit_bd#*/}"
+            case "$kit_bd" in
+                */*/*|/*|*/) kit_bd="" ;;
+                */*) ;;
+                *) kit_bd="" ;;
+            esac
+            case "$_bd_vendor" in
+                ''|.|..|*..*|*[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) kit_bd="" ;;
+            esac
+            case "$_bd_slug" in
+                ''|.|..|*..*|*[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) kit_bd="" ;;
+            esac
+        fi
+        case "$kit_oi" in
+            ''|.|..|*..*|*/*|*[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) kit_oi="" ;;
+        esac
 
         dt_chain="$kit_dt_chain"
         if [ -z "$dt_chain" ]; then
@@ -256,10 +286,12 @@ _rvdk_motd_render() {
 
         bd_quirks="$kit_bd_quirks"
         if [ -z "$bd_quirks" ] && [ -n "$kit_bd" ]; then
-            if [ -x "${eng_dir}/boards/${kit_bd}/motd-quirks.sh" ]; then
+            if [ ! -L "${eng_dir}/boards/${kit_bd}" ] \
+                && [ -x "${eng_dir}/boards/${kit_bd}/motd-quirks.sh" ] \
+                && [ ! -L "${eng_dir}/boards/${kit_bd}/motd-quirks.sh" ]; then
                 bd_quirks="$("${eng_dir}/boards/${kit_bd}/motd-quirks.sh" 2>/dev/null || true)"
             fi
-            if [ -z "$bd_quirks" ] && [ -d "${eng_dir}/boards/${kit_bd}/quirks" ]; then
+            if [ -z "$bd_quirks" ] && [ ! -L "${eng_dir}/boards/${kit_bd}" ] && [ -d "${eng_dir}/boards/${kit_bd}/quirks" ]; then
                 for _qf in "${eng_dir}/boards/${kit_bd}/quirks"/*.sh; do
                     [ -f "$_qf" ] || continue
                     _qn="${_qf##*/}"
@@ -270,13 +302,22 @@ _rvdk_motd_render() {
         fi
         [ -z "$bd_quirks" ] && bd_quirks="none"
 
-        kit_out="$(awk -F= \
-            -v tune="$dt_tune" \
-            -v chain="$dt_chain" \
-            -v quirks="$bd_quirks" \
-            -v kit_path="$kit_file" \
-            -v fallback_arch="${RVDK_ARCH:-$os_arch}" \
-            -v fallback_mmu="${RVDK_MMU:-}" '
+        kit_out="$(
+            RVDK_MOTD_TUNE="$dt_tune" \
+            RVDK_MOTD_CHAIN="$dt_chain" \
+            RVDK_MOTD_QUIRKS="$bd_quirks" \
+            RVDK_MOTD_KIT_PATH="$kit_file" \
+            RVDK_MOTD_FALLBACK_ARCH="${RVDK_ARCH:-$os_arch}" \
+            RVDK_MOTD_FALLBACK_MMU="${RVDK_MMU:-}" \
+            awk -F= '
+            BEGIN {
+                tune = ENVIRON["RVDK_MOTD_TUNE"]
+                chain = ENVIRON["RVDK_MOTD_CHAIN"]
+                quirks = ENVIRON["RVDK_MOTD_QUIRKS"]
+                kit_path = ENVIRON["RVDK_MOTD_KIT_PATH"]
+                fallback_arch = ENVIRON["RVDK_MOTD_FALLBACK_ARCH"]
+                fallback_mmu = ENVIRON["RVDK_MOTD_FALLBACK_MMU"]
+            }
             function unq(s) {
                 sub(/^[^=]*=/, "", s)
                 gsub(/^"|"$/, "", s)
@@ -379,7 +420,7 @@ rvdk_converge_apt_motd() {
             continue
         fi
         [[ -f "$f" ]] || continue
-        if [[ ! -f "$modes_file" ]] || ! awk -v b="$base" '$2 == b { found=1 } END { exit !found }' "$modes_file" 2>/dev/null; then
+        if [[ ! -f "$modes_file" ]] || ! RVDK_MOTD_BASE="$base" awk '$2 == ENVIRON["RVDK_MOTD_BASE"] { found=1 } END { exit !found }' "$modes_file" 2>/dev/null; then
             fmode="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null || echo 755)"
             printf '%s %s\n' "$fmode" "$base" >> "$modes_file"
         fi

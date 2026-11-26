@@ -144,6 +144,21 @@ if [[ -n "$TUNE_REQUEST" ]]; then
     esac
 fi
 
+_eic_validate_nic() {
+    local nic="${1:-}"
+    local label="${2:-PRIMARY_NIC}"
+    local nic_re='^[a-zA-Z0-9._-]{1,15}$'
+    if [[ ! "$nic" =~ $nic_re || "$nic" == "." || "$nic" == ".." ]]; then
+        log_fatal "Invalid ${label} '${nic}' (expected Linux interface name matching ^[a-zA-Z0-9._-]{1,15}$)."
+    fi
+}
+
+if [[ "$ACTION" != "status" ]]; then
+    [[ -n "${RVDK_PRIMARY_NIC:-}" ]] && _eic_validate_nic "$RVDK_PRIMARY_NIC" "RVDK_PRIMARY_NIC"
+    [[ -n "${RVDK_SECONDARY_NIC:-}" ]] && _eic_validate_nic "$RVDK_SECONDARY_NIC" "RVDK_SECONDARY_NIC"
+    [[ -n "${SECONDARY_NIC:-}" ]] && _eic_validate_nic "$SECONDARY_NIC" "SECONDARY_NIC"
+fi
+
 if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
@@ -214,6 +229,12 @@ esac
 
 PRIMARY_NIC="${RVDK_PRIMARY_NIC:-end0}"
 [[ -z "$PRIMARY_NIC" ]] && PRIMARY_NIC="end0"
+_eic_validate_nic "$PRIMARY_NIC" "PRIMARY_NIC"
+
+SECONDARY_NIC="${RVDK_SECONDARY_NIC:-${SECONDARY_NIC:-}}"
+if [[ -n "$SECONDARY_NIC" ]]; then
+    _eic_validate_nic "$SECONDARY_NIC" "SECONDARY_NIC"
+fi
 
 rvdk_prog_init "EIC7700X SoC DeepTune (--tune ${TUNE_LABEL}): converging accelerators & IRQs..."
 log_info "Converging ESWIN EIC7700X Silicon DeepTune (--tune ${TUNE_LABEL} | mode=${TUNE_MODE})..."
@@ -259,8 +280,13 @@ elif [[ "$TUNE_MODE" == "iot" ]]; then
     TARGET_MODS=(pvrsrvkm es_drm dw_hdmi_eswin dw_hdmi_cec "${TARGET_MODS[@]}")
 fi
 
-WANT_MODPROBE="# Managed by RVDK (bsp/eswin/eic7700x/deeptune.sh | tune=${TUNE_LABEL})
-# Suppresses EIC7700X ALSA codec$( [[ "$TUNE_MODE" == "data" ]] && printf " and PowerVR BXM-4-64 GPU (pvrsrvkm)" )$( [[ "$TUNE_MODE" == "iot" ]] && printf ", PowerVR GPU (pvrsrvkm), and HDMI/DRM" ) modules."
+_eic_modprobe_desc=""
+if [[ "$TUNE_MODE" == "data" ]]; then
+    _eic_modprobe_desc=" and PowerVR BXM-4-64 GPU (pvrsrvkm)"
+elif [[ "$TUNE_MODE" == "iot" ]]; then
+    _eic_modprobe_desc=", PowerVR GPU (pvrsrvkm), and HDMI/DRM"
+fi
+WANT_MODPROBE="$(printf '# Managed by RVDK (bsp/eswin/eic7700x/deeptune.sh | tune=%s)\n# Suppresses EIC7700X ALSA codec%s modules.' "$TUNE_LABEL" "$_eic_modprobe_desc")"
 for m in "${TARGET_MODS[@]}"; do
     WANT_MODPROBE+=$'\n'"blacklist ${m}"
 done
@@ -400,27 +426,43 @@ fi
 # ==============================================================================
 rvdk_prog 80 "EIC7700X DeepTune: pinning PLIC xHCI & GbE (${PRIMARY_NIC}) interrupts..."
 
-WANT_IRQ_SCRIPT="#!/usr/bin/env bash
+printf -v _q_primary_nic '%q' "$PRIMARY_NIC"
+_eic_irq_header="$(cat <<'EOF'
+#!/usr/bin/env bash
 # Managed by RVDK (bsp/eswin/eic7700x/deeptune.sh)
 # Spread high-rate EIC7700X peripheral IRQs off CPU0 across the 4 SiFive P550 harts:
 #   • nvme0q1..q4 : striped 0,1,2,3 by PCI-MSI
 #   • xhci-hcd:usb3 -> CPU1
-#   • ${PRIMARY_NIC} (GbE)    -> CPU2
+#   • primary GbE   -> CPU2
 #   • xhci-hcd:usb1 -> CPU3
 set -Eeuo pipefail
+EOF
+)"
+_eic_irq_body="$(cat <<'EOF'
 pin_irq() {
-    local pattern=\"\$1\"
-    local cpu_list=\"\$2\"
+    local pattern="$1"
+    local cpu_list="$2"
     local irq
     while IFS= read -r irq; do
-        [[ -n \"\$irq\" && -w \"/proc/irq/\${irq}/smp_affinity_list\" ]] || continue
-        printf \"%s\" \"\$cpu_list\" > \"/proc/irq/\${irq}/smp_affinity_list\" 2>/dev/null || true
-    done < <(awk -v pat=\"\$pattern\" \"\\\$0 ~ pat { sub(/:/, \\\"\\\", \\\$1); print \\\$1 }\" /proc/interrupts 2>/dev/null)
+        [[ -n "$irq" && -w "/proc/irq/${irq}/smp_affinity_list" ]] || continue
+        printf "%s" "$cpu_list" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null || true
+    done < <(awk -v pat="$pattern" '$0 ~ pat { sub(/:/, "", $1); print $1 }' /proc/interrupts 2>/dev/null)
 }
-pin_irq \"xhci-hcd:usb3\" \"1\"
-pin_irq \"${PRIMARY_NIC}\" \"2\"
-pin_irq \"xhci-hcd:usb1\" \"3\"
-"
+pin_irq "xhci-hcd:usb3" "1"
+pin_irq "$PRIMARY_NIC" "2"
+if [[ -n "${SECONDARY_NIC:-}" ]]; then
+    pin_irq "$SECONDARY_NIC" "2"
+fi
+pin_irq "xhci-hcd:usb1" "3"
+EOF
+)"
+if [[ -n "$SECONDARY_NIC" ]]; then
+    printf -v _q_secondary_nic '%q' "$SECONDARY_NIC"
+    _eic_irq_sec_line=$'\n'"SECONDARY_NIC=${_q_secondary_nic}"
+else
+    _eic_irq_sec_line=""
+fi
+WANT_IRQ_SCRIPT="${_eic_irq_header}"$'\n'"PRIMARY_NIC=${_q_primary_nic}${_eic_irq_sec_line}"$'\n'"${_eic_irq_body}"
 
 WANT_IRQ_UNIT="[Unit]
 Description=RVDK ESWIN EIC7700X PLIC Interrupt Affinity Balancer (${PRIMARY_NIC} + xHCI)
@@ -437,16 +479,19 @@ WantedBy=multi-user.target"
 
 install -d -m 0755 /usr/local/sbin
 IRQ_CHANGED="false"
-if ! printf "%s" "$WANT_IRQ_SCRIPT" | cmp -s - "$IRQ_SCRIPT" 2>/dev/null; then
-    printf "%s" "$WANT_IRQ_SCRIPT" | rvdk_atomic_write "$IRQ_SCRIPT" 0755
+if ! printf '%s\n' "$WANT_IRQ_SCRIPT" | cmp -s - "$IRQ_SCRIPT" 2>/dev/null; then
+    printf '%s\n' "$WANT_IRQ_SCRIPT" | rvdk_atomic_write "$IRQ_SCRIPT" 0755
     IRQ_CHANGED="true"
 fi
-if ! printf "%s\n" "$WANT_IRQ_UNIT" | cmp -s - "$IRQ_UNIT" 2>/dev/null; then
-    printf "%s\n" "$WANT_IRQ_UNIT" | rvdk_atomic_write "$IRQ_UNIT" 0644
-    systemctl daemon-reload
-    systemctl enable eic7700x-irq-affinity.service >/dev/null
-    IRQ_CHANGED="true"
+if command -v systemctl >/dev/null 2>&1; then
+    if ! printf "%s\n" "$WANT_IRQ_UNIT" | cmp -s - "$IRQ_UNIT" 2>/dev/null; then
+        printf "%s\n" "$WANT_IRQ_UNIT" | rvdk_atomic_write "$IRQ_UNIT" 0644
+        systemctl daemon-reload
+        systemctl enable eic7700x-irq-affinity.service >/dev/null
+        IRQ_CHANGED="true"
+    fi
 fi
+[[ -f "$IRQ_SCRIPT" && ! -L "$IRQ_SCRIPT" ]] || log_fatal "Refusing non-regular or symlink IRQ helper: ${IRQ_SCRIPT}"
 "$IRQ_SCRIPT"
 if [[ "$IRQ_CHANGED" == "true" ]]; then
     log_ok "Pinned EIC7700X PLIC IRQ affinity (xhci:usb3->CPU1, ${PRIMARY_NIC}->CPU2, xhci:usb1->CPU3)"

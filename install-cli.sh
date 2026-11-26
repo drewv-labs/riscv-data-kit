@@ -48,19 +48,6 @@ EOF
     fi
 done
 
-if [[ $EUID -ne 0 ]]; then
-    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
-        exec sudo -E bash "$SCRIPT_SELF" "$@"
-    else
-        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash" >&2
-        exit 1
-    fi
-fi
-
-# Enforce 022 umask so system directories and cloned scripts remain 0755/0644
-# even on hardened root environments with umask 077/027.
-umask 022
-
 _REPO_ROOT=""
 if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
     _REPO_ROOT="$(cd "$(dirname "$SCRIPT_SELF")" && pwd)"
@@ -86,8 +73,24 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
             mv -f "$_tmp" "$_dst"
         }
         rvdk_sync_cold_clock() { :; }
+        rvdk_sudo_preserve() { sudo "$@"; }
     fi
 fi
+
+if [[ $EUID -ne 0 ]]; then
+    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
+        _rvdk_sudo_rc=0
+        rvdk_sudo_preserve bash "$SCRIPT_SELF" "$@" || _rvdk_sudo_rc=$?
+        exit "$_rvdk_sudo_rc"
+    else
+        echo "[RVDK:FATAL] Pipe into 'sudo bash': curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash" >&2
+        exit 1
+    fi
+fi
+
+# Enforce 022 umask so system directories and cloned scripts remain 0755/0644
+# even on hardened root environments with umask 077/027.
+umask 022
 
 if ! typeset -f rvdk_assert_safe_managed_dir >/dev/null 2>&1; then
     rvdk_assert_safe_managed_dir() {

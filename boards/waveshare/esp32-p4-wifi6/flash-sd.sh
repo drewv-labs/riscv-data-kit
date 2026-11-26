@@ -33,7 +33,7 @@ fi
 _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 
-# @RVDK_INLINE_LIBS: common kit progbar
+# @RVDK_INLINE_LIBS: common kit progbar storage_guard
 if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
     if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
         # shellcheck source=lib/common.sh
@@ -75,6 +75,12 @@ if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
     else
         rvdk_prog_init() { :; }
         rvdk_prog()      { :; }
+    fi
+fi
+if [[ -z "${_RVDK_STORAGE_GUARD_SH_LOADED:-}" ]]; then
+    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/storage_guard.sh" ]]; then
+        # shellcheck source=lib/storage_guard.sh
+        source "${_REPO_ROOT}/lib/storage_guard.sh"
     fi
 fi
 
@@ -307,20 +313,6 @@ _stage_p4_tree() {
     fi
 }
 
-_resolve_linux_parent_disk() {
-    local dev_node="${1:-}"
-    [[ -n "$dev_node" ]] || return 0
-    local pk=""
-    if command -v lsblk >/dev/null 2>&1; then
-        pk="$(lsblk -no PKNAME "$dev_node" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
-    fi
-    if [[ -n "$pk" ]]; then
-        printf '/dev/%s\n' "$pk"
-    else
-        printf '%s\n' "$dev_node"
-    fi
-}
-
 _validate_target_disk() {
     local os_type="$1"
     local arg="$2"
@@ -388,37 +380,8 @@ _validate_target_disk() {
     esac
 
     # Fail-closed check against live OS /boot /swap backing devices even before -b stat
-    if command -v findmnt >/dev/null 2>&1; then
-        local crit_mp crit_src crit_parent
-        for crit_mp in / /boot /boot/efi /usr /var /home; do
-            crit_src="$(findmnt -n -o SOURCE "$crit_mp" 2>/dev/null || true)"
-            [[ -n "$crit_src" ]] || continue
-            crit_parent="$(_resolve_linux_parent_disk "$crit_src")"
-            if [[ "$arg" == "$crit_src" || "$arg" == "$crit_parent" || "$crit_src" == "${arg}"* ]]; then
-                log_fatal "Safety Interlock: ${arg} backs critical system mount '${crit_mp}' (${crit_src})! Aborting."
-            fi
-        done
-    fi
-    if [[ -r /proc/swaps ]]; then
-        local sw_dev sw_parent
-        while IFS= read -r sw_dev; do
-            [[ -n "$sw_dev" ]] || continue
-            sw_parent="$(_resolve_linux_parent_disk "$sw_dev")"
-            if [[ "$arg" == "$sw_dev" || "$arg" == "$sw_parent" || "$sw_dev" == "${arg}"* ]]; then
-                log_fatal "Safety Interlock: ${arg} backs active swap device (${sw_dev})! Aborting."
-            fi
-        done < <(awk 'NR>1 {print $1}' /proc/swaps 2>/dev/null || true)
-    fi
-    if command -v lsblk >/dev/null 2>&1; then
-        local mnt
-        while IFS= read -r mnt; do
-            [[ -z "$mnt" ]] && continue
-            case "$mnt" in
-                /|/boot|/boot/*|/usr|/var|/home|"[SWAP]")
-                    log_fatal "Safety Interlock: ${arg} backs critical system mount/swap (${mnt})! Aborting."
-                    ;;
-            esac
-        done < <(lsblk -rn -o MOUNTPOINTS "$arg" 2>/dev/null || lsblk -rn -o MOUNTPOINT "$arg" 2>/dev/null || true)
+    if [[ "$arg" == /* || -b "$arg" ]] && rvdk_device_backs_os_or_swap "$arg"; then
+        log_fatal "Safety Interlock: ${arg} backs critical system mount/swap! Aborting."
     fi
 
     [[ -b "$arg" ]] || log_fatal "Block device not found: ${arg}"
@@ -584,10 +547,11 @@ else
     done
 
     rvdk_prog 55 "ESP32-P4 SD: partitioning 4 MiB-aligned MBR + FAT32 (${ROOT_LABEL}, 32KB clusters)..."
-    for part_cand in "${RESOLVED_BLOCK_DEV}"*; do
-        [[ "$part_cand" == "$RESOLVED_BLOCK_DEV" ]] && continue
+    while IFS= read -r part_cand; do
+        [[ -n "$part_cand" ]] || continue
         _run_priv umount "$part_cand" 2>/dev/null || _run_priv umount -l "$part_cand" 2>/dev/null || true
-    done
+    done < <(rvdk_list_child_partitions "$RESOLVED_BLOCK_DEV")
+    _run_priv umount "$RESOLVED_BLOCK_DEV" 2>/dev/null || _run_priv umount -l "$RESOLVED_BLOCK_DEV" 2>/dev/null || true
 
     command -v wipefs >/dev/null 2>&1 && _run_priv wipefs -af "$RESOLVED_BLOCK_DEV" >/dev/null 2>&1 || true
     _run_priv parted -s "$RESOLVED_BLOCK_DEV" -- mklabel msdos

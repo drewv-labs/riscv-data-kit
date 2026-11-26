@@ -7,7 +7,7 @@
 #   Idempotent Day-0 OS normalization across Debian, Ubuntu, and SpacemiT Bianbu
 #   RISC-V nodes:
 #     • Canonical US-first signed HTTPS APT mirror normalization (`deb.debian.org`,
-#       `security.debian.org`, `ports.ubuntu.com`, `armbian.chi.auroradev.org`)
+#       `security.debian.org`, `ports.ubuntu.com`, `apt.armbian.com`)
 #       plus vendor CN PyPI/npm/cargo/goproxy/DNS touch-plane hygiene
 #     • Monotonic cold-RTC clock recovery, US-first persistent NTP (`systemd-timesyncd`
 #       / `chrony`), UTF-8 locale hygiene & non-interactive `sudo` availability

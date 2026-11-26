@@ -87,6 +87,13 @@ STAGE_ITEMS = (
     "LICENSE",
 )
 
+def _build_personal_name_pattern() -> re.Pattern[str]:
+    """Assemble personal-name PII regex from hex tokens without embedding raw PII."""
+    given = bytes.fromhex("64726577").decode("ascii")
+    family = bytes.fromhex("76616e64616772696666").decode("ascii")
+    return re.compile(rf"(?<![A-Za-z0-9])(?:{given}[-._\s]*)?{family}(?![A-Za-z0-9])", re.IGNORECASE)
+
+
 FORBIDDEN_BLEED_PATTERNS: Sequence[tuple[str, re.Pattern[str], bool]] = (
     ("Downstream project bleed (BrakerRak)", re.compile(r"\bbrakerrak\b", re.IGNORECASE), True),
     ("Downstream project bleed (BrakerBox)", re.compile(r"\bbrakerbox\b", re.IGNORECASE), False),
@@ -117,6 +124,19 @@ FORBIDDEN_BLEED_PATTERNS: Sequence[tuple[str, re.Pattern[str], bool]] = (
     ("Legacy local PGDG path (drewv-pgdg-riscv64)", re.compile(r"drewv-pgdg-riscv64"), False),
     ("Legacy local PGDG list (drewv-local-pgdg)", re.compile(r"drewv-local-pgdg"), False),
     ("Personal username in CLI flags (--user drew)", re.compile(r"--user\s+drew\b"), False),
+    ("Hardcoded personal home directory path", re.compile(r"(?:/Users|/home)/drew\b", re.IGNORECASE), False),
+    (
+        "Private email address outside drewv-labs.dev",
+        re.compile(
+            r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9](?:[A-Za-z0-9._%+-]*[A-Za-z0-9])?@"
+            r"(?!(?:[A-Za-z0-9-]+\.)*drewv-labs\.dev(?![A-Za-z0-9-]|\.[A-Za-z0-9-]))"
+            r"(?!(?:[A-Za-z0-9-]+\.)+(?:service|socket|target|timer|mount|automount|swap|path|slice|scope|device)(?![A-Za-z0-9-]|\.[A-Za-z0-9-]))"
+            r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}(?![A-Za-z0-9-]|\.[A-Za-z0-9-])",
+            re.IGNORECASE,
+        ),
+        False,
+    ),
+    ("Personal legal name PII bleed", _build_personal_name_pattern(), False),
     ("KASLR-defeating kptr_restrict=0 default", re.compile(r"kptr_restrict\s*=\s*0"), False),
     ("Unsigned APT --allow-unauthenticated", re.compile(r"--allow-unauthenticated"), False),
     ("Unsigned HTTP [trusted=yes] APT source", re.compile(r"\[trusted=yes\]\s*http://", re.IGNORECASE), False),

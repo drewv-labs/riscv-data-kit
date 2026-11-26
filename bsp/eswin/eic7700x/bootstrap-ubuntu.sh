@@ -109,13 +109,17 @@ rvdk_prog 75 "EIC7700X BSP: locking P550 performance governor..."
 rvdk_bsp_lock_cpufreq_performance "eic7700x" "Lock ESWIN EIC7700X SiFive P550 Harts to Performance Governor"
 
 rvdk_prog 90 "EIC7700X BSP: PWM fan controller & P550 PMU unlock..."
-if command -v apt-cache >/dev/null 2>&1 && apt-cache show fancontrol-config-p550-premier >/dev/null 2>&1; then
-    if ! dpkg -s fancontrol-config-p550-premier >/dev/null 2>&1; then
-        rvdk_apt_ensure fancontrol-config-p550-premier
-        log_ok "Installed fancontrol-config-p550-premier"
-    else
-        log_skip "fancontrol-config-p550-premier already installed"
+if [[ "${RVDK_BOARD:-}" == "sifive/p550" ]]; then
+    if command -v apt-cache >/dev/null 2>&1 && apt-cache show fancontrol-config-p550-premier >/dev/null 2>&1; then
+        if ! dpkg -s fancontrol-config-p550-premier >/dev/null 2>&1; then
+            rvdk_apt_ensure fancontrol-config-p550-premier
+            log_ok "Installed fancontrol-config-p550-premier"
+        else
+            log_skip "fancontrol-config-p550-premier already installed"
+        fi
     fi
+else
+    log_skip "Skipping fancontrol-config-p550-premier (board=${RVDK_BOARD:-unspecified}, requires sifive/p550)"
 fi
 
 rvdk_bsp_unlock_pmu "/etc/sysctl.d/90-sifive-p550-pmu.conf" "SiFive P550 L1/PL2/L3" "$EXPOSE_KALLSYMS"

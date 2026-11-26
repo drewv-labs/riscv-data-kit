@@ -326,6 +326,7 @@ _ntfy_curl() {
 
 _NTFY_TMP_ARCHIVE=""
 _NTFY_TMP_EXTRACT=""
+_NTFY_TMP_PKG=""
 _NTFY_TMP_GO_TGZ=""
 _NTFY_BUILD_ACTIVE="false"
 NTFY_LIB_ROOT="/var/lib/rvdk/ntfy-riscv64"
@@ -340,6 +341,7 @@ _rvdk_ntfy_cleanup() {
     [[ -n "$_NTFY_TMP_ARCHIVE" ]] && rm -f "$_NTFY_TMP_ARCHIVE" "${_NTFY_TMP_ARCHIVE}.sha256" 2>/dev/null || true
     [[ -n "$_NTFY_TMP_GO_TGZ" ]] && rm -f "$_NTFY_TMP_GO_TGZ" 2>/dev/null || true
     [[ -n "$_NTFY_TMP_EXTRACT" && -d "$_NTFY_TMP_EXTRACT" ]] && rm -rf "$_NTFY_TMP_EXTRACT" 2>/dev/null || true
+    [[ -n "$_NTFY_TMP_PKG" && -d "$_NTFY_TMP_PKG" ]] && rm -rf "$_NTFY_TMP_PKG" 2>/dev/null || true
     if [[ "$_NTFY_BUILD_ACTIVE" == "true" && "$KEEP_BUILD_DIR" != "true" && -d "$BUILD_DIR" ]]; then
         rm -rf "$BUILD_DIR" 2>/dev/null || true
     fi
@@ -453,12 +455,26 @@ ensure_go_toolchain() {
     if [[ ! -x "${ver_dir}/go/bin/go" ]]; then
         rm -rf "$ver_dir"
         mkdir -p "$ver_dir"
-        tar -xzf "$cached_tgz" -C "$ver_dir"
+        tar --no-same-owner --no-same-permissions -xzf "$cached_tgz" -C "$ver_dir"
         chmod -R a+rX "$ver_dir" 2>/dev/null || true
     fi
     ln -sfn "${ver_dir}/go" "${go_cache_root}/current"
     log_ok "Verified Go toolchain ${go_ver} (${go_sha:0:16}...)" >&2
     printf '%s\n' "${go_cache_root}/current/bin/go"
+}
+
+_ntfy_stage_built_binary() {
+    local stage_root="$1"
+    local dst_bin="$2"
+    local src_bin="${stage_root}/usr/bin/ntfy"
+    if [[ -L "$stage_root" || ! -d "$stage_root" || -L "${stage_root}/usr" || ! -d "${stage_root}/usr" || -L "${stage_root}/usr/bin" || ! -d "${stage_root}/usr/bin" ]]; then
+        log_fatal "Refusing symlinked or invalid ntfy staging directory: ${stage_root}"
+    fi
+    if [[ ! -f "$src_bin" || -L "$src_bin" ]]; then
+        log_fatal "Refusing symlink or non-regular ntfy binary at ${src_bin}"
+    fi
+    install -d -m 0755 -o root -g root "$(dirname "$dst_bin")"
+    install -m 0755 -o root -g root "$src_bin" "$dst_bin"
 }
 
 # 2. Install ntfy (Verified RVDK Precompiled Bundle -> Unprivileged Source Compile Fallback)
@@ -663,21 +679,37 @@ else
                 "$GO_BIN" build -C "${BUILD_DIR}/src" -trimpath -tags "$BUILD_TAGS" -ldflags "$BASE_LDFLAGS" -o "${STAGE_ROOT}/usr/bin/ntfy" .
         fi
 
-        chown 0:0 "${STAGE_ROOT}/usr/bin/ntfy"
-        chmod 0755 "${STAGE_ROOT}/usr/bin/ntfy"
-        "${STAGE_ROOT}/usr/bin/ntfy" --version >/dev/null
+        _NTFY_TMP_PKG="$(mktemp -d)"
+        chmod 0755 "$_NTFY_TMP_PKG"
+        _ntfy_stage_built_binary "$STAGE_ROOT" "${_NTFY_TMP_PKG}/usr/bin/ntfy"
+        "${_NTFY_TMP_PKG}/usr/bin/ntfy" --version >/dev/null
 
+        install -d -m 0755 -o root -g root "${_NTFY_TMP_PKG}/etc/systemd/system" "${_NTFY_TMP_PKG}/etc/ntfy"
+        for _src_dir in "${BUILD_DIR}/src" "${BUILD_DIR}/src/server" "${BUILD_DIR}/src/client"; do
+            if [[ -L "$_src_dir" ]]; then
+                log_fatal "Refusing symlinked source directory in ntfy build workspace: ${_src_dir}"
+            fi
+        done
+        if [[ -L "${BUILD_DIR}/src/server/ntfy.service" ]]; then
+            log_fatal "Refusing symlinked unit file in ntfy build workspace: ${BUILD_DIR}/src/server/ntfy.service"
+        fi
+        if [[ -L "${BUILD_DIR}/src/server/server.yml" ]]; then
+            log_fatal "Refusing symlinked config file in ntfy build workspace: ${BUILD_DIR}/src/server/server.yml"
+        fi
+        if [[ -L "${BUILD_DIR}/src/client/client.yml" ]]; then
+            log_fatal "Refusing symlinked config file in ntfy build workspace: ${BUILD_DIR}/src/client/client.yml"
+        fi
         if [[ -f "${BUILD_DIR}/src/server/ntfy.service" ]]; then
-            install -m 0644 -o root -g root "${BUILD_DIR}/src/server/ntfy.service" "${STAGE_ROOT}/etc/systemd/system/ntfy.service"
+            install -m 0644 -o root -g root "${BUILD_DIR}/src/server/ntfy.service" "${_NTFY_TMP_PKG}/etc/systemd/system/ntfy.service"
         fi
         if [[ -f "${BUILD_DIR}/src/server/server.yml" ]]; then
-            install -m 0644 -o root -g root "${BUILD_DIR}/src/server/server.yml" "${STAGE_ROOT}/etc/ntfy/server.yml.dist"
+            install -m 0644 -o root -g root "${BUILD_DIR}/src/server/server.yml" "${_NTFY_TMP_PKG}/etc/ntfy/server.yml.dist"
         fi
         if [[ -f "${BUILD_DIR}/src/client/client.yml" ]]; then
-            install -m 0644 -o root -g root "${BUILD_DIR}/src/client/client.yml" "${STAGE_ROOT}/etc/ntfy/client.yml"
+            install -m 0644 -o root -g root "${BUILD_DIR}/src/client/client.yml" "${_NTFY_TMP_PKG}/etc/ntfy/client.yml"
         fi
 
-        rvdk_kv_write "${STAGE_ROOT}/BUILD_INFO.env" 0644 "Managed by RVDK (mods/ntfy/forge.sh)" \
+        rvdk_kv_write "${_NTFY_TMP_PKG}/BUILD_INFO.env" 0644 "Managed by RVDK (mods/ntfy/forge.sh)" \
             "NTFY_VERSION=${NTFY_VERSION}" \
             "NTFY_COMMIT=${GIT_COMMIT}" \
             "TARGET_SLUG=${TARGET_SLUG}" \
@@ -687,8 +719,9 @@ else
             "BUILT_AT=${BUILD_DATE}"
 
         rvdk_prog 72 "ntfy ${NTFY_VERSION}: packaging RVDK catalog bundle (${BUNDLE_NAME})..."
-        chown -R 0:0 "$STAGE_ROOT"
-        tar -I 'zstd -9 -T0' -cf "$LOCAL_BUNDLE" -C "$STAGE_ROOT" .
+        tar -I 'zstd -9 -T0' -cf "$LOCAL_BUNDLE" -C "$_NTFY_TMP_PKG" .
+        rm -rf "$_NTFY_TMP_PKG"
+        _NTFY_TMP_PKG=""
         BUILT_SHA="$(rvdk_sha256_file "$LOCAL_BUNDLE")"
         printf '%s  %s\n' "$BUILT_SHA" "$BUNDLE_NAME" | rvdk_atomic_write "$LOCAL_BUNDLE_SHA" 0644
         chmod 0644 "$LOCAL_BUNDLE"
@@ -700,15 +733,18 @@ else
 
     rvdk_prog 78 "ntfy ${NTFY_VERSION}: installing binary & systemd unit from verified bundle..."
     _NTFY_TMP_EXTRACT="$(mktemp -d)"
-    tar -I zstd -xf "$LOCAL_BUNDLE" -C "$_NTFY_TMP_EXTRACT"
-    [[ -x "${_NTFY_TMP_EXTRACT}/usr/bin/ntfy" ]] || log_fatal "Invalid ntfy bundle layout inside ${LOCAL_BUNDLE} (missing usr/bin/ntfy)."
+    tar --no-same-owner --no-same-permissions -I zstd -xf "$LOCAL_BUNDLE" -C "$_NTFY_TMP_EXTRACT"
+    if [[ -n "$(find "$_NTFY_TMP_EXTRACT" -type l -print -quit)" ]]; then
+        log_fatal "Refusing ntfy bundle containing symbolic links inside ${LOCAL_BUNDLE}."
+    fi
+    [[ -f "${_NTFY_TMP_EXTRACT}/usr/bin/ntfy" && ! -L "${_NTFY_TMP_EXTRACT}/usr/bin/ntfy" ]] || log_fatal "Invalid or symlinked ntfy bundle layout inside ${LOCAL_BUNDLE} (missing or non-regular usr/bin/ntfy)."
 
     install -d -m 0755 /usr/bin /etc/systemd/system /etc/ntfy
-    install -m 0755 -o root -g root "${_NTFY_TMP_EXTRACT}/usr/bin/ntfy" /usr/bin/ntfy
+    _ntfy_stage_built_binary "$_NTFY_TMP_EXTRACT" /usr/bin/ntfy
 
-    if [[ -f "${_NTFY_TMP_EXTRACT}/etc/systemd/system/ntfy.service" ]]; then
+    if [[ -f "${_NTFY_TMP_EXTRACT}/etc/systemd/system/ntfy.service" && ! -L "${_NTFY_TMP_EXTRACT}/etc/systemd/system/ntfy.service" ]]; then
         install -m 0644 -o root -g root "${_NTFY_TMP_EXTRACT}/etc/systemd/system/ntfy.service" /etc/systemd/system/ntfy.service
-    elif [[ -f "${_NTFY_TMP_EXTRACT}/lib/systemd/system/ntfy.service" ]]; then
+    elif [[ -f "${_NTFY_TMP_EXTRACT}/lib/systemd/system/ntfy.service" && ! -L "${_NTFY_TMP_EXTRACT}/lib/systemd/system/ntfy.service" ]]; then
         install -m 0644 -o root -g root "${_NTFY_TMP_EXTRACT}/lib/systemd/system/ntfy.service" /etc/systemd/system/ntfy.service
     else
         rvdk_atomic_write /etc/systemd/system/ntfy.service 0644 <<'EOF'
@@ -739,15 +775,15 @@ WantedBy=multi-user.target
 EOF
     fi
 
-    if [[ -f "${_NTFY_TMP_EXTRACT}/etc/ntfy/server.yml.dist" ]]; then
+    if [[ -f "${_NTFY_TMP_EXTRACT}/etc/ntfy/server.yml.dist" && ! -L "${_NTFY_TMP_EXTRACT}/etc/ntfy/server.yml.dist" ]]; then
         install -m 0644 -o root -g root "${_NTFY_TMP_EXTRACT}/etc/ntfy/server.yml.dist" /etc/ntfy/server.yml.dist
     fi
-    if [[ -f "${_NTFY_TMP_EXTRACT}/etc/ntfy/client.yml" && ! -f /etc/ntfy/client.yml ]]; then
+    if [[ -f "${_NTFY_TMP_EXTRACT}/etc/ntfy/client.yml" && ! -L "${_NTFY_TMP_EXTRACT}/etc/ntfy/client.yml" && ! -f /etc/ntfy/client.yml ]]; then
         install -m 0644 -o root -g root "${_NTFY_TMP_EXTRACT}/etc/ntfy/client.yml" /etc/ntfy/client.yml
     fi
 
     BUNDLE_WEB_EMBEDDED="false"
-    if [[ -r "${_NTFY_TMP_EXTRACT}/BUILD_INFO.env" ]]; then
+    if [[ -r "${_NTFY_TMP_EXTRACT}/BUILD_INFO.env" && ! -L "${_NTFY_TMP_EXTRACT}/BUILD_INFO.env" ]]; then
         NTFY_WEB_EMBEDDED=""
         rvdk_kv_load "${_NTFY_TMP_EXTRACT}/BUILD_INFO.env" NTFY_WEB_EMBEDDED
         BUNDLE_WEB_EMBEDDED="${NTFY_WEB_EMBEDDED:-false}"

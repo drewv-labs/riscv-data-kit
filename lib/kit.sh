@@ -273,8 +273,11 @@ rvdk_kit_resolve() {
             IFS='|' read -r _mem_arch _mem_mmu <<< "$_mem_am"
             RVDK_ARCH="${RVDK_ARCH:-$_mem_arch}"
             RVDK_MMU="${RVDK_MMU:-$_mem_mmu}"
-            export RVDK_ARCH RVDK_MMU
         fi
+        if [[ "${RVDK_MMU:-unknown}" == "unknown" ]] && [[ "${RVDK_OS_ID:-}" == "esp-idf" || "${RVDK_OS_ID:-}" == "nuttx" || "${RVDK_OS_ID:-}" == "linux-nommu" ]]; then
+            RVDK_MMU="none"
+        fi
+        export RVDK_ARCH RVDK_MMU
         return 0
     fi
 
@@ -290,6 +293,9 @@ rvdk_kit_resolve() {
                 IFS='|' read -r _disk_arch _disk_mmu <<< "$_disk_am"
                 RVDK_ARCH="${RVDK_ARCH:-$_disk_arch}"
                 RVDK_MMU="${RVDK_MMU:-$_disk_mmu}"
+            fi
+            if [[ "${RVDK_MMU:-unknown}" == "unknown" ]] && [[ "${RVDK_OS_ID:-}" == "esp-idf" || "${RVDK_OS_ID:-}" == "nuttx" || "${RVDK_OS_ID:-}" == "linux-nommu" ]]; then
+                RVDK_MMU="none"
             fi
             _RVDK_LAST_PROBED_DT_MODEL="${RVDK_DT_MODEL:-}"
             export RVDK_KIT_SCHEMA RVDK_DT_MODEL RVDK_SOC RVDK_SOC_SLUG RVDK_BOARD RVDK_BOARD_TAG RVDK_ARCH RVDK_MMU RVDK_FACTORY_USER RVDK_OS_ID RVDK_OS_VERSION_ID RVDK_PRIMARY_NIC RVDK_CPU_HARTS
@@ -419,6 +425,9 @@ rvdk_kit_resolve() {
     local arch_mmu arch mmu
     arch_mmu="$(_rvdk_infer_arch_mmu "$soc")"
     IFS='|' read -r arch mmu <<< "$arch_mmu"
+    if [[ "$mmu" == "unknown" ]] && [[ "$os_id" == "esp-idf" || "$os_id" == "nuttx" || "$os_id" == "linux-nommu" ]]; then
+        mmu="none"
+    fi
 
     local soc_slug="${soc//\//-}"
     local primary_nic

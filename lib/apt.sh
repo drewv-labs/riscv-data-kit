@@ -44,9 +44,38 @@ _rvdk_apt_log_skip() {
     fi
 }
 
+_rvdk_apt_log_warn() {
+    if typeset -f log_warn >/dev/null 2>&1; then
+        log_warn "$1"
+    else
+        printf "\033[1;33m[WARN]\033[0m %s\n" "$1"
+    fi
+}
+
 rvdk_apt_has_lists() {
     compgen -G "/var/lib/apt/lists/*Packages*" >/dev/null 2>&1 || \
     compgen -G "/var/lib/apt/lists/*InRelease" >/dev/null 2>&1
+}
+
+_rvdk_apt_run_update() {
+    local min_epoch=1767225600
+    local now_epoch=""
+    now_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+    [[ "$now_epoch" =~ ^[0-9]+$ ]] || now_epoch=0
+
+    if (( now_epoch < min_epoch )) && typeset -f rvdk_sync_cold_clock >/dev/null 2>&1; then
+        rvdk_sync_cold_clock || true
+        now_epoch="$(date -u +%s 2>/dev/null || echo 0)"
+        [[ "$now_epoch" =~ ^[0-9]+$ ]] || now_epoch=0
+    fi
+
+    if (( now_epoch < min_epoch )); then
+        _rvdk_apt_log_warn "System UTC clock (${now_epoch}) predates 2026-01-01 after cold-clock sync; running apt-get update with Acquire::Check-Valid-Until=false"
+        apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q
+        return $?
+    fi
+
+    apt-get -o DPkg::Lock::Timeout=120 update -q
 }
 
 # Rewrite APT source stream ($1=in_file, $2=scheme) to stdout from CN / plain
@@ -187,7 +216,7 @@ rvdk_apt_normalize_mirrors() {
         rm -rf /var/lib/apt/lists/* 2>/dev/null || true
         export RVDK_NO_APT_UPDATE="0"
         if [[ "$need_ca_upgrade" == "true" ]]; then
-            apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
+            _rvdk_apt_run_update || true
             DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=120 install ca-certificates >/dev/null 2>&1 || true
             if [[ -s /etc/ssl/certs/ca-certificates.crt ]]; then
                 export _RVDK_APT_MIRRORS_CHECKED="0"
@@ -219,8 +248,7 @@ rvdk_apt_update() {
             return 0
         fi
     fi
-    apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || \
-        apt-get -o DPkg::Lock::Timeout=120 update -q
+    _rvdk_apt_run_update || return $?
     rvdk_apt_mark_updated
 }
 

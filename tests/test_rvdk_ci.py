@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -304,6 +305,82 @@ class TestForbiddenBleedPatterns:
         assert len(errs) == 1
         assert "bad.sh:2:" in errs[0]
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "/Users/" + "drew",
+            "/Users/" + "drew/repos/riscv-data-kit",
+            "/home/" + "drew/.ssh/id_ed25519",
+            "/users/" + "drew",
+            "dev" + "@gmail.com",
+            "alice" + "@example.org",
+            "ops" + "@drewv-labs.dev.evil.com",
+            "ops" + "@drewv-labs.dev-phish.org",
+            "ops" + "@fake-drewv-labs.dev",
+            "ops" + "@drewv-labs.com",
+            "See user" + "@example.com.",
+            "Copyright (c) 2026 DREW-V Labs ("
+            + bytes.fromhex("64726577").decode("ascii").title()
+            + " "
+            + bytes.fromhex("76616e64616772696666").decode("ascii").title()
+            + ")",
+            bytes.fromhex("64726577").decode("ascii")
+            + bytes.fromhex("76616e64616772696666").decode("ascii"),
+            bytes.fromhex("64726577").decode("ascii")
+            + "."
+            + bytes.fromhex("76616e64616772696666").decode("ascii"),
+            "author: " + bytes.fromhex("76616e64616772696666").decode("ascii").title(),
+        ],
+    )
+    def test_strict_pii_paths_emails_and_legal_name_caught_everywhere(
+        self, tmp_path: Path, line: str
+    ) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_text(
+            "# RVDK\n\n"
+            "#### Related *DREW-V Labs* Projects\n\n"
+            f"- {line}\n\n"
+            "---\n",
+            encoding="utf-8",
+        )
+        errs = rvdk_ci.check_forbidden_patterns(tmp_path)
+        assert len(errs) == 1
+        assert "README.md:5:" in errs[0]
+
+        (tmp_path / "notes.txt").write_text(f"{line}\n", encoding="utf-8")
+        errs = rvdk_ci.check_forbidden_patterns(tmp_path)
+        assert len(errs) == 2
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "Copyright (c) 2026 DREW-V Labs",
+            "DREW-V Labs // rvdk.drewv-labs.dev",
+            "ops" + "@drewv-labs.dev",
+            "ops" + "@drewv-labs.dev.",
+            "ci" + "@rvdk.drewv-labs.dev",
+            "/Users/" + "alice/work",
+            "/home/" + "rvadmin",
+            "/home/" + "drewv-labs/src",
+            "/home/${REAL_USER}",
+            "/home/swap",
+            "sed -E 's@https?://mirror.example/debian@https://deb.debian.org/debian@g'",
+            "system." + "@system[0].hostname",
+            "postgresql" + "@.service.d",
+            "postgresql@18-main.service",
+            "postgresql@18-main.service.d",
+            "getty@tty1.service",
+            "ssh root@192.168.1.10",
+            "pkg@1.2.3",
+            "actions/checkout@v4.1.0",
+        ],
+    )
+    def test_clean_domains_paths_and_sed_expressions_allowed(
+        self, tmp_path: Path, line: str
+    ) -> None:
+        (tmp_path / "clean.sh").write_text(f"#!/usr/bin/env bash\n# {line}\n", encoding="utf-8")
+        assert rvdk_ci.check_forbidden_patterns(tmp_path) == []
+
 
 class TestRenderStandaloneScript:
     def test_inlines_libs_strips_shebang_and_dead_stubs_and_is_idempotent(
@@ -431,4 +508,149 @@ class TestWave1SecurityAndIdempotencyInvariants:
         for path in targets:
             text = path.read_text(encoding="utf-8")
             assert "declare -F" not in text, f"{path.relative_to(REPO_ROOT)} still uses 'declare -F'"
+
+    def test_license_and_bootstrap_apt_header_clean(self) -> None:
+        license_lines = (REPO_ROOT / "LICENSE").read_text(encoding="utf-8").splitlines()
+        assert license_lines[2] == "Copyright (c) 2026 DREW-V Labs"
+
+        bootstrap_apt_text = (REPO_ROOT / "os" / "bootstrap-apt.sh").read_text(encoding="utf-8")
+        assert "armbian.chi.auroradev.org" not in bootstrap_apt_text
+        assert "apt.armbian.com" in "\n".join(bootstrap_apt_text.splitlines()[:15])
+
+    @pytest.mark.parametrize(
+        ("initial_epoch", "synced_epoch", "apt_rc", "expect_bypass", "expect_warn", "expect_sync"),
+        [
+            ("1767225600", "", 0, False, False, False),
+            ("1795651200", "", 0, False, False, False),
+            ("1767225600", "", 1, False, False, False),
+            ("1000", "1767225605", 0, False, False, True),
+            ("1767225599", "1767225599", 0, True, True, True),
+        ],
+    )
+    def test_rvdk_apt_update_conditional_check_valid_until(
+        self,
+        tmp_path: Path,
+        initial_epoch: str,
+        synced_epoch: str,
+        apt_rc: int,
+        expect_bypass: bool,
+        expect_warn: bool,
+        expect_sync: bool,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        epoch_file = tmp_path / "epoch.txt"
+        epoch_file.write_text(initial_epoch, encoding="utf-8")
+        apt_log = tmp_path / "apt.log"
+        sync_log = tmp_path / "sync.log"
+        stamp_file = tmp_path / "apt.stamp"
+
+        date_mock = bin_dir / "date"
+        date_mock.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "${1:-}" == "-u" && "${2:-}" == "+%s" ]]; then\n'
+            f'    cat "{epoch_file}"\n'
+            "    exit 0\n"
+            "fi\n"
+            'exec /bin/date "$@"\n',
+            encoding="utf-8",
+        )
+        date_mock.chmod(0o755)
+
+        apt_mock = bin_dir / "apt-get"
+        apt_mock.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{apt_log}"\n'
+            f"exit {apt_rc}\n",
+            encoding="utf-8",
+        )
+        apt_mock.chmod(0o755)
+
+        script = (
+            "set -Eeuo pipefail\n"
+            f'source "{REPO_ROOT / "lib" / "common.sh"}"\n'
+            f'source "{REPO_ROOT / "lib" / "apt.sh"}"\n'
+            "rvdk_sync_cold_clock() {\n"
+            f'    echo called >> "{sync_log}"\n'
+            + (f'    printf "%s" "{synced_epoch}" > "{epoch_file}"\n' if synced_epoch else "")
+            + "    return 0\n"
+            "}\n"
+            "export _RVDK_APT_MIRRORS_CHECKED=1\n"
+            f'export RVDK_APT_STAMP_FILE="{stamp_file}"\n'
+            "rvdk_apt_update\n"
+        )
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        proc = subprocess.run(
+            [_find_bash(), "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+
+        assert proc.returncode == apt_rc, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        logged_calls = apt_log.read_text(encoding="utf-8").splitlines()
+        assert len(logged_calls) == 1
+        if expect_bypass:
+            assert "Acquire::Check-Valid-Until=false" in logged_calls[0]
+        else:
+            assert "Check-Valid-Until=false" not in logged_calls[0]
+            assert logged_calls[0] == "-o DPkg::Lock::Timeout=120 update -q"
+
+        if expect_warn:
+            assert "[WARN]" in proc.stdout
+        else:
+            assert "[WARN]" not in proc.stdout
+
+        assert sync_log.exists() is expect_sync
+        assert stamp_file.exists() is (apt_rc == 0)
+
+    def test_rvdk_apt_update_failure_under_if_condition_does_not_mark_updated(
+        self, tmp_path: Path
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        stamp_file = tmp_path / "apt.stamp"
+
+        date_mock = bin_dir / "date"
+        date_mock.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "${1:-}" == "-u" && "${2:-}" == "+%s" ]]; then\n'
+            '    echo "1795651200"\n'
+            "    exit 0\n"
+            "fi\n"
+            'exec /bin/date "$@"\n',
+            encoding="utf-8",
+        )
+        date_mock.chmod(0o755)
+
+        apt_mock = bin_dir / "apt-get"
+        apt_mock.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+        apt_mock.chmod(0o755)
+
+        script = (
+            "set -Eeuo pipefail\n"
+            f'source "{REPO_ROOT / "lib" / "apt.sh"}"\n'
+            "export _RVDK_APT_MIRRORS_CHECKED=1\n"
+            'export RVDK_NO_APT_UPDATE="0"\n'
+            f'export RVDK_APT_STAMP_FILE="{stamp_file}"\n'
+            "if rvdk_apt_update; then\n"
+            "    echo unexpected-success\n"
+            "    exit 99\n"
+            "fi\n"
+            'printf "no_apt_update=%s\\n" "${RVDK_NO_APT_UPDATE}"\n'
+        )
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        proc = subprocess.run(
+            [_find_bash(), "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        assert "no_apt_update=0" in proc.stdout
+        assert not stamp_file.exists()
 

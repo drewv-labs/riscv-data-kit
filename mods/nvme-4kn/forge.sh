@@ -397,7 +397,7 @@ _nvme_wipe_partitions() {
     while IFS= read -r _part; do
         [[ -n "$_part" && -b "$_part" ]] || continue
         wipefs -af "$_part" >/dev/null
-    done < <(lsblk -rn -o PATH,TYPE "$dev" 2>/dev/null | awk '$2 == "part" {print $1}' || true)
+    done < <(rvdk_list_child_partitions "$dev")
 }
 
 # 2. Verify or Convert to Native 4096-Byte (4Kn) Hardware LBA Sectors (ms:0 ONLY)
@@ -500,55 +500,7 @@ else
 fi
 
 converge_fstab_entry() {
-    if typeset -f rvdk_converge_fstab_entry >/dev/null 2>&1; then
-        rvdk_converge_fstab_entry "$@"
-        return $?
-    fi
-    local spec="$1"
-    local mnt="$2"
-    local fstype="$3"
-    local entry="$4"
-    local fstab_file="${5:-/etc/fstab}"
-    local want_fstab=""
-
-    if [[ -s "$fstab_file" ]]; then
-        want_fstab="$(awk -v sp="$spec" -v mp="$mnt" -v line="$entry" '
-            BEGIN {
-                replaced = 0
-                while (length(mp) > 1 && substr(mp, length(mp), 1) == "/") {
-                    mp = substr(mp, 1, length(mp) - 1)
-                }
-            }
-            /^[[:space:]]*#/ || NF < 2 { print; next }
-            {
-                m = $2
-                while (length(m) > 1 && substr(m, length(m), 1) == "/") {
-                    m = substr(m, 1, length(m) - 1)
-                }
-                if ($1 == sp || m == mp) {
-                    if (!replaced) {
-                        print line
-                        replaced = 1
-                    }
-                    next
-                }
-                print
-            }
-            END { if (!replaced) print line }
-        ' "$fstab_file")"
-    else
-        want_fstab="$entry"
-    fi
-
-    if [[ -f "$fstab_file" ]] && printf '%s\n' "$want_fstab" | cmp -s - "$fstab_file" 2>/dev/null; then
-        log_skip "${mnt} (${fstype}) already in ${fstab_file}"
-    else
-        printf '%s\n' "$want_fstab" | rvdk_atomic_write "$fstab_file" 0644
-        if [[ "$fstab_file" == "/etc/fstab" ]] && command -v systemctl >/dev/null 2>&1; then
-            systemctl daemon-reload
-        fi
-        log_ok "Persisted ${spec} -> ${mnt} (${fstype}) in ${fstab_file}"
-    fi
+    rvdk_converge_fstab_entry "$@"
 }
 
 # 4. Persist Primary Volume in /etc/fstab & Mount

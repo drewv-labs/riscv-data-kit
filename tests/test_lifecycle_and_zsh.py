@@ -227,6 +227,48 @@ _rvdk_purge_promote_legacy_config "{unsafe_mnt_cfg}" "/home/victim"
         assert lines2 == ["RVDK_TIMEZONE=UTC"]
         assert "Skipped invalid legacy config key 'MOUNT_POINT'" in proc.stdout
 
+    def test_promote_legacy_config_accepts_iot_tune_and_rejects_invalid_tune(
+        self, tmp_path: Path
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        _write_exe(bin_dir / "install", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "chown", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "chmod", "#!/usr/bin/env bash\nexit 0\n")
+
+        iot_cfg = tmp_path / "iot.env"
+        iot_cfg.write_text("RVDK_TUNE=iot\nRVDK_HOSTNAME=iot-node-01\n", encoding="utf-8")
+
+        bad_cfg = tmp_path / "bad_tune.env"
+        bad_cfg.write_text("RVDK_TUNE=bogus\nRVDK_TIMEZONE=UTC\n", encoding="utf-8")
+
+        cap_iot = tmp_path / "promoted_iot.txt"
+        cap_bad = tmp_path / "promoted_bad.txt"
+
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/utils/purge-user.sh"
+rvdk_kv_write() {{
+    local dst="$1"
+    shift 3
+    printf '%s\\n' "$@" > "{cap_iot}"
+}}
+_rvdk_purge_promote_legacy_config "{iot_cfg}" "/home/victim"
+rvdk_kv_write() {{
+    local dst="$1"
+    shift 3
+    printf '%s\\n' "$@" > "{cap_bad}"
+}}
+_rvdk_purge_promote_legacy_config "{bad_cfg}" "/home/victim"
+"""
+        proc = _run_bash(script, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        assert proc.returncode == 0, proc.stderr
+        assert cap_iot.read_text(encoding="utf-8").splitlines() == [
+            "RVDK_HOSTNAME=iot-node-01",
+            "RVDK_TUNE=iot",
+        ]
+        assert cap_bad.read_text(encoding="utf-8").splitlines() == ["RVDK_TIMEZONE=UTC"]
+        assert "Skipped invalid legacy config key 'RVDK_TUNE'" in proc.stdout
+
 
 class TestUninstallAndInstallCli:
     @pytest.mark.parametrize("bad_dir", ["/usr/", "/etc/.", "/usr//local"])
@@ -318,6 +360,226 @@ exec "{real_uname}" "$@"
             in proc.stdout
         )
 
+    def test_uninstall_xdg_cache_home_confinement_and_symlink_rejection(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+
+        home_base = tmp_path / "home"
+        real_home = home_base / "alice"
+        fallback_cache = real_home / ".cache" / "rvdk"
+        fallback_cache.mkdir(parents=True)
+
+        prefix_twin_cache = home_base / "alice2" / ".cache" / "rvdk"
+        prefix_twin_cache.mkdir(parents=True)
+
+        outside_dir = tmp_path / "outside"
+        (outside_dir / "rvdk").mkdir(parents=True)
+        sym_in_home = real_home / "sym_cache"
+        sym_in_home.symlink_to(outside_dir)
+
+        custom_cache = real_home / ".custom_cache"
+        (custom_cache / "rvdk").mkdir(parents=True)
+
+        _write_exe(
+            bin_dir / "getent",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "passwd" ]]; then
+    printf '%s:x:1000:1000::%s:/bin/bash\\n' "${{2:-alice}}" "{real_home}"
+fi
+""",
+        )
+
+        base_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_ENGINE_DIR": str(tmp_path / "safe" / "engine"),
+            "RVDK_CACHE_DIR": str(tmp_path / "safe" / "cache"),
+            "RVDK_STATE_DIR": str(tmp_path / "safe" / "state"),
+        }
+
+        # 1. XDG_CACHE_HOME=/var/lib must be rejected with [WARN], never target /var/lib/rvdk, and fall back
+        proc_varlib = _run_bash(
+            f'"{REPO_ROOT}/utils/uninstall.sh" --dry-run',
+            env={**base_env, "XDG_CACHE_HOME": "/var/lib"},
+        )
+        assert proc_varlib.returncode == 0, proc_varlib.stderr
+        assert "[WARN]" in proc_varlib.stdout
+        assert "/var/lib/rvdk" not in proc_varlib.stdout
+        assert f"[DRY-RUN] Would remove: {fallback_cache}" in proc_varlib.stdout
+
+        # 2. Prefix confusion (${REAL_HOME}2) must be rejected and fall back to REAL_HOME/.cache/rvdk
+        proc_twin = _run_bash(
+            f'"{REPO_ROOT}/utils/uninstall.sh" --dry-run',
+            env={**base_env, "XDG_CACHE_HOME": str(home_base / "alice2" / ".cache")},
+        )
+        assert proc_twin.returncode == 0, proc_twin.stderr
+        assert "[WARN]" in proc_twin.stdout
+        assert str(prefix_twin_cache) not in proc_twin.stdout
+        assert f"[DRY-RUN] Would remove: {fallback_cache}" in proc_twin.stdout
+
+        # 3. Symlink component inside REAL_HOME must be rejected and fall back safely
+        proc_sym = _run_bash(
+            f'"{REPO_ROOT}/utils/uninstall.sh" --dry-run',
+            env={**base_env, "XDG_CACHE_HOME": str(sym_in_home)},
+        )
+        assert proc_sym.returncode == 0, proc_sym.stderr
+        assert "[WARN]" in proc_sym.stdout
+        assert str(sym_in_home / "rvdk") not in proc_sym.stdout
+        assert str(outside_dir / "rvdk") not in proc_sym.stdout
+        assert f"[DRY-RUN] Would remove: {fallback_cache}" in proc_sym.stdout
+
+        # 4. Valid XDG_CACHE_HOME strictly inside REAL_HOME is accepted with zero warning
+        proc_valid = _run_bash(
+            f'"{REPO_ROOT}/utils/uninstall.sh" --dry-run',
+            env={**base_env, "XDG_CACHE_HOME": str(custom_cache)},
+        )
+        assert proc_valid.returncode == 0, proc_valid.stderr
+        assert "[WARN]" not in proc_valid.stdout
+        assert f"[DRY-RUN] Would remove: {custom_cache / 'rvdk'}" in proc_valid.stdout
+
+        # 5. Relative / traversal XDG_CACHE_HOME must be rejected and fall back safely
+        proc_rel = _run_bash(
+            f'"{REPO_ROOT}/utils/uninstall.sh" --dry-run',
+            env={**base_env, "XDG_CACHE_HOME": f"{real_home}/../outside"},
+        )
+        assert proc_rel.returncode == 0, proc_rel.stderr
+        assert "[WARN]" in proc_rel.stdout
+        assert str(outside_dir / "rvdk") not in proc_rel.stdout
+        assert f"[DRY-RUN] Would remove: {fallback_cache}" in proc_rel.stdout
+
+        # 6. Symlinked fallback (${REAL_HOME}/.cache -> outside) must ALSO be rejected safely
+        shutil.rmtree(real_home / ".cache")
+        (real_home / ".cache").symlink_to(outside_dir)
+        proc_bad_fb = _run_bash(
+            f'"{REPO_ROOT}/utils/uninstall.sh" --dry-run',
+            env={**base_env, "XDG_CACHE_HOME": "/var/lib"},
+        )
+        assert proc_bad_fb.returncode == 0, proc_bad_fb.stderr
+        assert "[WARN]" in proc_bad_fb.stdout
+        assert f"Would remove: {fallback_cache}" not in proc_bad_fb.stdout
+        assert str(outside_dir / "rvdk") not in proc_bad_fb.stdout
+
+    def test_uninstall_purge_dry_run_includes_iot_cpufreq_units(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+
+        systemd_dir = tmp_path / "etc" / "systemd" / "system"
+        systemd_dir.mkdir(parents=True)
+        (systemd_dir / "eic7700x-cpufreq-iot.service").write_text("[Unit]\n", encoding="utf-8")
+        (systemd_dir / "spacemit-k1-cpufreq-iot.service").write_text("[Unit]\n", encoding="utf-8")
+
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_ENGINE_DIR": str(tmp_path / "safe" / "engine"),
+            "RVDK_CACHE_DIR": str(tmp_path / "safe" / "cache"),
+            "RVDK_STATE_DIR": str(tmp_path / "safe" / "state"),
+            "RVDK_SYSTEMD_UNIT_DIR": str(systemd_dir),
+        }
+        proc = _run_bash(f'"{REPO_ROOT}/utils/uninstall.sh" --purge --dry-run -y', env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert (
+            f"[DRY-RUN] Would disable & remove systemd unit: {systemd_dir}/eic7700x-cpufreq-iot.service"
+            in proc.stdout
+        )
+        assert (
+            f"[DRY-RUN] Would disable & remove systemd unit: {systemd_dir}/spacemit-k1-cpufreq-iot.service"
+            in proc.stdout
+        )
+
+    def test_uninstall_restore_preserved_backups_path_sidecar_and_deeptune(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+
+        backup_root = tmp_path / "backups"
+        deeptune_dir = backup_root / "deeptune"
+        deeptune_dir.mkdir(parents=True)
+
+        # Standard .path sidecar (exact path containing '__' that stem decoding alone would mangle)
+        k1_orig = deeptune_dir / "etc__modules-load.d__my__custom.conf.orig"
+        k1_orig.write_text("# modules\n", encoding="utf-8")
+        (deeptune_dir / "etc__modules-load.d__my__custom.conf.path").write_text(
+            "/etc/modules-load.d/my__custom.conf\n", encoding="utf-8"
+        )
+
+        # .orig.path sidecar variant
+        apt_dir = backup_root / "apt"
+        apt_dir.mkdir(parents=True)
+        apt_orig = apt_dir / "custom_repo.orig"
+        apt_orig.write_text("deb https://deb.debian.org/debian trixie main\n", encoding="utf-8")
+        (apt_dir / "custom_repo.orig.path").write_text(
+            "/etc/apt/sources.list.d/vendor__repo.list\n", encoding="utf-8"
+        )
+
+        # Unsafe sidecars (traversal, symlink, protected /etc/config/network) must all be ignored
+        bad_trav = apt_dir / "bad_trav.orig"
+        bad_trav.write_text("x\n", encoding="utf-8")
+        (apt_dir / "bad_trav.path").write_text("/etc/apt/../shadow\n", encoding="utf-8")
+
+        bad_sym = apt_dir / "bad_sym.orig"
+        bad_sym.write_text("x\n", encoding="utf-8")
+        (apt_dir / "bad_sym.path").symlink_to("/etc/passwd")
+
+        bad_multi = apt_dir / "bad_multi.orig"
+        bad_multi.write_text("x\n", encoding="utf-8")
+        (apt_dir / "bad_multi.path").write_text("/etc/apt/a.list\n/etc/apt/b.list\n", encoding="utf-8")
+
+        owrt_dir = backup_root / "openwrt"
+        owrt_dir.mkdir(parents=True)
+        bad_net = owrt_dir / "net.orig"
+        bad_net.write_text("x\n", encoding="utf-8")
+        (owrt_dir / "net.path").write_text("/etc/config/network\n", encoding="utf-8")
+
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_ENGINE_DIR": str(tmp_path / "safe" / "engine"),
+            "RVDK_CACHE_DIR": str(tmp_path / "safe" / "cache"),
+            "RVDK_STATE_DIR": str(tmp_path / "safe" / "state"),
+            "RVDK_BACKUP_ROOT": str(backup_root),
+        }
+        proc = _run_bash(f'"{REPO_ROOT}/utils/uninstall.sh" --purge --dry-run -y', env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert (
+            f"[DRY-RUN] Would restore backup: {k1_orig} -> /etc/modules-load.d/my__custom.conf"
+            in proc.stdout
+        )
+        assert (
+            f"[DRY-RUN] Would restore backup: {apt_orig} -> /etc/apt/sources.list.d/vendor__repo.list"
+            in proc.stdout
+        )
+        assert "/etc/apt/../shadow" not in proc.stdout
+        assert "/etc/passwd" not in proc.stdout
+        assert "/etc/apt/a.list" not in proc.stdout
+        assert "/etc/config/network" not in proc.stdout
+
 
 class TestStorageAutotuneGrantCap:
     def test_autotune_awk_caps_last_hungry_grant_at_want_i(self) -> None:
@@ -353,6 +615,83 @@ class TestStorageAutotuneGrantCap:
         )
         assert proc2.returncode == 0, proc2.stderr
         assert [int(x) for x in proc2.stdout.strip().split()] == [20, 30]
+
+    def test_autotune_healthy_summary_uses_comma_space_separator(self, tmp_path: Path) -> None:
+        bin_dir = tmp_path / "bin"
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+        _write_exe(
+            bin_dir / "vgs",
+            """#!/usr/bin/env bash
+if [[ "${1:-}" == "vg_rvdk" ]]; then
+    exit 0
+fi
+if [[ "$*" == *"vg_size,vg_free"* ]]; then
+    printf '107374182400 21474836480 4194304 25600 5120\\n'
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "lvs",
+            """#!/usr/bin/env bash
+if [[ "${1:-}" == "--noheadings" && "${2:-}" == "-o" && "${3:-}" == "lv_name" ]]; then
+    printf '  lv_a\\n  lv_b\\n'
+    exit 0
+fi
+if [[ "${1:-}" == "vg_rvdk/lv_a" || "${1:-}" == "vg_rvdk/lv_b" ]]; then
+    exit 0
+fi
+if [[ "$*" == *"lv_size"* ]]; then
+    printf '42949672960\\n'
+    exit 0
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "findmnt",
+            """#!/usr/bin/env bash
+case "$*" in
+    *"-S /dev/vg_rvdk/lv_a -o TARGET"*) printf '/mnt/lv_a\\n' ;;
+    *"-S /dev/vg_rvdk/lv_b -o TARGET"*) printf '/mnt/lv_b\\n' ;;
+    *"-M /mnt/lv_a -o FSTYPE"*) printf 'xfs\\n' ;;
+    *"-M /mnt/lv_b -o FSTYPE"*) printf 'btrfs\\n' ;;
+esac
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "df",
+            """#!/usr/bin/env bash
+printf '1B-blocks Used Avail\\n'
+case "${*: -1}" in
+    /mnt/lv_a) printf '42949672960 17179869184 25769803776\\n' ;;
+    /mnt/lv_b) printf '42949672960 8589934592 34359738368\\n' ;;
+esac
+exit 0
+""",
+        )
+
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/utils/storage.sh"
+rvdk_require_root() {{ :; }}
+export RVDK_ENV_FILE="{tmp_path}/nonexistent.env"
+main autotune --vg vg_rvdk --dry-run
+"""
+        proc = _run_bash(script, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        assert proc.returncode == 0, proc.stderr
+        assert "All mounted volumes healthy below 75% high-water mark (lv_a: 40%, lv_b: 20%)." in proc.stdout
 
 
 class TestZshEntrypoints:

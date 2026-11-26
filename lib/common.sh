@@ -239,11 +239,195 @@ rvdk_require_root() {
     done
     if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
         if [[ -n "$script_path" && -f "$script_path" ]] && command -v sudo >/dev/null 2>&1; then
-            exec sudo -E bash "$script_path" "$@"
+            local _sudo_rc=0
+            rvdk_sudo_preserve bash "$script_path" "$@" || _sudo_rc=$?
+            exit "$_sudo_rc"
         else
             log_fatal "Root privileges required. Run with sudo or pipe into 'sudo bash'."
         fi
     fi
+}
+
+# Join items with an arbitrary multi-character separator without format-string injection.
+# Usage: rvdk_join_by <sep> [items...]
+rvdk_join_by() {
+    local sep="${1-}"
+    shift || return 0
+    [[ $# -eq 0 ]] && return 0
+    printf '%s' "$1"
+    shift
+    local item
+    for item in "$@"; do
+        printf '%s%s' "$sep" "$item"
+    done
+}
+
+_RVDK_SUDO_PRESERVE_ALLOWLIST=(
+    RVDK_ALLOW_CIDR
+    RVDK_APT_DISTRO_DEFAULT
+    RVDK_ARCH
+    RVDK_BACKUP_ROOT
+    RVDK_BASE_URL
+    RVDK_BOARD
+    RVDK_BOARDS_DIR
+    RVDK_BOARD_QUIRKS
+    RVDK_BOARD_TAG
+    RVDK_BOOT_BACKUP_DIR
+    RVDK_BRANCH
+    RVDK_CACHE_DIR
+    RVDK_DEEPTUNE_CHAIN
+    RVDK_DEEPTUNE_ENV
+    RVDK_DEEPTUNE_LAYERS
+    RVDK_DT_MODEL
+    RVDK_ENGINE_DIR
+    RVDK_ENV_FILE
+    RVDK_FLASH_FORCE_RAW
+    RVDK_HOSTNAME
+    RVDK_KEEP_VENDOR_MIRRORS
+    RVDK_KIT_CACHE_FILE
+    RVDK_LOCALE
+    RVDK_MAX_VALID_EPOCH
+    RVDK_MIN_VALID_EPOCH
+    RVDK_MIRROR_URL
+    RVDK_MMU
+    RVDK_NO_APT_UPDATE
+    RVDK_NO_PROGBAR
+    RVDK_OS_ID
+    RVDK_OS_VERSION_ID
+    RVDK_P550_HDMI_STATE_FILE
+    RVDK_P550_PLAT_DRV_BASE
+    RVDK_PARENT_BADGE_SGR
+    RVDK_PARENT_BAR_SGR
+    RVDK_PARENT_LABEL
+    RVDK_PARENT_PROGBAR
+    RVDK_PARENT_STATE
+    RVDK_PRIMARY_NIC
+    RVDK_PROGBAR_SESSION
+    RVDK_PROG_BASE
+    RVDK_PROG_SPAN
+    RVDK_RELEASE_BASE
+    RVDK_REPO_URL
+    RVDK_SECONDARY_NIC
+    RVDK_SKIP_NET_GUARD
+    RVDK_SOC
+    RVDK_SOC_SLUG
+    RVDK_STATE_DIR
+    RVDK_SUB_STATE
+    RVDK_SYSTEMD_UNIT_DIR
+    RVDK_TIMEZONE
+    RVDK_TUNE
+    RVDK_TUNE_MODE
+)
+
+# Escalate via sudo while preserving ONLY allowlisted operational RVDK_* env vars
+# (explicitly excluding XDG_CACHE_HOME, LD_*, PATH, BASH_ENV, etc.).
+# Falls back gracefully to plain `sudo` when sudoers restricts SETENV without
+# ever executing the target command twice on a real target failure.
+# Usage: rvdk_sudo_preserve <command> [args...]
+rvdk_sudo_preserve() {
+    [[ $# -gt 0 ]] || return 1
+    local -a present_vars=()
+    local var_name
+    for var_name in "${_RVDK_SUDO_PRESERVE_ALLOWLIST[@]}"; do
+        if [[ -n "${!var_name+x}" ]]; then
+            present_vars+=("$var_name")
+        fi
+    done
+
+    local rc=0
+    if [[ ${#present_vars[@]} -eq 0 ]]; then
+        sudo "$@" || rc=$?
+        return "$rc"
+    fi
+
+    local preserve_csv
+    preserve_csv="$(rvdk_join_by "," "${present_vars[@]}")"
+
+    local probe_err="" probe_rc=0
+    probe_err="$(sudo --preserve-env="$preserve_csv" -n true 2>&1)" || probe_rc=$?
+    if [[ "$probe_rc" -eq 0 ]]; then
+        sudo --preserve-env="$preserve_csv" "$@" || rc=$?
+        return "$rc"
+    fi
+
+    if [[ "$probe_err" =~ (not[[:space:]]+allowed|SETENV|preserve-env|unrecognized[[:space:]]+option|unknown[[:space:]]+option|illegal[[:space:]]+option|invalid[[:space:]]+option|unexpected[[:space:]]+argument) ]] \
+        || sudo -n true >/dev/null 2>&1; then
+        sudo "$@" || rc=$?
+        return "$rc"
+    fi
+
+    if sudo -v; then
+        if sudo --preserve-env="$preserve_csv" -n true >/dev/null 2>&1; then
+            sudo --preserve-env="$preserve_csv" "$@" || rc=$?
+            return "$rc"
+        fi
+        sudo "$@" || rc=$?
+        return "$rc"
+    fi
+    return 1
+}
+
+# Create a pristine first-touch backup of <src_path> under $RVDK_BACKUP_ROOT/<category>/
+# with an accompanying .path sidecar recording the exact original destination path.
+# Usage: rvdk_backup_file <src_path> [category]
+rvdk_backup_file() {
+    local src_path="${1:-}"
+    local category="${2:-deeptune}"
+
+    [[ "$category" =~ ^[a-z0-9_-]+$ ]] || return 1
+    [[ "$src_path" == /* && -f "$src_path" && ! -L "$src_path" ]] || return 1
+    [[ "$src_path" != *$'\n'* && "$src_path" != *$'\r'* && ! "$src_path" =~ [[:cntrl:]] ]] || return 1
+    [[ "$src_path" != *".."* && "$src_path" != *"//"* && "$src_path" != *"/./"* && "$src_path" != *"/." && "$src_path" != */ ]] || return 1
+
+    local backup_root="${RVDK_BACKUP_ROOT:-${RVDK_STATE_DIR:-/var/lib/rvdk}/backups}"
+    while [[ "$backup_root" != "/" && "$backup_root" == */ ]]; do
+        backup_root="${backup_root%/}"
+    done
+    [[ -n "$backup_root" && "$backup_root" == /* ]] || return 1
+
+    local encoded="${src_path#/}"
+    encoded="${encoded//\//__}"
+    [[ -n "$encoded" ]] || return 1
+
+    local cat_dir="${backup_root}/${category}"
+    local orig_path="${cat_dir}/${encoded}.orig"
+    local sidecar_path="${cat_dir}/${encoded}.path"
+
+    if [[ -L "$backup_root" || -L "$cat_dir" ]]; then
+        log_err "rvdk_backup_file: refusing symlink backup directory '${cat_dir}'"
+        return 1
+    fi
+    if [[ -L "$orig_path" || -L "$sidecar_path" ]]; then
+        log_err "rvdk_backup_file: refusing symlink backup artifact under '${cat_dir}'"
+        return 1
+    fi
+
+    mkdir -p "$cat_dir" && chmod 0755 "$cat_dir" || return 1
+
+    if [[ ! -e "$orig_path" ]]; then
+        _rvdk_install_cleanup_trap "false"
+        local tmp_orig
+        tmp_orig="$(mktemp "${cat_dir}/.${encoded}.orig.XXXXXX")" || return 1
+        _RVDK_TMPFILES+=("$tmp_orig")
+        if ! cp -a "$src_path" "$tmp_orig" || ! mv -f "$tmp_orig" "$orig_path"; then
+            rm -f "$tmp_orig" 2>/dev/null || true
+            _rvdk_untrack_tmpfile "$tmp_orig"
+            return 1
+        fi
+        _rvdk_untrack_tmpfile "$tmp_orig"
+    elif [[ ! -f "$orig_path" ]]; then
+        log_err "rvdk_backup_file: existing backup '${orig_path}' is not a regular file"
+        return 1
+    fi
+
+    if [[ ! -e "$sidecar_path" ]]; then
+        printf '%s\n' "$src_path" | rvdk_atomic_write "$sidecar_path" 0644 || return 1
+    elif [[ ! -f "$sidecar_path" ]]; then
+        log_err "rvdk_backup_file: existing sidecar '${sidecar_path}' is not a regular file"
+        return 1
+    fi
+
+    return 0
 }
 
 # Sanitize SSH-forwarded LC_* environment variables before target locales are generated

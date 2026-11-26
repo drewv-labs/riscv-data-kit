@@ -70,6 +70,16 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
             [[ -n "$_own" ]] && chown "$_own" "$_tmp"
             mv -f "$_tmp" "$_dst"
         }
+        rvdk_sha256_file() {
+            local _f="$1"
+            if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum "$_f" | awk '{print tolower($1)}'
+            elif command -v shasum >/dev/null 2>&1; then
+                shasum -a 256 "$_f" | awk '{print tolower($1)}'
+            else
+                log_fatal "Neither sha256sum nor shasum is installed for cryptographic verification."
+            fi
+        }
     fi
 fi
 if [[ -z "${_RVDK_KIT_SH_LOADED:-}" ]]; then
@@ -323,14 +333,205 @@ LOCAL_REPO_DIR="${PG_LIB_ROOT}/debs"
 LOCAL_LIST="/etc/apt/sources.list.d/rvdk-local-pgdg.list"
 WANT_LOCAL_LIST="deb [trusted=yes check-date=no lang=none] file://${LOCAL_REPO_DIR} ./"
 
+_pg_purge_local_repo_cache() {
+    local repo_dir="${1:-$LOCAL_REPO_DIR}"
+    repo_dir="${repo_dir%/}"
+    [[ -n "$repo_dir" ]] || log_fatal "Refusing empty local repository path."
+    if [[ -L "$repo_dir" ]]; then
+        log_fatal "Local repository directory '${repo_dir}' must not be a symbolic link."
+    fi
+    [[ -d "$repo_dir" ]] || return 0
+    if [[ -n "$(find "$repo_dir" -mindepth 1 -type l -print -quit 2>/dev/null)" ]]; then
+        log_fatal "Refusing to purge ${repo_dir}: unexpected symbolic link detected inside cache."
+    fi
+    find "$repo_dir" -mindepth 1 -type f \( \
+        -name '*.deb' -o -name '.rvdk-debs.sha256' -o -name 'InRelease' \
+        -o -name 'Release' -o -name 'Release.gpg' -o -name 'Packages*' \
+    \) -exec rm -f {} +
+    find "$repo_dir" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+}
+
+_pg_verify_local_repo_debs() {
+    local repo_dir="${1:-$LOCAL_REPO_DIR}"
+    repo_dir="${repo_dir%/}"
+    if [[ -z "$repo_dir" || -L "$repo_dir" || ! -d "$repo_dir" ]]; then
+        log_fatal "Local repository directory '${repo_dir}' is missing or a symbolic link."
+    fi
+    if [[ -n "$(find "$repo_dir" -mindepth 1 -type l -print -quit 2>/dev/null)" ]]; then
+        log_fatal "Refusing symbolic link inside local repository ${repo_dir}."
+    fi
+    if [[ -n "$(find "$repo_dir" -mindepth 1 -type d -print -quit 2>/dev/null)" ]]; then
+        log_fatal "Refusing unexpected subdirectory inside local repository ${repo_dir}."
+    fi
+    local deb_name_re='^[A-Za-z0-9][A-Za-z0-9._+%:~-]*\.deb$'
+    local deb base
+    while IFS= read -r -d '' deb; do
+        if [[ -L "$deb" || ! -f "$deb" ]]; then
+            log_fatal "Refusing symlink or non-regular package artifact in ${repo_dir}: ${deb}"
+        fi
+        if [[ "$(dirname "$deb")" != "$repo_dir" ]]; then
+            log_fatal "Refusing nested package artifact in ${repo_dir}: ${deb}"
+        fi
+        base="$(basename "$deb")"
+        if [[ ! "$base" =~ $deb_name_re || "$base" == *".."* ]]; then
+            log_fatal "Refusing hidden or unsafe package filename in ${repo_dir}: ${deb}"
+        fi
+    done < <(find "$repo_dir" -mindepth 1 -name '*.deb' -print0)
+}
+
+_pg_write_debs_manifest() {
+    local repo_dir="${1:-$LOCAL_REPO_DIR}"
+    repo_dir="${repo_dir%/}"
+    local manifest="${repo_dir}/.rvdk-debs.sha256"
+    _pg_verify_local_repo_debs "$repo_dir"
+    if [[ -L "$manifest" ]]; then
+        log_fatal "Refusing symlinked package manifest: ${manifest}"
+    fi
+
+    local -a debs=()
+    local deb
+    while IFS= read -r -d '' deb; do
+        debs+=("$deb")
+    done < <(find "$repo_dir" -mindepth 1 -maxdepth 1 -type f -name '*.deb' -print0)
+
+    (( ${#debs[@]} > 0 )) || log_fatal "No .deb packages found in ${repo_dir} to stamp in ${manifest}."
+
+    local -a sorted_names=()
+    local name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && sorted_names+=("$name")
+    done < <(
+        local _d
+        for _d in "${debs[@]}"; do
+            basename "$_d"
+        done | LC_ALL=C sort -u
+    )
+
+    local deb_name_re='^[A-Za-z0-9][A-Za-z0-9._+%:~-]*\.deb$'
+    local manifest_body="" digest
+    for name in "${sorted_names[@]}"; do
+        if [[ ! "$name" =~ $deb_name_re || "$name" == *".."* ]]; then
+            log_fatal "Refusing unsafe package filename in ${repo_dir}: ${name}"
+        fi
+        deb="${repo_dir}/${name}"
+        if [[ -L "$deb" || ! -f "$deb" ]]; then
+            log_fatal "Refusing symlink or non-regular package artifact in ${repo_dir}: ${deb}"
+        fi
+        digest="$(rvdk_sha256_file "$deb")"
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || log_fatal "Invalid SHA-256 digest computed for ${deb}."
+        manifest_body+="${digest}  ${name}"$'\n'
+    done
+
+    printf '%s' "$manifest_body" | rvdk_atomic_write "$manifest" 0644 root:root
+}
+
+_pg_verify_debs_manifest() {
+    local repo_dir="${1:-$LOCAL_REPO_DIR}"
+    repo_dir="${repo_dir%/}"
+    local manifest="${repo_dir}/.rvdk-debs.sha256"
+    [[ -n "$repo_dir" && -d "$repo_dir" && ! -L "$repo_dir" ]] || return 1
+    [[ -z "$(find "$repo_dir" -mindepth 1 \( -type l -o -type d \) -print -quit 2>/dev/null)" ]] || return 1
+    [[ -f "$manifest" && ! -L "$manifest" && -s "$manifest" ]] || return 1
+
+    local entry_re='^([0-9a-fA-F]{64})  ([A-Za-z0-9][A-Za-z0-9._+%:~-]*\.deb)$'
+    local deb_name_re='^[A-Za-z0-9][A-Za-z0-9._+%:~-]*\.deb$'
+    local -A expected_hashes=()
+    local line expected_sha fname deb_path actual_sha
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -n "$line" ]] || return 1
+        [[ "$line" =~ $entry_re ]] || return 1
+        expected_sha="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+        fname="${BASH_REMATCH[2]}"
+        [[ "$fname" != *".."* ]] || return 1
+        [[ -z "${expected_hashes["$fname"]:-}" ]] || return 1
+        deb_path="${repo_dir}/${fname}"
+        [[ -f "$deb_path" && ! -L "$deb_path" ]] || return 1
+        actual_sha="$(rvdk_sha256_file "$deb_path")"
+        [[ "$actual_sha" == "$expected_sha" ]] || return 1
+        expected_hashes["$fname"]="$expected_sha"
+    done < "$manifest"
+
+    (( ${#expected_hashes[@]} > 0 )) || return 1
+
+    local actual_count=0 deb
+    while IFS= read -r -d '' deb; do
+        [[ -f "$deb" && ! -L "$deb" ]] || return 1
+        [[ "$(dirname "$deb")" == "$repo_dir" ]] || return 1
+        fname="$(basename "$deb")"
+        [[ "$fname" =~ $deb_name_re && "$fname" != *".."* ]] || return 1
+        [[ -n "${expected_hashes["$fname"]:-}" ]] || return 1
+        actual_count=$(( actual_count + 1 ))
+    done < <(find "$repo_dir" -mindepth 1 -name '*.deb' -print0)
+
+    (( actual_count == ${#expected_hashes[@]} )) || return 1
+    return 0
+}
+
+_pg_stage_built_debs() {
+    local work_dir="$1"
+    local repo_dir="${2:-$LOCAL_REPO_DIR}"
+    work_dir="${work_dir%/}"
+    repo_dir="${repo_dir%/}"
+    if [[ -z "$work_dir" || -L "$work_dir" || ! -d "$work_dir" ]]; then
+        log_fatal "Refusing symlinked or non-directory build work directory: ${work_dir}"
+    fi
+    if [[ -z "$repo_dir" || -L "$repo_dir" || ! -d "$repo_dir" ]]; then
+        log_fatal "Refusing symlinked or non-directory local repo directory: ${repo_dir}"
+    fi
+
+    local had_nullglob="false" had_dotglob="false"
+    if shopt -q nullglob; then had_nullglob="true"; fi
+    if shopt -q dotglob; then had_dotglob="true"; fi
+    shopt -s nullglob dotglob
+    local debs=("${work_dir}"/*.deb)
+    if [[ "$had_nullglob" == "false" ]]; then shopt -u nullglob; fi
+    if [[ "$had_dotglob" == "false" ]]; then shopt -u dotglob; fi
+
+    (( ${#debs[@]} > 0 )) || log_fatal "No .deb artifacts produced in ${work_dir}."
+
+    local deb_name_re='^[A-Za-z0-9][A-Za-z0-9._+%:~-]*\.deb$'
+    local deb base
+    for deb in "${debs[@]}"; do
+        if [[ -L "$deb" || ! -f "$deb" ]]; then
+            log_fatal "Refusing symlink or non-regular build artifact from ${BUILD_USER:-build}: ${deb}"
+        fi
+        base="$(basename "$deb")"
+        if [[ ! "$base" =~ $deb_name_re || "$base" == *".."* ]]; then
+            log_fatal "Refusing hidden or unsafe build artifact filename from ${BUILD_USER:-build}: ${deb}"
+        fi
+        if [[ -L "${repo_dir}/${base}" ]]; then
+            log_fatal "Refusing symlinked destination in ${repo_dir}: ${base}"
+        fi
+    done
+
+    for deb in "${debs[@]}"; do
+        if [[ -L "$deb" || ! -f "$deb" ]]; then
+            log_fatal "Refusing symlink or non-regular build artifact from ${BUILD_USER:-build}: ${deb}"
+        fi
+        install -m 0644 -o root -g root "$deb" "${repo_dir}/"
+    done
+}
+
 update_local_repo() {
+    _pg_verify_local_repo_debs "$LOCAL_REPO_DIR"
+    if ! _pg_verify_debs_manifest "$LOCAL_REPO_DIR"; then
+        log_fatal "Refusing to index ${LOCAL_REPO_DIR}: local .deb artifacts failed .rvdk-debs.sha256 integrity verification."
+    fi
     chmod 0755 /var/lib/rvdk "$PG_LIB_ROOT" "$LOCAL_REPO_DIR" 2>/dev/null || true
     (
         cd "$LOCAL_REPO_DIR"
         rm -f InRelease Release Release.gpg Packages Packages.gz Packages.xz Packages.bz2 Packages.lzma Packages.zst
         dpkg-scanpackages . /dev/null > Packages 2>/dev/null
         gzip -9cn Packages > Packages.gz
-        chmod 0644 Packages Packages.gz ./*.deb 2>/dev/null || true
+        chmod 0644 Packages Packages.gz
+        local _deb
+        while IFS= read -r -d '' _deb; do
+            if [[ -L "$_deb" || ! -f "$_deb" ]]; then
+                log_fatal "Refusing symlink or non-regular package artifact in ${LOCAL_REPO_DIR}: ${_deb}"
+            fi
+            chmod 0644 "$_deb"
+        done < <(find . -mindepth 1 -name '*.deb' -print0)
         if command -v apt-ftparchive >/dev/null 2>&1; then
             apt-ftparchive release . > Release 2>/dev/null
         else
@@ -339,7 +540,7 @@ update_local_repo() {
                     "$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')"
                 for _idx in Packages Packages.gz; do
                     printf ' %s %16d %s\n' \
-                        "$(sha256sum "$_idx" | awk '{print $1}')" \
+                        "$(rvdk_sha256_file "$_idx")" \
                         "$(wc -c < "$_idx" | tr -d '[:space:]')" \
                         "$_idx"
                 done
@@ -358,25 +559,59 @@ update_local_repo() {
     fi
 }
 
+_pg_reconcile_installed_local_repo() {
+    if [[ -L "$LOCAL_REPO_DIR" ]]; then
+        log_fatal "Local repository directory '${LOCAL_REPO_DIR}' must not be a symbolic link."
+    fi
+    if [[ -d "$LOCAL_REPO_DIR" ]] && [[ -n "$(find "$LOCAL_REPO_DIR" -mindepth 1 \( -name '*.deb' -o -type l -o -type d \) -print -quit 2>/dev/null)" ]]; then
+        _pg_verify_local_repo_debs "$LOCAL_REPO_DIR"
+        if ! _pg_verify_debs_manifest "$LOCAL_REPO_DIR"; then
+            log_warn "Cached PGDG packages in ${LOCAL_REPO_DIR} failed .rvdk-debs.sha256 verification; purging untrusted local repository and ${LOCAL_LIST}."
+            _pg_purge_local_repo_cache "$LOCAL_REPO_DIR"
+            rm -f "$LOCAL_LIST"
+            return 0
+        fi
+        if command -v dpkg-scanpackages >/dev/null 2>&1; then
+            if [[ ! -f "${LOCAL_REPO_DIR}/Release" ]] || ! printf '%s\n' "$WANT_LOCAL_LIST" | cmp -s - "$LOCAL_LIST" 2>/dev/null; then
+                update_local_repo
+                log_ok "Refreshed local PGDG repository metadata (${LOCAL_REPO_DIR}/Release)"
+            fi
+        fi
+    elif [[ -e "$LOCAL_LIST" || -L "$LOCAL_LIST" ]]; then
+        log_warn "Local PGDG source list ${LOCAL_LIST} exists without verified packages in ${LOCAL_REPO_DIR}; removing stale source list."
+        rm -f "$LOCAL_LIST"
+    fi
+}
+
 # 2. Install PostgreSQL 18.6 (Verified Precompiled Bundle -> Unprivileged PGDG Source Fallback)
 rvdk_prog 15 "PG 18.6: checking postgresql-${PG_VERSION} package state..."
 PACKAGES_CHANGED="false"
 if dpkg -s "postgresql-${PG_VERSION}" >/dev/null 2>&1 && [[ "$FORCE_BUILD" == "false" ]]; then
-    if [[ -d "$LOCAL_REPO_DIR" ]] && compgen -G "${LOCAL_REPO_DIR}/*.deb" >/dev/null 2>&1 && command -v dpkg-scanpackages >/dev/null 2>&1; then
-        if [[ ! -f "${LOCAL_REPO_DIR}/Release" ]] || ! printf '%s\n' "$WANT_LOCAL_LIST" | cmp -s - "$LOCAL_LIST" 2>/dev/null; then
-            update_local_repo
-            log_ok "Refreshed local PGDG repository metadata (${LOCAL_REPO_DIR}/Release)"
-        fi
-    fi
+    _pg_reconcile_installed_local_repo
     log_skip "postgresql-${PG_VERSION} is already installed (pass --force-build to recompile)"
 else
+    if [[ -L "$LOCAL_REPO_DIR" ]]; then
+        log_fatal "Local repository directory '${LOCAL_REPO_DIR}' must not be a symbolic link."
+    fi
     mkdir -p /var/lib/rvdk "$PG_LIB_ROOT" "$LOCAL_REPO_DIR"
     chmod 0755 /var/lib/rvdk "$PG_LIB_ROOT" "$LOCAL_REPO_DIR" 2>/dev/null || true
     rvdk_prog 20 "PG 18.6: verifying repository & archive prerequisites..."
     rvdk_apt_ensure curl ca-certificates zstd dpkg-dev gnupg lsb-release rsync
 
     if [[ "$FORCE_BUILD" == "false" ]]; then
-        if ! compgen -G "${LOCAL_REPO_DIR}/postgresql-${PG_VERSION}_*.deb" >/dev/null 2>&1; then
+        HAVE_VERIFIED_LOCAL_DEBS="false"
+        if [[ -n "$(find "$LOCAL_REPO_DIR" -mindepth 1 \( -name '*.deb' -o -type l -o -type d \) -print -quit 2>/dev/null)" ]]; then
+            _pg_verify_local_repo_debs "$LOCAL_REPO_DIR"
+            if _pg_verify_debs_manifest "$LOCAL_REPO_DIR" && compgen -G "${LOCAL_REPO_DIR}/postgresql-${PG_VERSION}_*.deb" >/dev/null 2>&1; then
+                HAVE_VERIFIED_LOCAL_DEBS="true"
+                log_skip "Using verified local PGDG packages (${LOCAL_REPO_DIR})"
+            else
+                log_warn "Cached PGDG packages in ${LOCAL_REPO_DIR} failed .rvdk-debs.sha256 verification; purging untrusted cache and re-acquiring verified packages."
+                _pg_purge_local_repo_cache "$LOCAL_REPO_DIR"
+            fi
+        fi
+
+        if [[ "$HAVE_VERIFIED_LOCAL_DEBS" == "false" ]]; then
             EXPECTED_BUNDLE_SHA="$(printf '%s' "$BUNDLE_SHA256" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
             if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" != "true" && "$SKIP_BUNDLE_SHA" != "true" ]]; then
                 if [[ -n "${PG_PREBUILT_DEB_URL:-}" ]]; then
@@ -411,9 +646,13 @@ else
                         fi
                         log_ok "Verified bundle SHA-256: ${ACTUAL_BUNDLE_SHA:0:16}..."
                     fi
+                    _pg_purge_local_repo_cache "$LOCAL_REPO_DIR"
                     tar --no-same-owner --no-same-permissions -I zstd -xf "$_PG_TMP_ARCHIVE" -C "$LOCAL_REPO_DIR"
-                    rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256" "${LOCAL_REPO_DIR}"/*-dbgsym_*.deb
+                    rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256"
                     _PG_TMP_ARCHIVE=""
+                    _pg_verify_local_repo_debs "$LOCAL_REPO_DIR"
+                    rm -f "${LOCAL_REPO_DIR}"/*-dbgsym_*.deb
+                    _pg_write_debs_manifest "$LOCAL_REPO_DIR"
                     log_ok "Extracted verified PostgreSQL 18.6 bundle to ${LOCAL_REPO_DIR}"
                 else
                     rm -f "$_PG_TMP_ARCHIVE"
@@ -431,6 +670,7 @@ else
 
     if [[ "$FORCE_BUILD" == "true" ]]; then
         _PG_BUILD_ACTIVE="true"
+        _pg_purge_local_repo_cache "$LOCAL_REPO_DIR"
         rvdk_prog 25 "PG 18.6: preparing verified PGDG source build (${TARGET_SLUG})..."
         log_info "Executing unprivileged PGDG source build (--force-build) for ${TARGET_SLUG}..."
 
@@ -504,8 +744,8 @@ else
                 DEB_CFLAGS_APPEND="$OPT_FLAGS" \
                 DEB_CXXFLAGS_APPEND="$OPT_FLAGS" \
                 bash -Eeuo pipefail -c 'cd "$1/work" && apt-get source --compile postgresql-common' _ "$BUILD_DIR"
-            chown 0:0 "${BUILD_DIR}/work"/*.deb
-            mv -f "${BUILD_DIR}/work"/*.deb "$LOCAL_REPO_DIR/"
+            _pg_stage_built_debs "${BUILD_DIR}/work" "$LOCAL_REPO_DIR"
+            _pg_write_debs_manifest "$LOCAL_REPO_DIR"
             update_local_repo
             apt-get install "${APT_FLAGS[@]}" postgresql-common postgresql-common-dev
         fi
@@ -521,11 +761,11 @@ else
             DEB_CFLAGS_APPEND="$OPT_FLAGS" \
             DEB_CXXFLAGS_APPEND="$OPT_FLAGS" \
             bash -Eeuo pipefail -c 'cd "$1/work" && apt-get source --compile "postgresql-$2"' _ "$BUILD_DIR" "$PG_VERSION"
-        chown 0:0 "${BUILD_DIR}/work"/*.deb
-        mv -f "${BUILD_DIR}/work"/*.deb "$LOCAL_REPO_DIR/"
+        _pg_stage_built_debs "${BUILD_DIR}/work" "$LOCAL_REPO_DIR"
         rm -f "${LOCAL_REPO_DIR}"/*-dbgsym_*.deb
         [[ "$KEEP_BUILD_DIR" != "true" ]] && rm -rf "$BUILD_DIR"
         _PG_BUILD_ACTIVE="false"
+        _pg_write_debs_manifest "$LOCAL_REPO_DIR"
         update_local_repo
     fi
 

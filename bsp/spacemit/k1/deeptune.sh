@@ -144,6 +144,50 @@ if [[ -n "$TUNE_REQUEST" ]]; then
     esac
 fi
 
+_k1_validate_nic() {
+    local nic="${1:-}"
+    local label="${2:-PRIMARY_NIC}"
+    local nic_re='^[a-zA-Z0-9._-]{1,15}$'
+    if [[ ! "$nic" =~ $nic_re || "$nic" == "." || "$nic" == ".." ]]; then
+        log_fatal "Invalid ${label} '${nic}' (expected Linux interface name matching ^[a-zA-Z0-9._-]{1,15}$)."
+    fi
+}
+
+_k1_backup_file() {
+    local src_path="${1:-}"
+    local category="${2:-deeptune}"
+    [[ "$src_path" == /* && -f "$src_path" && ! -L "$src_path" ]] || return 1
+    [[ "$src_path" != *$'\n'* && "$src_path" != *$'\r'* && "$src_path" != *".."* ]] || return 1
+    [[ "$category" =~ ^[a-z0-9_-]+$ ]] || return 1
+
+    local backup_root="${RVDK_BACKUP_ROOT:-${RVDK_STATE_DIR:-/var/lib/rvdk}/backups}"
+    local encoded="${src_path#/}"
+    while [[ "$encoded" == /* ]]; do
+        encoded="${encoded#/}"
+    done
+    encoded="${encoded//\//__}"
+    local cat_dir="${backup_root}/${category}"
+    local orig_path="${cat_dir}/${encoded}.orig"
+    local sidecar_path="${cat_dir}/${encoded}.path"
+
+    if [[ -L "$backup_root" || -L "$cat_dir" ]]; then
+        log_fatal "Refusing symlink backup directory: ${cat_dir}"
+    fi
+    install -d -m 0755 "$cat_dir"
+    if [[ ! -f "$orig_path" && ! -L "$orig_path" ]]; then
+        cp -a "$src_path" "$orig_path"
+    fi
+    if [[ ! -f "$sidecar_path" && ! -L "$sidecar_path" ]]; then
+        printf '%s\n' "$src_path" | rvdk_atomic_write "$sidecar_path" 0644
+    fi
+}
+
+if [[ "$ACTION" != "status" ]]; then
+    [[ -n "${RVDK_PRIMARY_NIC:-}" ]] && _k1_validate_nic "$RVDK_PRIMARY_NIC" "RVDK_PRIMARY_NIC"
+    [[ -n "${RVDK_SECONDARY_NIC:-}" ]] && _k1_validate_nic "$RVDK_SECONDARY_NIC" "RVDK_SECONDARY_NIC"
+    [[ -n "${SECONDARY_NIC:-}" ]] && _k1_validate_nic "$SECONDARY_NIC" "SECONDARY_NIC"
+fi
+
 if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
@@ -159,6 +203,20 @@ if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
     DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
 fi
 DT_MODEL_LC="$(tr '[:upper:]' '[:lower:]' <<< "$DT_MODEL")"
+
+_K1_IS_ORANGEPI="false"
+_K1_IS_ORANGEPI_RV2="false"
+if [[ "${RVDK_BOARD:-}" == orangepi/* || "$DT_MODEL_LC" == *"orangepi"* || "$DT_MODEL_LC" == *"orange pi"* ]]; then
+    _K1_IS_ORANGEPI="true"
+fi
+if [[ "${RVDK_BOARD:-}" == "orangepi/rv2" || "$DT_MODEL_LC" == *"orangepi-rv2"* || "$DT_MODEL_LC" == *"orangepi rv2"* || "$DT_MODEL_LC" == *"orange pi rv2"* ]]; then
+    _K1_IS_ORANGEPI_RV2="true"
+fi
+_K1_OPI_AFTER=""
+if [[ "$_K1_IS_ORANGEPI" == "true" ]] \
+    || [[ -f /etc/systemd/system/orangepi-hardware-optimize.service || -f /lib/systemd/system/orangepi-hardware-optimize.service || -f /usr/lib/systemd/system/orangepi-hardware-optimize.service ]]; then
+    _K1_OPI_AFTER=" orangepi-hardware-optimize.service"
+fi
 
 if [[ "$FORCE_SOC" != "true" && "${RVDK_SOC:-}" != "spacemit/k1" ]]; then
     case "$DT_MODEL_LC" in
@@ -296,6 +354,12 @@ if [[ -z "$PRIMARY_NIC" ]] && command -v ip >/dev/null 2>&1; then
     PRIMARY_NIC="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}' || true)"
 fi
 [[ -z "$PRIMARY_NIC" ]] && PRIMARY_NIC="end0"
+_k1_validate_nic "$PRIMARY_NIC" "PRIMARY_NIC"
+
+SECONDARY_NIC="${RVDK_SECONDARY_NIC:-${SECONDARY_NIC:-}}"
+if [[ -n "$SECONDARY_NIC" ]]; then
+    _k1_validate_nic "$SECONDARY_NIC" "SECONDARY_NIC"
+fi
 
 PRIMARY_IS_WIFI="false"
 if [[ "$PRIMARY_NIC" == wl* || -d "/sys/class/net/${PRIMARY_NIC}/wireless" ]]; then
@@ -311,6 +375,16 @@ log_info "Converging SpacemiT K1 / Ky X1 Silicon DeepTune (--tune ${TUNE_LABEL} 
 # ==============================================================================
 rvdk_prog 35 "SpacemiT K1 DeepTune: converging wireless, audio & GPU/Hailo modules (--tune ${TUNE_LABEL})..."
 
+MOD_LOAD_CFGS=(/etc/modules)
+if [[ "$_K1_IS_ORANGEPI_RV2" == "true" && -f /etc/modules-load.d/orangepirv2.conf ]]; then
+    MOD_LOAD_CFGS+=(/etc/modules-load.d/orangepirv2.conf)
+fi
+
+RESTORED_WIFI_AUTOLOAD="false"
+_K1_WAS_WIFI_BLACKLISTED="false"
+if grep -Eq '^blacklist (bcmdhd|dhd_static_buf)$' "$MODPROBE_SOC" 2>/dev/null; then
+    _K1_WAS_WIFI_BLACKLISTED="true"
+fi
 if [[ "$TUNE_MODE" != "iot" ]]; then
     if pgrep -f "brcm_patchram_plus" >/dev/null 2>&1; then
         pkill -TERM -f "brcm_patchram_plus" 2>/dev/null || true
@@ -318,14 +392,38 @@ if [[ "$TUNE_MODE" != "iot" ]]; then
     fi
 
     if [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
-        for mod_load_cfg in /etc/modules /etc/modules-load.d/orangepirv2.conf; do
-            if [[ -f "$mod_load_cfg" ]] && grep -Eq '^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]]|$)' "$mod_load_cfg" 2>/dev/null; then
-                sed -E 's/^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?$/# \1 # disabled by RVDK spacemit\/k1 deeptune/' "$mod_load_cfg" \
+        for mod_load_cfg in "${MOD_LOAD_CFGS[@]}"; do
+            if [[ -f "$mod_load_cfg" && ! -L "$mod_load_cfg" ]] && grep -Eq '^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]]|$)' "$mod_load_cfg" 2>/dev/null; then
+                if typeset -f rvdk_backup_file >/dev/null 2>&1; then
+                    rvdk_backup_file "$mod_load_cfg" "deeptune"
+                else
+                    _k1_backup_file "$mod_load_cfg" "deeptune"
+                fi
+                sed -E 's/^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?$/# \1\2 # disabled by RVDK spacemit\/k1 deeptune/' "$mod_load_cfg" \
                     | rvdk_atomic_write "$mod_load_cfg" 0644
                 log_ok "Disabled forced SDIO Wi-Fi module autoload in ${mod_load_cfg}"
             fi
         done
     fi
+else
+    for mod_load_cfg in "${MOD_LOAD_CFGS[@]}"; do
+        if [[ -f "$mod_load_cfg" && ! -L "$mod_load_cfg" ]] && grep -Eq '^[[:space:]]*#[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?[[:space:]]+#[[:space:]]*disabled by RVDK spacemit/k1 deeptune[[:space:]]*$' "$mod_load_cfg" 2>/dev/null; then
+            if typeset -f rvdk_backup_file >/dev/null 2>&1; then
+                rvdk_backup_file "$mod_load_cfg" "deeptune"
+            else
+                _k1_backup_file "$mod_load_cfg" "deeptune"
+            fi
+            awk '
+                /^[[:space:]]*#[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?[[:space:]]+#[[:space:]]*disabled by RVDK spacemit\/k1 deeptune[[:space:]]*$/ {
+                    sub(/^[[:space:]]*#[[:space:]]*/, "")
+                    sub(/[[:space:]]+#[[:space:]]*disabled by RVDK spacemit\/k1 deeptune[[:space:]]*$/, "")
+                }
+                { print }
+            ' "$mod_load_cfg" | rvdk_atomic_write "$mod_load_cfg" 0644
+            RESTORED_WIFI_AUTOLOAD="true"
+            log_ok "Restored SDIO Wi-Fi module autoload in ${mod_load_cfg} (--tune iot)"
+        fi
+    done
 fi
 
 SOC_HDMI_AUDIO_MODS=(
@@ -365,8 +463,15 @@ else
 fi
 
 mkdir -p /etc/modprobe.d
+if [[ "$TUNE_MODE" == "iot" ]]; then
+    MODPROBE_DESC="GPU/NPU/HDMI/ALSA (preserving Wi-Fi/BT/SDIO/I2C/SPI/UART)"
+else
+    MODPROBE_DESC="Bluetooth/ALSA"
+    [[ "$PRIMARY_IS_WIFI" == "false" ]] && MODPROBE_DESC+="/SDIO-WiFi"
+    [[ "$TUNE_MODE" == "data" ]] && MODPROBE_DESC+=" and IMG GPU / Hailo PCIe NPU"
+fi
 WANT_MODPROBE="# Managed by RVDK (bsp/spacemit/k1/deeptune.sh | tune=${TUNE_LABEL})
-# Suppresses SpacemiT K1/Ky X1 $( [[ "$TUNE_MODE" == "iot" ]] && printf "GPU/NPU/HDMI/ALSA (preserving Wi-Fi/BT/SDIO/I2C/SPI/UART)" || printf "Bluetooth/ALSA$( [[ "$PRIMARY_IS_WIFI" == "false" ]] && printf "/SDIO-WiFi" )$( [[ "$TUNE_MODE" == "data" ]] && printf " and IMG GPU / Hailo PCIe NPU" )" ) modules."
+# Suppresses SpacemiT K1/Ky X1 $(printf '%s' "$MODPROBE_DESC") modules."
 for m in "${TARGET_MODS[@]}"; do
     WANT_MODPROBE+=$'\n'"blacklist ${m}"
 done
@@ -396,6 +501,14 @@ if [[ "$TUNE_MODE" == "ai" ]]; then
             fi
         else
             log_skip "Accelerator module (${ai_mod}) already loaded for '${TUNE_LABEL}' tune"
+        fi
+    done
+elif [[ "$TUNE_MODE" == "iot" ]] && [[ "$RESTORED_WIFI_AUTOLOAD" == "true" || "$_K1_WAS_WIFI_BLACKLISTED" == "true" ]]; then
+    for wifi_mod in dhd_static_buf bcmdhd; do
+        if ! awk -v mod="$wifi_mod" '$1 == mod { found=1 } END { exit !found }' /proc/modules 2>/dev/null; then
+            if modinfo "$wifi_mod" >/dev/null 2>&1 && modprobe "$wifi_mod" 2>/dev/null; then
+                log_ok "Reloaded SDIO Wi-Fi module (${wifi_mod}) live for '${TUNE_LABEL}' tune"
+            fi
         fi
     done
 fi
@@ -430,7 +543,7 @@ if [[ "$TUNE_MODE" == "iot" ]]; then
 
     WANT_IOT_GOV_UNIT="[Unit]
 Description=RVDK SpacemiT K1 IoT CPUFreq Governor (schedutil -> ondemand -> performance)
-After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service orangepi-hardware-optimize.service armbian-hardware-optimize.service spacemit-k1-cpufreq-performance.service
+After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service${_K1_OPI_AFTER} armbian-hardware-optimize.service spacemit-k1-cpufreq-performance.service
 
 [Service]
 Type=oneshot
@@ -474,49 +587,63 @@ fi
 rvdk_prog 80 "SpacemiT K1 DeepTune: pinning Cluster 0 (cpu1..3) I/O IRQs & isolating Cluster 1 (cpu4..7)..."
 
 SECONDARY_NIC_CANDIDATES=()
-for _sec_nic in end1 eth1 enP1p1s0; do
+for _sec_nic in ${SECONDARY_NIC:+"$SECONDARY_NIC"} end1 eth1 enP1p1s0; do
     [[ "$_sec_nic" == "$PRIMARY_NIC" ]] && continue
-    SECONDARY_NIC_CANDIDATES+=("$_sec_nic")
+    _dup_sec="false"
+    for _existing_sec in ${SECONDARY_NIC_CANDIDATES[@]+"${SECONDARY_NIC_CANDIDATES[@]}"}; do
+        if [[ "$_existing_sec" == "$_sec_nic" ]]; then
+            _dup_sec="true"
+            break
+        fi
+    done
+    [[ "$_dup_sec" == "false" ]] && SECONDARY_NIC_CANDIDATES+=("$_sec_nic")
 done
 SECONDARY_NIC_PATTERN="$(IFS='|'; printf '%s' "${SECONDARY_NIC_CANDIDATES[*]}")"
-SECONDARY_IRQ_LINE=""
-if [[ -n "$SECONDARY_NIC_PATTERN" ]]; then
-    SECONDARY_IRQ_LINE="pin_irq \"${SECONDARY_NIC_PATTERN}\" \"2\""$'\n'
-fi
 
-WANT_IRQ_SCRIPT="#!/usr/bin/env bash
+printf -v _q_primary_nic '%q' "$PRIMARY_NIC"
+printf -v _q_secondary_pat '%q' "$SECONDARY_NIC_PATTERN"
+_k1_irq_header="$(cat <<'EOF'
+#!/usr/bin/env bash
 # Managed by RVDK (bsp/spacemit/k1/deeptune.sh)
 # SpacemiT K1 / Ky X1 cache-topology-aware IRQ & RPS affinity across 2x4 X60 clusters:
 #   • cpu0            : Timer & kernel housekeeping
-#   • Cluster 0 (1..3): GbE/2.5GbE (${PRIMARY_NIC}, end1/eth1) + RPS (0x0e), xHCI USB3, MMC/eMMC
+#   • Cluster 0 (1..3): GbE/2.5GbE primary + secondary NICs + RPS (0x0e), xHCI USB3, MMC/eMMC
 #   • Cluster 1 (4..7): Isolated shared-L2 compute/database/RVV 1.0/NPU harts
 set -Eeuo pipefail
+EOF
+)"
+_k1_irq_body="$(cat <<'EOF'
 
 pin_irq() {
-    local pattern=\"\$1\"
-    local cpu_list=\"\$2\"
+    local pattern="$1"
+    local cpu_list="$2"
     local irq
     while IFS= read -r irq; do
-        [[ -n \"\$irq\" && -w \"/proc/irq/\${irq}/smp_affinity_list\" ]] || continue
-        printf \"%s\" \"\$cpu_list\" > \"/proc/irq/\${irq}/smp_affinity_list\" 2>/dev/null || true
-    done < <(awk -v pat=\"\$pattern\" \"\\\$0 ~ pat { sub(/:/, \\\"\\\", \\\$1); print \\\$1 }\" /proc/interrupts 2>/dev/null)
+        [[ -n "$irq" && -w "/proc/irq/${irq}/smp_affinity_list" ]] || continue
+        printf "%s" "$cpu_list" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null || true
+    done < <(awk -v pat="$pattern" '$0 ~ pat { sub(/:/, "", $1); print $1 }' /proc/interrupts 2>/dev/null)
 }
 
-pin_irq \"${PRIMARY_NIC}\" \"1\"
-${SECONDARY_IRQ_LINE}pin_irq \"xhci-hcd\" \"3\"
-pin_irq \"mmc0|mmc2|sdhci\" \"3\"
+pin_irq "$PRIMARY_NIC" "1"
+if [[ -n "${SECONDARY_NIC_PATTERN:-}" ]]; then
+    pin_irq "$SECONDARY_NIC_PATTERN" "2"
+fi
+pin_irq "xhci-hcd" "3"
+pin_irq "mmc0|mmc2|sdhci" "3"
 
 for nic_dir in /sys/class/net/end* /sys/class/net/eth* /sys/class/net/enP*; do
-    [[ -d \"\$nic_dir\" ]] || continue
-    for rps_f in \"\${nic_dir}\"/queues/rx-*/rps_cpus; do
-        [[ -w \"\$rps_f\" ]] && printf \"0e\" > \"\$rps_f\" 2>/dev/null || true
+    [[ -d "$nic_dir" ]] || continue
+    for rps_f in "${nic_dir}"/queues/rx-*/rps_cpus; do
+        [[ -w "$rps_f" ]] && printf "0e" > "$rps_f" 2>/dev/null || true
     done
 done
-"
+EOF
+)"
+WANT_IRQ_SCRIPT="${_k1_irq_header}"$'\n'"PRIMARY_NIC=${_q_primary_nic}"$'\n'"SECONDARY_NIC_PATTERN=${_q_secondary_pat}"$'\n'"${_k1_irq_body}"
 
 WANT_IRQ_UNIT="[Unit]
 Description=RVDK SpacemiT K1 Dual-Cluster X60 Interrupt & RPS Affinity (${PRIMARY_NIC} + xHCI + MMC)
-After=network-online.target multi-user.target orangepi-hardware-optimize.service armbian-hardware-optimize.service
+After=network-online.target multi-user.target${_K1_OPI_AFTER} armbian-hardware-optimize.service
 Wants=network-online.target
 
 [Service]
@@ -529,8 +656,8 @@ WantedBy=multi-user.target"
 
 install -d -m 0755 /usr/local/sbin
 IRQ_CHANGED="false"
-if ! printf "%s" "$WANT_IRQ_SCRIPT" | cmp -s - "$IRQ_SCRIPT" 2>/dev/null; then
-    printf "%s" "$WANT_IRQ_SCRIPT" | rvdk_atomic_write "$IRQ_SCRIPT" 0755
+if ! printf '%s\n' "$WANT_IRQ_SCRIPT" | cmp -s - "$IRQ_SCRIPT" 2>/dev/null; then
+    printf '%s\n' "$WANT_IRQ_SCRIPT" | rvdk_atomic_write "$IRQ_SCRIPT" 0755
     IRQ_CHANGED="true"
 fi
 if ! printf "%s\n" "$WANT_IRQ_UNIT" | cmp -s - "$IRQ_UNIT" 2>/dev/null; then
@@ -539,6 +666,7 @@ if ! printf "%s\n" "$WANT_IRQ_UNIT" | cmp -s - "$IRQ_UNIT" 2>/dev/null; then
     systemctl enable spacemit-k1-irq-affinity.service >/dev/null
     IRQ_CHANGED="true"
 fi
+[[ -f "$IRQ_SCRIPT" && ! -L "$IRQ_SCRIPT" ]] || log_fatal "Refusing non-regular or symlink IRQ helper: ${IRQ_SCRIPT}"
 "$IRQ_SCRIPT"
 if [[ "$IRQ_CHANGED" == "true" ]]; then
     log_ok "Pinned SpacemiT K1 Cluster 0 IRQ/RPS affinity (${PRIMARY_NIC}->CPU1, NIC2->CPU2, xHCI/MMC->CPU3; Cluster 1 CPU4..7 isolated)"

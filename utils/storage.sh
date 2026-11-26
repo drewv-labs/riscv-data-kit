@@ -681,12 +681,15 @@ main() {
         fi
 
         if (( total_want_ext == 0 )); then
-            local summary_parts=()
+            local summary_str="" entry
             for (( i = 0; i < m_cnt; i++ )); do
-                summary_parts+=("${lvs_names[i]}: ${lvs_util[i]}%")
+                entry="${lvs_names[i]}: ${lvs_util[i]}%"
+                if [[ -z "$summary_str" ]]; then
+                    summary_str="$entry"
+                else
+                    summary_str="${summary_str}, ${entry}"
+                fi
             done
-            local summary_str
-            summary_str="$(IFS=', '; echo "${summary_parts[*]}")"
             log_ok "All mounted volumes healthy below ${high_water}% high-water mark (${summary_str})."
             log_skip "Preserving $(human_bytes "$vg_free_b") elastic VG reserve so grow-only filesystems never lock in unneeded extents (pass --distribute-pool or --high-water <pct> to allocate early)."
             print_status_report
@@ -810,4 +813,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main "$@"
+fi
