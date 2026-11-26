@@ -4,12 +4,12 @@
   "tag": "rv2",
   "name": "Orange Pi RV2 (Ky X1 / K1)",
   "soc": "spacemit/k1",
-  "default_os": "ubuntu-24.04",
+  "default_os": "debian-13",
   "media": {
     "sd": {
       "mode": "raw",
       "script": "flash-sd.sh",
-      "description": "Raw block SD card flasher for Orange Pi RV2 (root labeled rvdk_sd_root)",
+      "description": "Raw block SD card flasher for Orange Pi RV2 Debian Trixie (root labeled rvdk_sd_root)",
       "image": "Orangepirv2_1.0.0_debian_trixie_minimal_linux6.6.63-v3.img.bz2",
       "url": "https://dl.romanrm.net/risc-v/Orangepirv2_1.0.0_debian_trixie_minimal_linux6.6.63-v3.img.bz2",
       "sha256": "4dea04b64c19d109590938ee97a07a4b46426d083f43e5b666c1028a932700d0",

@@ -67,7 +67,7 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
             while [[ "$p" != "/" && "$p" == */ ]]; do
                 p="${p%/}"
             done
-            printf '%s' "$p"
+            printf '%s\n' "$p"
         }
         rvdk_kv_load() { :; }
         rvdk_kv_write() { :; }

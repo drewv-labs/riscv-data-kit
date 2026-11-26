@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -482,14 +483,66 @@ _rvdk_bsp_select_root_part "/dev/mmcblk0"
         )
         script = f"""
 set -Eeuo pipefail
-source "{REPO_ROOT}/lib/bsp.sh"
-_rvdk_bsp_strip_fstab_commit <<'EOF'
+source "{REPO_ROOT}/lib/common.sh"
+_rvdk_strip_fstab_commit <<'EOF'
 {fstab_in.rstrip()}
 EOF
 """
         proc = _run_bash(script)
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout == expected
+
+    def test_common_rewrite_label_token_and_literal_and_normalize_mount_path(
+        self, tmp_path: Path
+    ) -> None:
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+_rvdk_rewrite_literal "1111-2222" 'aaaa&\\1$b' <<'EOF'
+UUID=1111-2222 / ext4 defaults 0 1
+# comment 1111-2222
+EOF
+printf '===LBL===\\n'
+_rvdk_rewrite_label_token "armbi_root" "rvdk_emmc_root" <<'EOF'
+root=LABEL=armbi_root,ro LABEL=armbi_root2
+EOF
+printf '===NORM1=<%s>===\\n' "$(rvdk_normalize_mount_path "/mnt/nvme_data///")"
+printf '===NORM_RAW===\\n'
+rvdk_normalize_mount_path "/mnt/nvme_data///"
+rvdk_normalize_mount_path "/"
+rvdk_normalize_mount_path ""
+printf '===RESOLVE===\\n'
+rvdk_resolve_data_mount "/mnt/nvme_data///"
+"""
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == (
+            "UUID=aaaa&\\1$b / ext4 defaults 0 1\n"
+            "# comment aaaa&\\1$b\n"
+            "===LBL===\n"
+            "root=LABEL=rvdk_emmc_root,ro LABEL=armbi_root2\n"
+            "===NORM1=</mnt/nvme_data>===\n"
+            "===NORM_RAW===\n"
+            "/mnt/nvme_data\n"
+            "/\n"
+            "\n"
+            "===RESOLVE===\n"
+            "/mnt/nvme_data\n"
+        )
+
+        # Verify standalone purge-user.sh fallback stub matches trailing-newline semantics
+        purge_stub = tmp_path / "purge_standalone.sh"
+        purge_stub.write_text((REPO_ROOT / "utils" / "purge-user.sh").read_text(encoding="utf-8"), encoding="utf-8")
+        stub_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{purge_stub}"
+rvdk_normalize_mount_path "/mnt/data///"
+rvdk_normalize_mount_path "/"
+"""
+        )
+        assert stub_proc.returncode == 0, stub_proc.stderr
+        assert stub_proc.stdout == "/mnt/data\n/\n"
 
 
 class TestPurgeUserHelpers:
@@ -1086,6 +1139,39 @@ printf 'SRC=%s|ARCH=%s|MMU=%s|SOC=%s|BOARD=%s\\n' \\
             proc.stdout.strip()
             == "SRC=cache|ARCH=riscv32|MMU=none|SOC=espressif/esp32p4|BOARD=waveshare/esp32-p4-wifi6"
         )
+
+    def test_kit_resolve_and_normalize_cover_all_17_media_manifests(self) -> None:
+        manifest_paths = sorted((REPO_ROOT / "boards").glob("*/*/media.json"))
+        assert len(manifest_paths) == 17
+
+        checks: list[str] = []
+        expected_lines: list[str] = []
+        for m_path in manifest_paths:
+            doc = json.loads(m_path.read_text(encoding="utf-8"))
+            board = str(doc["board"])
+            tag = str(doc["tag"])
+            soc = str(doc["soc"])
+            arch = str(doc.get("arch") or "riscv64")
+            os_arg = "esp-idf" if arch == "riscv32" else "debian"
+            checks.append(
+                f'n_tag="$(rvdk_normalize_board_id "{tag}")"\n'
+                f'n_brd="$(rvdk_normalize_board_id "{board}")"\n'
+                f'rvdk_kit_resolve --no-cache --board "{tag}" --os "{os_arg}"\n'
+                f'printf "%s|%s|%s|%s|%s|%s\\n" "$n_tag" "$n_brd" "$RVDK_BOARD" "$RVDK_BOARD_TAG" "$RVDK_SOC" "$RVDK_ARCH"'
+            )
+            expected_lines.append(f"{board}|{board}|{board}|{tag}|{soc}|{arch}")
+
+        script = (
+            "set -Eeuo pipefail\n"
+            'export RVDK_KIT_CACHE_FILE="/nonexistent"\n'
+            f'source "{REPO_ROOT}/lib/common.sh"\n'
+            f'source "{REPO_ROOT}/lib/kit.sh"\n'
+            + "\n".join(checks)
+            + "\n"
+        )
+        proc = _run_bash(script)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.splitlines() == expected_lines
 
 
 class TestLibBspAndMotdRiscv32:

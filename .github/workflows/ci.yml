@@ -16,26 +16,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Python lint & test dependencies (ruff, pytest)
-        run: |
-          python3 -m venv "${{ runner.temp }}/rvdk-ci-venv"
-          "${{ runner.temp }}/rvdk-ci-venv/bin/python" -m pip install --no-cache-dir ruff pytest
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+
+      - name: Install locked Python lint, typecheck & test dependencies
+        run: uv sync --frozen
 
       - name: Run Ruff lint on Python tooling and tests
-        run: "${{ runner.temp }}/rvdk-ci-venv/bin/ruff" check tools/rvdk_ci.py tests/
+        run: uv run --frozen ruff check tools tests
+
+      - name: Run basedpyright static type check on Python tooling and tests
+        run: uv run --frozen basedpyright tools tests
+
+      - name: Run RVDK manifest, symlink, syntax, ShellCheck, bundler & security checks
+        run: uv run --frozen python3 tools/rvdk_ci.py --check
 
       - name: Run unit and shell library regression suite
-        run: "${{ runner.temp }}/rvdk-ci-venv/bin/pytest" -q tests/
-
-      - name: Run RVDK manifest, symlink, syntax & agnosticism checks
-        run: python3 tools/rvdk_ci.py --check
-
-      - name: Run ShellCheck across repository scripts
-        run: |
-          find . -path './.git' -prune -o -path './_site' -prune -o -name '*.sh' -type f -print0 \
-            | xargs -0 shellcheck -x -S warning
-
-      - name: Verify standalone Pages bundler & ShellCheck bundled artifacts
-        run: |
-          python3 tools/rvdk_ci.py --bundle-dist _site
-          find _site -name '*.sh' -type f -print0 | xargs -0 shellcheck -S warning
+        run: uv run --frozen pytest -v

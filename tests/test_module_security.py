@@ -1,4 +1,4 @@
-"""Behavioral and static security regression tests for PG18, ntfy, and tailscale modules."""
+"""Behavioral and static security regression tests for PG18, ntfy, tailscale, OS, and board modules."""
 
 from __future__ import annotations
 
@@ -1014,3 +1014,556 @@ _NTFY_TMP_EXTRACT="{ext_dir}"
         )
         assert ext_proc.returncode != 0
         assert "symbolic links" in ext_proc.stderr
+
+
+OWNED_PRIV_BOUNDARY_SCRIPTS: list[tuple[Path, list[str], str, str]] = [
+    (REPO_ROOT / "os" / "bootstrap-apt.sh", ["--distro", "debian"], "RVDK_APT_DISTRO_DEFAULT", "debian"),
+    (REPO_ROOT / "os" / "bootstrap-openwrt.sh", ["--hostname", "r2s-gw"], "RVDK_KEEP_VENDOR_MIRRORS", "1"),
+    (REPO_ROOT / "os" / "deeptune.sh", ["--tune", "iot"], "RVDK_TUNE", "iot"),
+    (REPO_ROOT / "boards" / "sifive" / "p550" / "quirks" / "fusb.sh", ["off"], "RVDK_BOARD", "sifive/p550"),
+    (REPO_ROOT / "boards" / "sifive" / "p550" / "quirks" / "hdmi.sh", ["off"], "RVDK_SOC", "eswin/eic7700x"),
+    (REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "deeptune.sh", ["--tune", "iot"], "RVDK_TUNE", "iot"),
+    (REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "quirks" / "c6-sdio.sh", ["disable"], "RVDK_NO_PROGBAR", "1"),
+]
+
+
+def _make_self_elevate_sudo_mock(
+    tmp_path: Path,
+    *,
+    deny_setenv: bool = False,
+    child_rc: int = 0,
+) -> tuple[Path, Path, Path, Path]:
+    bin_dir = tmp_path / "bin"
+    sudo_log = tmp_path / "sudo_calls.log"
+    child_env_log = tmp_path / "child_env.txt"
+    pwn_flag = tmp_path / "bash_env_pwned"
+
+    _write_exe(
+        bin_dir / "sudo",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "{sudo_log}"
+validate_only=0
+non_interactive=0
+preserve_csv=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n)
+            non_interactive=1
+            shift
+            ;;
+        -v)
+            validate_only=1
+            shift
+            ;;
+        -E)
+            printf 'sudo: -E must never be called\\n' >&2
+            exit 99
+            ;;
+        --preserve-env=*)
+            preserve_csv="${{1#--preserve-env=}}"
+            shift
+            ;;
+        --preserve-env)
+            preserve_csv="${{2:-}}"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+if [[ -n "$preserve_csv" && "{1 if deny_setenv else 0}" == "1" ]]; then
+    printf 'sudo: sorry, you are not allowed to set the following environment variables: %s\\n' "$preserve_csv" >&2
+    exit 1
+fi
+if [[ "$validate_only" == "1" ]]; then
+    exit 0
+fi
+if [[ "$non_interactive" == "1" && "${{1:-}}" == "true" ]]; then
+    exit 0
+fi
+
+clean_env=("PATH=/usr/bin:/bin" "RVDK_TEST_ELEVATED=1")
+if [[ -n "$preserve_csv" ]]; then
+    IFS=',' read -r -a keep_vars <<< "$preserve_csv"
+    for k in "${{keep_vars[@]}}"; do
+        if [[ -n "${{!k+x}}" ]]; then
+            clean_env+=("${{k}}=${{!k}}")
+        fi
+    done
+fi
+
+env -i "${{clean_env[@]}}" "{BASH_BIN}" -c '
+    printf "BASH_ENV=%s\\n" "${{BASH_ENV:-UNSET}}"
+    printf "ENV=%s\\n" "${{ENV:-UNSET}}"
+    printf "LD_PRELOAD=%s\\n" "${{LD_PRELOAD:-UNSET}}"
+    printf "LD_LIBRARY_PATH=%s\\n" "${{LD_LIBRARY_PATH:-UNSET}}"
+    printf "PATH=%s\\n" "${{PATH:-UNSET}}"
+    printf "XDG_CACHE_HOME=%s\\n" "${{XDG_CACHE_HOME:-UNSET}}"
+    printf "RVDK_PROGBAR_LIB=%s\\n" "${{RVDK_PROGBAR_LIB:-UNSET}}"
+    printf "RVDK_APT_LIB=%s\\n" "${{RVDK_APT_LIB:-UNSET}}"
+    printf "RVDK_TUNE=%s\\n" "${{RVDK_TUNE:-UNSET}}"
+    printf "RVDK_BOARD=%s\\n" "${{RVDK_BOARD:-UNSET}}"
+    printf "RVDK_SOC=%s\\n" "${{RVDK_SOC:-UNSET}}"
+    printf "RVDK_APT_DISTRO_DEFAULT=%s\\n" "${{RVDK_APT_DISTRO_DEFAULT:-UNSET}}"
+    printf "RVDK_KEEP_VENDOR_MIRRORS=%s\\n" "${{RVDK_KEEP_VENDOR_MIRRORS:-UNSET}}"
+    printf "RVDK_NO_PROGBAR=%s\\n" "${{RVDK_NO_PROGBAR:-UNSET}}"
+    exit {child_rc}
+' > "{child_env_log}"
+""",
+    )
+    return bin_dir, sudo_log, child_env_log, pwn_flag
+
+
+class TestOsAndBoardPrivilegeBoundary:
+    @pytest.mark.parametrize(
+        ("script_path", "_args", "_var_name", "_var_val"),
+        OWNED_PRIV_BOUNDARY_SCRIPTS,
+        ids=lambda item: str(item.relative_to(REPO_ROOT)) if isinstance(item, Path) else str(item),
+    )
+    def test_no_sudo_dash_e_or_eval_in_owned_scripts(
+        self,
+        script_path: Path,
+        _args: list[str],
+        _var_name: str,
+        _var_val: str,
+    ) -> None:
+        text = script_path.read_text(encoding="utf-8")
+        assert not re.search(r"(^|\s)sudo\s+-E(\s|$)", text, flags=re.MULTILINE)
+        assert not re.search(r"(^|[;&|]\s*)eval(\s|$)", text, flags=re.MULTILINE)
+        assert "rvdk_sudo_preserve" in text
+
+    @pytest.mark.parametrize("standalone", [False, True], ids=["repo", "standalone"])
+    @pytest.mark.parametrize(
+        ("script_path", "cli_args", "allow_var", "allow_val"),
+        OWNED_PRIV_BOUNDARY_SCRIPTS,
+        ids=lambda item: str(item.relative_to(REPO_ROOT)) if isinstance(item, Path) else str(item),
+    )
+    def test_self_elevation_strips_bash_env_and_dangerous_vars(
+        self,
+        tmp_path: Path,
+        script_path: Path,
+        cli_args: list[str],
+        allow_var: str,
+        allow_val: str,
+        standalone: bool,
+    ) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("Unprivileged self-elevation path requires non-root UID")
+
+        bin_dir, sudo_log, child_env_log, pwn_flag = _make_self_elevate_sudo_mock(tmp_path)
+        evil_bashenv = tmp_path / "evil_bashenv.sh"
+        evil_bashenv.write_text(
+            f'if [[ "${{RVDK_TEST_ELEVATED:-0}}" == "1" ]]; then touch "{pwn_flag}"; fi\n',
+            encoding="utf-8",
+        )
+
+        target = script_path
+        if standalone:
+            standalone_dir = tmp_path / "standalone_only"
+            standalone_dir.mkdir()
+            target = standalone_dir / script_path.name
+            shutil.copy2(script_path, target)
+
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "BASH_ENV": str(evil_bashenv),
+            "ENV": str(evil_bashenv),
+            "LD_PRELOAD": "/tmp/evil_preload.so",
+            "LD_LIBRARY_PATH": "/tmp/evil_ld_path",
+            "XDG_CACHE_HOME": "/tmp/evil_xdg",
+            "RVDK_PROGBAR_LIB": "/tmp/evil_progbar.sh",
+            "RVDK_APT_LIB": "/tmp/evil_apt.sh",
+            allow_var: allow_val,
+        }
+
+        proc = subprocess.run(
+            [BASH_BIN, str(target), *cli_args],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        assert not pwn_flag.exists(), "BASH_ENV must not survive sudo self-elevation"
+
+        sudo_calls = sudo_log.read_text(encoding="utf-8").splitlines()
+        assert len(sudo_calls) == 2
+        assert "--preserve-env=" in sudo_calls[0]
+        assert "--preserve-env=" in sudo_calls[1]
+        for call in sudo_calls:
+            assert " -E " not in f" {call} "
+            for dangerous in (
+                "BASH_ENV",
+                "ENV",
+                "LD_PRELOAD",
+                "LD_LIBRARY_PATH",
+                "PATH",
+                "XDG_CACHE_HOME",
+                "RVDK_PROGBAR_LIB",
+                "RVDK_APT_LIB",
+            ):
+                assert dangerous not in call
+
+        child_env = dict(
+            line.split("=", 1) for line in child_env_log.read_text(encoding="utf-8").splitlines()
+        )
+        assert child_env["BASH_ENV"] == "UNSET"
+        assert child_env["ENV"] == "UNSET"
+        assert child_env["LD_PRELOAD"] == "UNSET"
+        assert child_env["LD_LIBRARY_PATH"] == "UNSET"
+        assert child_env["PATH"] == "/usr/bin:/bin"
+        assert child_env["XDG_CACHE_HOME"] == "UNSET"
+        assert child_env["RVDK_PROGBAR_LIB"] == "UNSET"
+        assert child_env["RVDK_APT_LIB"] == "UNSET"
+        assert child_env[allow_var] == allow_val
+
+    def test_standalone_fallback_preserves_exit_code_and_falls_back_when_setenv_denied(
+        self, tmp_path: Path
+    ) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("Unprivileged self-elevation path requires non-root UID")
+
+        bin_dir, sudo_log, child_env_log, pwn_flag = _make_self_elevate_sudo_mock(
+            tmp_path, deny_setenv=True, child_rc=42
+        )
+        evil_bashenv = tmp_path / "evil_bashenv.sh"
+        evil_bashenv.write_text(
+            f'if [[ "${{RVDK_TEST_ELEVATED:-0}}" == "1" ]]; then touch "{pwn_flag}"; fi\n',
+            encoding="utf-8",
+        )
+
+        standalone_target = tmp_path / "standalone" / "deeptune.sh"
+        standalone_target.parent.mkdir()
+        shutil.copy2(REPO_ROOT / "os" / "deeptune.sh", standalone_target)
+
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "BASH_ENV": str(evil_bashenv),
+            "LD_PRELOAD": "/tmp/evil.so",
+            "RVDK_TUNE": "iot",
+        }
+        proc = subprocess.run(
+            [BASH_BIN, str(standalone_target), "--tune", "iot"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert proc.returncode == 42
+        assert not pwn_flag.exists()
+
+        calls = sudo_log.read_text(encoding="utf-8").splitlines()
+        assert len(calls) == 2
+        assert calls[0].startswith("--preserve-env=")
+        assert calls[1] == f"bash {standalone_target} --tune iot"
+
+        child_env = dict(
+            line.split("=", 1) for line in child_env_log.read_text(encoding="utf-8").splitlines()
+        )
+        assert child_env["BASH_ENV"] == "UNSET"
+        assert child_env["LD_PRELOAD"] == "UNSET"
+        assert child_env["RVDK_TUNE"] == "UNSET"
+
+
+class TestBootstrapAptNetGuardPersistenceAndChroot:
+    def _extract_net_guard_block(self, root_dir: Path, nft_bin: Path) -> str:
+        apt_text = (REPO_ROOT / "os" / "bootstrap-apt.sh").read_text(encoding="utf-8")
+        match = re.search(
+            r"(?ms)^# 4\. RVDK IPv4 IP-OPTIONS PREROUTING DROP GUARD.*?^(?=# =+\n# 5\. UNIFIED RVDK LOGIN HEADER)",
+            apt_text,
+        )
+        assert match is not None, "Could not locate section 4 rvdk-net-guard block in os/bootstrap-apt.sh"
+        block = match.group(0)
+        return (
+            block.replace("/usr/sbin/nft", str(nft_bin))
+            .replace("/etc/", f"{root_dir}/etc/")
+            .replace("/run/systemd/system", f"{root_dir}/run/systemd/system")
+        )
+
+    def _make_stateful_nft_mock(self, bin_dir: Path, state_file: Path, log_file: Path) -> Path:
+        return _write_exe(
+            bin_dir / "nft",
+            f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "{log_file}"
+touch "{state_file}"
+case "${{1:-}}" in
+    -f)
+        cfg="${{2:-}}"
+        if [[ ! -r "$cfg" ]]; then
+            printf 'nft: cannot open %s\\n' "$cfg" >&2
+            exit 1
+        fi
+        if grep -qE '^flush ruleset$' "$cfg"; then
+            : > "{state_file}"
+        fi
+        if grep -qE 'table inet filter' "$cfg"; then
+            printf 'inet:filter\\n' >> "{state_file}"
+        fi
+        if grep -qE 'table ip rvdk_net_guard' "$cfg"; then
+            if ! grep -qxF 'ip:rvdk_net_guard' "{state_file}"; then
+                printf 'ip:rvdk_net_guard\\n' >> "{state_file}"
+            fi
+        fi
+        exit 0
+        ;;
+    list)
+        if [[ "${{2:-}}" == "table" && "${{3:-}}" == "ip" ]]; then
+            grep -qxF "ip:${{4:-}}" "{state_file}" 2>/dev/null
+            exit $?
+        fi
+        ;;
+    delete)
+        if [[ "${{2:-}}" == "table" && "${{3:-}}" == "ip" ]]; then
+            grep -vxF "ip:${{4:-}}" "{state_file}" > "{state_file}.tmp" || true
+            mv -f "{state_file}.tmp" "{state_file}"
+            exit 0
+        fi
+        ;;
+esac
+exit 1
+""",
+        )
+
+    def test_net_guard_dropin_persists_guard_across_nftables_reload_and_converges(
+        self, tmp_path: Path
+    ) -> None:
+        root_dir = tmp_path / "rootfs"
+        (root_dir / "etc" / "nftables.d").mkdir(parents=True)
+        (root_dir / "run" / "systemd" / "system").mkdir(parents=True)
+        nftables_conf = root_dir / "etc" / "nftables.conf"
+        nftables_conf.write_text(
+            "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n}\n",
+            encoding="utf-8",
+        )
+
+        bin_dir = tmp_path / "bin"
+        nft_state = tmp_path / "nft_tables.state"
+        nft_log = tmp_path / "nft.log"
+        sys_log = tmp_path / "systemctl.log"
+        enabled_marker = tmp_path / "unit_enabled"
+        active_marker = tmp_path / "unit_active"
+
+        nft_bin = self._make_stateful_nft_mock(bin_dir, nft_state, nft_log)
+        _write_exe(bin_dir / "sysctl", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "systemctl",
+            f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "{sys_log}"
+case "${{1:-}}" in
+    daemon-reload)
+        exit 0
+        ;;
+    enable)
+        if [[ "${{2:-}}" == "--now" ]]; then
+            touch "{enabled_marker}" "{active_marker}"
+        else
+            touch "{enabled_marker}"
+        fi
+        exit 0
+        ;;
+    is-active)
+        [[ -f "{active_marker}" ]]
+        exit $?
+        ;;
+    is-enabled)
+        [[ -f "{enabled_marker}" ]]
+        exit $?
+        ;;
+esac
+exit 0
+""",
+        )
+
+        guard_block = self._extract_net_guard_block(root_dir, nft_bin)
+        run_script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_prog() {{ :; }}
+SKIP_NET_GUARD="false"
+{guard_block}
+"""
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+        # Pass 1: initial convergence
+        p1 = _run_bash(run_script, env=env)
+        assert p1.returncode == 0, f"stdout={p1.stdout}\nstderr={p1.stderr}"
+        assert "[OK]" in p1.stdout
+
+        dropin_path = root_dir / "etc" / "systemd" / "system" / "nftables.service.d" / "90-rvdk-net-guard.conf"
+        guard_nft_path = root_dir / "etc" / "nftables.d" / "10-rvdk-ip-options.nft"
+        assert dropin_path.is_file()
+        assert guard_nft_path.is_file()
+
+        dropin_lines = [ln.strip() for ln in dropin_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert dropin_lines == [
+            "[Service]",
+            f"ExecStartPost=-{nft_bin} -f {guard_nft_path}",
+            "ExecReload=",
+            f"ExecReload={nft_bin} -f {root_dir}/etc/nftables.conf",
+            f"ExecReload=-{nft_bin} -f {guard_nft_path}",
+        ]
+
+        # Simulate `systemctl reload nftables.service`: apply drop-in ExecReload= entries in order
+        reload_cmds: list[str] = []
+        for line in dropin_lines:
+            if line.startswith("ExecReload="):
+                val = line.split("=", 1)[1]
+                if val == "":
+                    reload_cmds.clear()
+                else:
+                    reload_cmds.append(val.lstrip("-"))
+        assert len(reload_cmds) == 2
+
+        reload_proc = _run_bash("\n".join(reload_cmds), env=env)
+        assert reload_proc.returncode == 0, reload_proc.stderr
+        assert "ip:rvdk_net_guard" in nft_state.read_text(encoding="utf-8").splitlines()
+        assert "inet:filter" in nft_state.read_text(encoding="utf-8").splitlines()
+
+        # Pass 2: converged re-run must emit [SKIP] and avoid re-applying nft / daemon-reload
+        nft_log_before = len(nft_log.read_text(encoding="utf-8").splitlines())
+        sys_log_before = len(sys_log.read_text(encoding="utf-8").splitlines())
+        p2 = _run_bash(run_script, env=env)
+        assert p2.returncode == 0, f"stdout={p2.stdout}\nstderr={p2.stderr}"
+        assert "[SKIP]" in p2.stdout
+        assert "[OK]" not in p2.stdout
+        new_nft_calls = nft_log.read_text(encoding="utf-8").splitlines()[nft_log_before:]
+        new_sys_calls = sys_log.read_text(encoding="utf-8").splitlines()[sys_log_before:]
+        assert not any(c.startswith("-f ") for c in new_nft_calls)
+        assert not any(c.startswith(("daemon-reload", "enable")) for c in new_sys_calls)
+
+    def test_net_guard_non_systemd_chroot_offline_enable_and_converged_skip(
+        self, tmp_path: Path
+    ) -> None:
+        root_dir = tmp_path / "chroot"
+        (root_dir / "etc" / "nftables.d").mkdir(parents=True)
+        # Intentionally do NOT create root_dir/run/systemd/system
+
+        bin_dir = tmp_path / "bin"
+        nft_log = tmp_path / "nft_chroot.log"
+        sys_log = tmp_path / "systemctl_chroot.log"
+        enabled_marker = tmp_path / "chroot_enabled"
+
+        nft_bin = bin_dir / "nft"
+        _write_exe(
+            nft_bin,
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{nft_log}"
+printf 'nft: netfilter unavailable in chroot\\n' >&2
+exit 1
+""",
+        )
+        _write_exe(bin_dir / "sysctl", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(
+            bin_dir / "systemctl",
+            f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "{sys_log}"
+case "${{1:-}}" in
+    daemon-reload|is-active|is-system-running)
+        printf 'System has not been booted with systemd as init system (PID 1).\\n' >&2
+        exit 1
+        ;;
+    enable)
+        if [[ "$*" == *"--now"* ]]; then
+            printf 'System has not been booted with systemd as init system (PID 1).\\n' >&2
+            exit 1
+        fi
+        touch "{enabled_marker}"
+        exit 0
+        ;;
+    is-enabled)
+        [[ -f "{enabled_marker}" ]]
+        exit $?
+        ;;
+esac
+exit 1
+""",
+        )
+
+        guard_block = self._extract_net_guard_block(root_dir, nft_bin)
+        run_script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_prog() {{ :; }}
+SKIP_NET_GUARD="false"
+{guard_block}
+"""
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+        # Pass 1: writes files, offline-enables unit without --now or daemon-reload or live nft
+        p1 = _run_bash(run_script, env=env)
+        assert p1.returncode == 0, f"stdout={p1.stdout}\nstderr={p1.stderr}"
+        assert "[OK]" in p1.stdout
+        assert not nft_log.exists(), "Live nft must not be invoked when /run/systemd/system is absent"
+        assert enabled_marker.is_file()
+        sys_calls_1 = sys_log.read_text(encoding="utf-8").splitlines()
+        assert "enable rvdk-net-guard.service" in sys_calls_1
+        assert not any("daemon-reload" in c or "--now" in c or "is-active" in c for c in sys_calls_1)
+
+        # Pass 2: converged chroot re-run logs [SKIP] and does not re-enable
+        sys_count_1 = len(sys_calls_1)
+        p2 = _run_bash(run_script, env=env)
+        assert p2.returncode == 0, f"stdout={p2.stdout}\nstderr={p2.stderr}"
+        assert "[SKIP]" in p2.stdout
+        assert "[OK]" not in p2.stdout
+        assert not nft_log.exists()
+        sys_calls_2 = sys_log.read_text(encoding="utf-8").splitlines()[sys_count_1:]
+        assert sys_calls_2 == ["is-enabled --quiet rvdk-net-guard.service"]
+
+    def test_non_systemd_container_with_failing_systemctl_does_not_fail(
+        self, tmp_path: Path
+    ) -> None:
+        root_dir = tmp_path / "container_rootfs"
+        (root_dir / "etc" / "nftables.d").mkdir(parents=True)
+
+        bin_dir = tmp_path / "bin"
+        nft_bin = bin_dir / "nft"
+        _write_exe(nft_bin, "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(bin_dir / "sysctl", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(bin_dir / "dpkg-query", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(
+            bin_dir / "systemctl",
+            "#!/usr/bin/env bash\nprintf 'System has not been booted with systemd\\n' >&2\nexit 1\n",
+        )
+
+        apt_text = (REPO_ROOT / "os" / "bootstrap-apt.sh").read_text(encoding="utf-8")
+        debloat_fn = _extract_bash_function(REPO_ROOT / "os" / "bootstrap-apt.sh", "run_headless_debloat")
+        debloat_fn = debloat_fn.replace("/etc/", f"{root_dir}/etc/").replace(
+            "/run/systemd/system", f"{root_dir}/run/systemd/system"
+        )
+        guard_block = self._extract_net_guard_block(root_dir, nft_bin)
+        assert "[[ -d /run/systemd/system ]]" in apt_text
+
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_prog() {{ :; }}
+KEEP_GUI="false"
+DISTRO_FLAVOR="debian"
+_DISTRO_TITLE="Debian"
+APT_FLAGS=(-y)
+SKIP_NET_GUARD="false"
+{debloat_fn}
+run_headless_debloat
+{guard_block}
+"""
+        p1 = _run_bash(script, env=env)
+        assert p1.returncode == 0, f"stdout={p1.stdout}\nstderr={p1.stderr}"
+        assert "Skipped" not in p1.stderr
+
+        p2 = _run_bash(script, env=env)
+        assert p2.returncode == 0, f"stdout={p2.stdout}\nstderr={p2.stderr}"
+        assert "[SKIP]" in p2.stdout
+

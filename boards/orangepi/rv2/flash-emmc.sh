@@ -83,6 +83,7 @@ _rvdk_emmc_cleanup() {
     for svc in ${_STOPPED_SVCS[@]+"${_STOPPED_SVCS[@]}"}; do
         systemctl start "$svc" 2>/dev/null || true
     done
+    _STOPPED_SVCS=()
     if [[ -n "${_EMMC_TMP_MNT:-}" && -d "${_EMMC_TMP_MNT}" ]]; then
         if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "${_EMMC_TMP_MNT}" 2>/dev/null; then
             umount "${_EMMC_TMP_MNT}" 2>/dev/null || umount -l "${_EMMC_TMP_MNT}" 2>/dev/null || true
@@ -90,9 +91,12 @@ _rvdk_emmc_cleanup() {
             umount "${_EMMC_TMP_MNT}" 2>/dev/null || true
         fi
         rmdir "${_EMMC_TMP_MNT}" 2>/dev/null || true
+        _EMMC_TMP_MNT=""
     fi
-    if typeset -f _rvdk_cleanup_tmpfiles >/dev/null 2>&1; then
-        _rvdk_cleanup_tmpfiles || true
+    if [[ "${_RVDK_CLEANUP_RUNNING:-0}" != "1" ]]; then
+        if typeset -f _rvdk_cleanup_tmpfiles >/dev/null 2>&1; then
+            _rvdk_cleanup_tmpfiles || true
+        fi
     fi
 }
 
@@ -184,6 +188,10 @@ Hardware Workflow:
 EOF
 }
 
+_require_arg() {
+    [[ $# -ge 2 && -n "${2:-}" && "${2:-}" != -* ]] || log_fatal "Option '${1:-}' requires an argument."
+}
+
 main() {
     local orig_args=("$@")
     local target_dev=""
@@ -195,9 +203,9 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -d|--device)       target_dev="${2:-}"; shift 2 ;;
-            --root-label)      root_label="${2:-}"; shift 2 ;;
-            --hostname)        target_hostname="${2:-}"; shift 2 ;;
+            -d|--device)       _require_arg "$@"; target_dev="$2"; shift 2 ;;
+            --root-label)      _require_arg "$@"; root_label="$2"; shift 2 ;;
+            --hostname)        _require_arg "$@"; target_hostname="$2"; shift 2 ;;
             -n|--dry-run)      dry_run="true"; shift ;;
             --force)           force_run="true"; shift ;;
             -y|--yes)          skip_confirm="true"; shift ;;
@@ -401,9 +409,13 @@ main() {
         esac
     fi
 
-    trap '_rvdk_emmc_cleanup' EXIT
-    trap '_rvdk_emmc_cleanup; trap - INT; kill -INT $$' INT
-    trap '_rvdk_emmc_cleanup; trap - TERM; kill -TERM $$' TERM
+    if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
+        rvdk_register_cleanup _rvdk_emmc_cleanup
+    else
+        trap '_rvdk_emmc_cleanup' EXIT
+        trap 'trap - EXIT INT; _rvdk_emmc_cleanup; kill -INT $$' INT
+        trap 'trap - EXIT TERM; _rvdk_emmc_cleanup; kill -TERM $$' TERM
+    fi
 
     # --------------------------------------------------------------------------
     # 3. Partition Full eMMC (16 MiB-Aligned MBR) & Format `rvdk_emmc_root`

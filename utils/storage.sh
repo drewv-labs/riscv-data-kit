@@ -325,21 +325,46 @@ main() {
         lvs --noheadings -o lv_name "$vg_name" 2>/dev/null | awk '{$1=$1; if ($1 != "") print $1}'
     }
 
+    # Parse and validate a single `<lv>:<weight>` entry, requiring numeric weight > 0
+    _parse_weight_pair() {
+        local pair="$1"
+        [[ -n "$pair" ]] || log_fatal "Invalid empty entry in --weights '${weights_csv}'."
+        [[ "$pair" == *:* ]] || log_fatal "Invalid entry '${pair}' in --weights (expected <lv>:<weight>)."
+        local k="${pair%%:*}"
+        local v="${pair#*:}"
+        [[ -n "$k" ]] || log_fatal "Missing LV name in --weights entry '${pair}'."
+        if [[ ! "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            log_fatal "Invalid numeric weight '${v}' for LV '${k}' in --weights."
+        fi
+        if ! awk -v w="$v" 'BEGIN { exit !(w + 0 > 0) }'; then
+            log_fatal "Weight for LV '${k}' in --weights must be greater than 0 (got '${v}')."
+        fi
+        _WEIGHT_LV="$k"
+        _WEIGHT_VAL="$v"
+    }
+
+    # Validate all comma-separated entries in --weights before computing allocations
+    validate_weights_csv() {
+        [[ -n "$weights_csv" ]] || return 0
+        local pair _WEIGHT_LV="" _WEIGHT_VAL=""
+        local -a _pairs=()
+        IFS=',' read -r -a _pairs <<< "$weights_csv"
+        for pair in "${_pairs[@]+"${_pairs[@]}"}"; do
+            _parse_weight_pair "$pair"
+        done
+    }
+
     # Resolve priority weight for an LV during autotune
     lv_weight_for() {
         local lv_n="$1"
         if [[ -n "$weights_csv" ]]; then
-            local pair k v
+            local pair _WEIGHT_LV="" _WEIGHT_VAL=""
             local -a _pairs=()
             IFS=',' read -r -a _pairs <<< "$weights_csv"
             for pair in "${_pairs[@]+"${_pairs[@]}"}"; do
-                k="${pair%%:*}"
-                v="${pair#*:}"
-                if [[ "$k" == "$lv_n" ]]; then
-                    if [[ ! "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-                        log_fatal "Invalid numeric weight '${v}' for LV '${k}' in --weights."
-                    fi
-                    echo "$v"
+                _parse_weight_pair "$pair"
+                if [[ "$_WEIGHT_LV" == "$lv_n" ]]; then
+                    echo "$_WEIGHT_VAL"
                     return 0
                 fi
             done
@@ -498,6 +523,72 @@ main() {
         if [[ "$LV_FSTYPE" != "btrfs" ]]; then
             log_fatal "Online live shrink requires Btrfs ('${LV_MNT}' is formatted as '${LV_FSTYPE}'). XFS/ext4 cannot shrink online."
         fi
+        command -v btrfs >/dev/null 2>&1 || log_fatal "btrfs-progs ('btrfs') is required for online Btrfs shrink on '${LV_MNT}'."
+
+        local btrfs_show_out=""
+        if ! btrfs_show_out="$(btrfs filesystem show "$LV_MNT" 2>/dev/null)" || [[ -z "$btrfs_show_out" ]]; then
+            log_fatal "Refusing online Btrfs shrink on '${LV_MNT}': unable to inspect Btrfs member devices."
+        fi
+        if grep -qiE 'devices?[[:space:]]+missing' <<< "$btrfs_show_out"; then
+            log_fatal "Refusing online Btrfs shrink on '${LV_MNT}': Btrfs filesystem reports missing/degraded member device(s)."
+        fi
+
+        local total_devs=""
+        total_devs="$(awk '/Total devices[[:space:]]+[0-9]+/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "devices" && $(i + 1) ~ /^[0-9]+$/) { print $(i + 1); exit }
+            }
+        }' <<< "$btrfs_show_out")"
+        if [[ -n "$total_devs" ]] && (( total_devs != 1 )); then
+            log_fatal "Refusing online Btrfs shrink on '${LV_MNT}': filesystem spans ${total_devs} devices (multi-device Btrfs shrink is unsupported)."
+        fi
+
+        local -a btrfs_devids=() btrfs_paths=()
+        local _did="" _dpath=""
+        while IFS=$'\t' read -r _did _dpath; do
+            [[ -n "$_did" && -n "$_dpath" ]] || continue
+            btrfs_devids+=("$_did")
+            btrfs_paths+=("$_dpath")
+        done < <(awk '/^[[:space:]]*devid[[:space:]]+[0-9]+[[:space:]]+.*path[[:space:]]+/ {
+            id = $2
+            sub(/^.*[[:space:]]path[[:space:]]+/, "")
+            gsub(/\r$/, "")
+            sub(/[[:space:]]+$/, "")
+            printf "%s\t%s\n", id, $0
+        }' <<< "$btrfs_show_out")
+
+        if (( ${#btrfs_devids[@]} == 0 )); then
+            log_fatal "Refusing online Btrfs shrink on '${LV_MNT}': no Btrfs member device found in 'btrfs filesystem show'."
+        fi
+        if (( ${#btrfs_devids[@]} > 1 )); then
+            log_fatal "Refusing online Btrfs shrink on '${LV_MNT}': filesystem spans ${#btrfs_devids[@]} devices (${btrfs_paths[*]}); multi-device Btrfs shrink is unsupported."
+        fi
+
+        local btrfs_devid="${btrfs_devids[0]}"
+        local member_path="${btrfs_paths[0]}"
+        if [[ ! "$btrfs_devid" =~ ^[0-9]+$ ]] || (( btrfs_devid < 1 )); then
+            log_fatal "Refusing online Btrfs shrink on '${LV_MNT}': invalid Btrfs devid '${btrfs_devid}'."
+        fi
+
+        local vg_dm="${vg_name//-/--}"
+        local lv_dm="${lv_n//-/--}"
+        local dm_path="/dev/mapper/${vg_dm}-${lv_dm}"
+        local canon_lv canon_dm canon_member
+        canon_lv="$(readlink -f "$LV_PATH" 2>/dev/null || echo "$LV_PATH")"
+        canon_dm="$(readlink -f "$dm_path" 2>/dev/null || echo "$dm_path")"
+        canon_member="$(readlink -f "$member_path" 2>/dev/null || echo "$member_path")"
+
+        local dev_match="false"
+        if [[ -e "$LV_PATH" || -e "$dm_path" ]]; then
+            if [[ -e "$LV_PATH" && "$canon_member" == "$canon_lv" ]] || [[ -e "$dm_path" && "$canon_member" == "$canon_dm" ]]; then
+                dev_match="true"
+            fi
+        elif [[ "$canon_member" == "$canon_lv" || "$canon_member" == "$canon_dm" || "$member_path" == "$LV_PATH" || "$member_path" == "$dm_path" ]]; then
+            dev_match="true"
+        fi
+        if [[ "$dev_match" != "true" ]]; then
+            log_fatal "Refusing online Btrfs shrink on '${LV_MNT}': Btrfs member '${member_path}' (${canon_member}) does not match target LV '${LV_PATH}' (${canon_lv})."
+        fi
 
         # Safety floor: max(used * 1.25 + 2 GiB, 4 GiB) + 64 MiB resize cushion
         local two_gib=$(( 2 * 1073741824 ))
@@ -517,19 +608,19 @@ main() {
         fi
 
         if [[ "$dry_run" == "true" ]]; then
-            log_plan "[DRY-RUN] Shrink ${vg_name}/${lv_n} (@ ${LV_MNT}, btrfs): $(human_bytes "$LV_SIZE_B") -> $(human_bytes "$new_lv_b") (-$(human_bytes "$sub_bytes") / -${sub_ext} extents returned to ${vg_name})"
+            log_plan "[DRY-RUN] Shrink ${vg_name}/${lv_n} (@ ${LV_MNT}, btrfs devid ${btrfs_devid}): $(human_bytes "$LV_SIZE_B") -> $(human_bytes "$new_lv_b") (-$(human_bytes "$sub_bytes") / -${sub_ext} extents returned to ${vg_name})"
             return 0
         fi
 
         local fs_pre_target=$(( new_lv_b - cushion_b ))
-        log_info "Shrinking Btrfs filesystem on ${LV_MNT} & returning $(human_bytes "$sub_bytes") (${sub_ext} extents) to '${vg_name}'..."
-        btrfs filesystem resize "$fs_pre_target" "$LV_MNT" >/dev/null
+        log_info "Shrinking Btrfs filesystem on ${LV_MNT} (devid ${btrfs_devid}) & returning $(human_bytes "$sub_bytes") (${sub_ext} extents) to '${vg_name}'..."
+        btrfs filesystem resize "${btrfs_devid}:${fs_pre_target}" "$LV_MNT" >/dev/null
         if ! lvreduce -f -y -l "$new_lv_ext" "$LV_PATH" >/dev/null; then
-            log_warn "lvreduce failed on ${LV_PATH}; rolling Btrfs filesystem on ${LV_MNT} back to max LV size..."
-            btrfs filesystem resize max "$LV_MNT" >/dev/null 2>&1 || true
+            log_warn "lvreduce failed on ${LV_PATH}; rolling Btrfs filesystem on ${LV_MNT} (devid ${btrfs_devid}) back to max LV size..."
+            btrfs filesystem resize "${btrfs_devid}:max" "$LV_MNT" >/dev/null 2>&1 || true
             log_fatal "Online LV shrink aborted safely; filesystem restored to full LV extent."
         fi
-        btrfs filesystem resize max "$LV_MNT" >/dev/null
+        btrfs filesystem resize "${btrfs_devid}:max" "$LV_MNT" >/dev/null
         log_ok "Shrank ${LV_MNT} online -> $(human_bytes "$new_lv_b") (+$(human_bytes "$sub_bytes") returned to '${vg_name}' elastic pool)"
     }
 
@@ -562,6 +653,7 @@ main() {
         if (( target_util < 20 || target_util >= high_water || high_water > 95 )); then
             log_fatal "Require 20 <= --target-util (${target_util}) < --high-water (${high_water}) <= 95."
         fi
+        validate_weights_csv
 
         read_vg_metrics
         log_info "Evaluating live storage telemetry on '${vg_name}' (high-water=${high_water}%, target=${target_util}%, min-reserve=${min_reserve_pct}%)..."
@@ -634,6 +726,12 @@ main() {
                     split(arr[i], kv, ":");
                     s[i] = (kv[1] + 0) * (kv[2] + 0);
                     sum += s[i];
+                }
+                if (sum <= 0) {
+                    for (i = 1; i <= n; i++) {
+                        printf "0%s", (i == n ? "\n" : " ");
+                    }
+                    exit 0;
                 }
                 rem = alloc;
                 for (i = 1; i <= n; i++) {
@@ -723,6 +821,12 @@ main() {
                     s[i] = want[i] * (kv[2] + 0);
                     sum += s[i];
                     if (want[i] > 0) last_hungry = i;
+                }
+                if (sum <= 0) {
+                    for (i = 1; i <= n; i++) {
+                        printf "0%s", (i == n ? "\n" : " ");
+                    }
+                    exit 0;
                 }
                 rem = alloc;
                 for (i = 1; i <= n; i++) {

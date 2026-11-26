@@ -5,7 +5,7 @@
 #
 # Security, Supply-Chain & Performance Hardening:
 #   • SHA-256 verifies precompiled binary bundles prior to extraction
-#     (requiring explicit --bundle-sha256 or --allow-remote-sha256 for unpinned sidecars)
+#     (failing fast unless pinned in catalog or --bundle-sha256 / --allow-remote-sha256 / --force-build)
 #   • Verifies PGDG signing key fingerprint (B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8)
 #     and compiles source packages under unprivileged `_apt` account
 #   • Consolidates silicon compiler profiles via `lib/kit.sh` (including QEMU riscv64-generic)
@@ -42,7 +42,7 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
         rvdk_log_init() { :; }
         rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
         rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
-        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; export REAL_USER REAL_GRP; }
         rvdk_load_config_env() { :; }
         rvdk_normalize_mount_path() {
             local p="${1:-}"
@@ -258,6 +258,7 @@ run_as_user() {
 
 _PG_TMP_ARCHIVE=""
 _PG_TMP_KEY=""
+_PG_TMP_STAGE=""
 _PG_MIGRATING_DIR=""
 _PG_BUILD_ACTIVE="false"
 PG_LIB_ROOT="/var/lib/rvdk/pgdg-riscv64"
@@ -268,6 +269,7 @@ _rvdk_pg_cleanup() {
     fi
     [[ -n "$_PG_TMP_ARCHIVE" ]] && rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256" 2>/dev/null || true
     [[ -n "$_PG_TMP_KEY" ]] && rm -f "$_PG_TMP_KEY" 2>/dev/null || true
+    [[ -n "$_PG_TMP_STAGE" && -d "$_PG_TMP_STAGE" ]] && rm -rf "$_PG_TMP_STAGE" 2>/dev/null || true
     [[ -n "$_PG_MIGRATING_DIR" && -d "$_PG_MIGRATING_DIR" ]] && rm -rf "$_PG_MIGRATING_DIR" 2>/dev/null || true
     if [[ "$_PG_BUILD_ACTIVE" == "true" && "$KEEP_BUILD_DIR" != "true" && -d "$BUILD_DIR" ]]; then
         rm -rf "$BUILD_DIR" 2>/dev/null || true
@@ -333,6 +335,20 @@ LOCAL_REPO_DIR="${PG_LIB_ROOT}/debs"
 LOCAL_LIST="/etc/apt/sources.list.d/rvdk-local-pgdg.list"
 WANT_LOCAL_LIST="deb [trusted=yes check-date=no lang=none] file://${LOCAL_REPO_DIR} ./"
 
+# Official rvdk-v1 release bundle SHA-256 registry, keyed by TARGET_SLUG and BUNDLE_NAME.
+# Returns empty when a target/bundle has no published pinned digest recorded yet.
+_pg_pinned_bundle_sha256() {
+    local target_slug="${1:-${TARGET_SLUG:-}}"
+    local bundle_name="${2:-${BUNDLE_NAME:-postgresql18-6-io_uring-${target_slug}.tar.zst}}"
+    case "${target_slug}:${bundle_name}" in
+        # Add only verified rvdk-v1 release digests here as:
+        # <target_slug>:<bundle_name>) printf '%s\n' '<64-char lowercase hex>' ;;
+        *)
+            printf ''
+            ;;
+    esac
+}
+
 _pg_purge_local_repo_cache() {
     local repo_dir="${1:-$LOCAL_REPO_DIR}"
     repo_dir="${repo_dir%/}"
@@ -363,8 +379,11 @@ _pg_verify_local_repo_debs() {
     if [[ -n "$(find "$repo_dir" -mindepth 1 -type d -print -quit 2>/dev/null)" ]]; then
         log_fatal "Refusing unexpected subdirectory inside local repository ${repo_dir}."
     fi
+    if [[ -n "$(find "$repo_dir" -mindepth 1 ! -type f -print -quit 2>/dev/null)" ]]; then
+        log_fatal "Refusing non-regular entry inside local repository ${repo_dir}."
+    fi
     local deb_name_re='^[A-Za-z0-9][A-Za-z0-9._+%:~-]*\.deb$'
-    local deb base
+    local deb base deb_count=0
     while IFS= read -r -d '' deb; do
         if [[ -L "$deb" || ! -f "$deb" ]]; then
             log_fatal "Refusing symlink or non-regular package artifact in ${repo_dir}: ${deb}"
@@ -376,7 +395,9 @@ _pg_verify_local_repo_debs() {
         if [[ ! "$base" =~ $deb_name_re || "$base" == *".."* ]]; then
             log_fatal "Refusing hidden or unsafe package filename in ${repo_dir}: ${deb}"
         fi
+        deb_count=$(( deb_count + 1 ))
     done < <(find "$repo_dir" -mindepth 1 -name '*.deb' -print0)
+    (( deb_count > 0 )) || log_fatal "No .deb packages found in local repository ${repo_dir}."
 }
 
 _pg_write_debs_manifest() {
@@ -613,19 +634,24 @@ else
 
         if [[ "$HAVE_VERIFIED_LOCAL_DEBS" == "false" ]]; then
             EXPECTED_BUNDLE_SHA="$(printf '%s' "$BUNDLE_SHA256" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
+            if [[ -z "$EXPECTED_BUNDLE_SHA" && -z "${PG_PREBUILT_DEB_URL:-}" && "${RVDK_RELEASE_BASE%/}" == */rvdk-v1 ]]; then
+                EXPECTED_BUNDLE_SHA="$(_pg_pinned_bundle_sha256 "$TARGET_SLUG" "$BUNDLE_NAME" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
+            fi
             if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" != "true" && "$SKIP_BUNDLE_SHA" != "true" ]]; then
                 if [[ -n "${PG_PREBUILT_DEB_URL:-}" ]]; then
-                    log_fatal "Refusing to trust unpinned PG_PREBUILT_DEB_URL (${BUNDLE_URL}) without --bundle-sha256 <hex64> or explicit --allow-remote-sha256."
+                    log_fatal "Refusing to trust unpinned PG_PREBUILT_DEB_URL (${BUNDLE_URL}) without --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
                 fi
-                log_warn "No pinned SHA-256 provided for ${BUNDLE_NAME} (pass --bundle-sha256 or --allow-remote-sha256 to use remote .sha256 sidecar); falling back to verified PGDG source build..."
-                FORCE_BUILD="true"
+                log_fatal "No pinned SHA-256 digest is recorded for ${BUNDLE_NAME} (${TARGET_SLUG}). Pass --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
             else
+                if [[ -n "$EXPECTED_BUNDLE_SHA" ]] && [[ ! "$EXPECTED_BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+                    log_fatal "Invalid SHA-256 format '${EXPECTED_BUNDLE_SHA}' for ${BUNDLE_URL}."
+                fi
                 if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" && "$BUNDLE_URL" != https://* ]]; then
                     log_fatal "Refusing to fetch remote .sha256 sidecar over insecure non-HTTPS URL (${BUNDLE_URL}); use https:// or pass an explicit --bundle-sha256 <hex64> pin."
                 fi
                 rvdk_prog 35 "PG 18.6: pulling ${TARGET_SLUG} io_uring binary bundle..."
                 log_info "Pulling precompiled ${TARGET_SLUG} bundle from ${BUNDLE_URL}..."
-                _PG_TMP_ARCHIVE="$(mktemp /tmp/rvdk-pg18-bundle.XXXXXX.tar.zst)"
+                _PG_TMP_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/rvdk-pg18-bundle.XXXXXX")"
                 if _pg_curl "$BUNDLE_URL" -fL --retry 3 -o "$_PG_TMP_ARCHIVE"; then
                     if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" ]]; then
                         if _pg_curl "${BUNDLE_URL}.sha256" -fsSL --retry 3 -o "${_PG_TMP_ARCHIVE}.sha256"; then
@@ -635,6 +661,11 @@ else
                             _PG_TMP_ARCHIVE=""
                             log_fatal "Fail-closed security check: missing SHA-256 manifest at ${BUNDLE_URL}.sha256. Supply --bundle-sha256 <hex> or --force-build."
                         fi
+                    fi
+                    if [[ -z "$EXPECTED_BUNDLE_SHA" && "$SKIP_BUNDLE_SHA" != "true" ]]; then
+                        rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256"
+                        _PG_TMP_ARCHIVE=""
+                        log_fatal "Fail-closed security check: empty SHA-256 manifest at ${BUNDLE_URL}.sha256. Supply --bundle-sha256 <hex> or --force-build."
                     fi
                     if [[ -n "$EXPECTED_BUNDLE_SHA" ]]; then
                         [[ "$EXPECTED_BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]] || log_fatal "Invalid SHA-256 format '${EXPECTED_BUNDLE_SHA}' for ${BUNDLE_URL}."
@@ -646,17 +677,28 @@ else
                         fi
                         log_ok "Verified bundle SHA-256: ${ACTUAL_BUNDLE_SHA:0:16}..."
                     fi
-                    _pg_purge_local_repo_cache "$LOCAL_REPO_DIR"
-                    tar --no-same-owner --no-same-permissions -I zstd -xf "$_PG_TMP_ARCHIVE" -C "$LOCAL_REPO_DIR"
+                    _PG_TMP_STAGE="$(mktemp -d)"
+                    chmod 0755 "$_PG_TMP_STAGE"
+                    tar --no-same-owner --no-same-permissions -I zstd -xf "$_PG_TMP_ARCHIVE" -C "$_PG_TMP_STAGE"
                     rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256"
                     _PG_TMP_ARCHIVE=""
-                    _pg_verify_local_repo_debs "$LOCAL_REPO_DIR"
-                    rm -f "${LOCAL_REPO_DIR}"/*-dbgsym_*.deb
+                    _pg_verify_local_repo_debs "$_PG_TMP_STAGE"
+                    rm -f "${_PG_TMP_STAGE}"/*-dbgsym_*.deb
+                    if ! compgen -G "${_PG_TMP_STAGE}/*.deb" >/dev/null 2>&1; then
+                        log_fatal "No installable .deb packages found in prebuilt bundle ${BUNDLE_URL}."
+                    fi
+                    _pg_purge_local_repo_cache "$LOCAL_REPO_DIR"
+                    _pg_stage_built_debs "$_PG_TMP_STAGE" "$LOCAL_REPO_DIR"
+                    rm -rf "$_PG_TMP_STAGE"
+                    _PG_TMP_STAGE=""
                     _pg_write_debs_manifest "$LOCAL_REPO_DIR"
                     log_ok "Extracted verified PostgreSQL 18.6 bundle to ${LOCAL_REPO_DIR}"
                 else
-                    rm -f "$_PG_TMP_ARCHIVE"
+                    rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256"
                     _PG_TMP_ARCHIVE=""
+                    if [[ -n "$EXPECTED_BUNDLE_SHA" || -n "${PG_PREBUILT_DEB_URL:-}" ]]; then
+                        log_fatal "Failed to download prebuilt bundle from ${BUNDLE_URL} (pass --force-build to compile from source)."
+                    fi
                     log_warn "No prebuilt bundle published at ${BUNDLE_URL}; falling back to verified PGDG source compile (--force-build)..."
                     FORCE_BUILD="true"
                 fi

@@ -18,7 +18,7 @@ The `riscv-data-kit` (**RVDK**) transforms out-of-the-box `riscv64` single-board
 * Board-specific hardware `quirk` toggles (`hdmi`, `fusb`, `c6-sdio`)
 * Metadata-driven host recovery & SD provisioning media flashers (`SHA-256` verified)
 * Native `4Kn` NVMe + Elastic LVM + Btrfs RAID 10 storage modules (`riscv64` + MMU)
-* Precompiled [build catalog](https://github.com/drewv-labs/riscv-data-kit/releases) across **[SiFive](https://www.sifive.com/)**, **[Tenstorrent](https://tenstorrent.com/)**, **[StarFive](https://www.starfivetech.com/en/)**, **[Milk-V](https://milkv.io/)**, **[SpacemiT](https://www.spacemit.com/en/)**, **[UltraRISC](https://www.ultrarisc.com/)**, **[Banana Pi](https://www.banana-pi.org/)**, **[Firefly](https://www.t-firefly.com/pages/riscv)**, **[Orange Pi](http://www.orangepi.org/)**, and **[Waveshare](https://www.waveshare.com/)** / **[Espressif](https://www.espressif.com/)** platforms.
+* Precompiled [build catalog](https://github.com/drewv-labs/riscv-data-kit/releases) across **[SiFive](https://www.sifive.com/)**, **[Tenstorrent](https://tenstorrent.com/)**, **[StarFive](https://www.starfivetech.com/en/)**, **[Milk-V](https://milkv.io/)**, **[SpacemiT](https://www.spacemit.com/en/)**, **[UltraRISC](https://www.ultrarisc.com/)**, **[Banana Pi](https://www.banana-pi.org/)**, **[Firefly](https://www.t-firefly.com/pages/riscv)**, **[Orange Pi](https://www.orangepi.org/)**, and **[Waveshare](https://www.waveshare.com/)** / **[Espressif](https://www.espressif.com/)** platforms.
 
 ---
 
@@ -52,11 +52,11 @@ Organizes silicon hooks by SoC die (`bsp/<vendor>/<soc>/`) and board specifics (
 
 ### **Layer 3 — Composable Data, Storage & Network Modules (`postgresql/`, `mods/`):** 
 Self-contained, opt-in modules (`riscv64` + MMU required for PG18, NVMe/RAID, NFSv4, Tailscale, and `ntfy` — fail fast deterministically on `riscv32` / nommu) for: 
-* `io_uring` PostgreSQL 18.6 (SHA-256 verified prebuilt `.tar.zst` bundle by default, or `--force-build` cold compilation)
+* `io_uring` PostgreSQL 18.6 (fail-closed SHA-256 verified prebuilt `.tar.zst` bundle via pinned catalog / `--bundle-sha256` / `--allow-remote-sha256`, or explicit `--force-build` cold compilation)
 * Native `4Kn` NVMe + Single/Dual-LVM (`vg_rvdk`) with OS/swap disk wipe guards
 * Kernel Btrfs RAID 10
 * Eclipse Mosquitto MQTT (loopback-safe by default; authenticated LAN bind)
-* `ntfy` HTTP & Unix socket pub/sub notification broker (SHA-256 verified prebuilt `.tar.zst` bundle by default, or `--force-build` cold compilation)
+* `ntfy` HTTP & Unix socket pub/sub notification broker (fail-closed SHA-256 verified prebuilt `.tar.zst` bundle via pinned catalog / `--bundle-sha256` / `--allow-remote-sha256`, or explicit `--force-build` cold compilation)
 * NFSv4 (explicit `--allow-cidr` / `--auto-subnet`, `root_squash` default, auto kernel `nfsd` -> userspace `nfs-ganesha`)
 * `riscv64` Tailscale mesh VPN
 <br>
@@ -134,8 +134,8 @@ sudo rvdk mods/nvme-4kn --device /dev/nvme0n1 --mount /mnt/nvme_data
 sudo rvdk storage status
 sudo rvdk storage grow --lv lv_data --gb 50
 
-# Install silicon-tuned PostgreSQL 18.6 with io_uring & Sv39 HugePages (prebuilt .tar.zst default)
-sudo rvdk postgresql --data-mount /mnt/nvme_data
+# Install silicon-tuned PostgreSQL 18.6 with io_uring & Sv39 HugePages (use --bundle-sha256 <hex64> or --allow-remote-sha256 for unpinned bundles)
+sudo rvdk postgresql --data-mount /mnt/nvme_data --allow-remote-sha256
 
 # Or force a reproducible cold source compile on-device
 sudo rvdk postgresql --force-build
@@ -143,7 +143,7 @@ sudo rvdk postgresql --force-build
 # Optional storage & network modules
 sudo rvdk mods/btrfs-raid --json '[...]'
 sudo rvdk mods/mosquitto --port 1883
-sudo rvdk mods/ntfy --port 2586
+sudo rvdk mods/ntfy --port 2586 --allow-remote-sha256   # Or --bundle-sha256 <hex64> / --force-build
 sudo rvdk mods/nfs-vault --allow-cidr 192.168.1.0/24
 sudo rvdk mods/tailscale --up --ssh
 ```

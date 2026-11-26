@@ -63,7 +63,7 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
         rvdk_validate_username() { [[ "${1:-}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; }
         rvdk_validate_hostname() { [[ ${#1} -ge 1 && ${#1} -le 253 && "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; }
         rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
-        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_HOME="/root"; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_HOME="/root"; export REAL_USER REAL_HOME; }
         rvdk_atomic_write() {
             local _dst="$1" _mode="${2:-0644}" _own="${3:-}" _tmp
             mkdir -p "$(dirname "$_dst")"
@@ -99,6 +99,88 @@ if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
 fi
 
 rvdk_log_init "RVDK:OS"
+
+if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
+    rvdk_sudo_preserve() {
+        [[ $# -gt 0 ]] || return 1
+        local -a _allowlist=(
+            RVDK_APT_DISTRO_DEFAULT
+            RVDK_ARCH
+            RVDK_BACKUP_ROOT
+            RVDK_BOARD
+            RVDK_BOARD_TAG
+            RVDK_DEEPTUNE_ENV
+            RVDK_DT_MODEL
+            RVDK_ENV_FILE
+            RVDK_HOSTNAME
+            RVDK_KEEP_VENDOR_MIRRORS
+            RVDK_KIT_CACHE_FILE
+            RVDK_LOCALE
+            RVDK_MAX_VALID_EPOCH
+            RVDK_MIN_VALID_EPOCH
+            RVDK_MIRROR_URL
+            RVDK_MMU
+            RVDK_NO_APT_UPDATE
+            RVDK_NO_PROGBAR
+            RVDK_OS_ID
+            RVDK_OS_VERSION_ID
+            RVDK_PARENT_BADGE_SGR
+            RVDK_PARENT_BAR_SGR
+            RVDK_PARENT_LABEL
+            RVDK_PARENT_PROGBAR
+            RVDK_PARENT_STATE
+            RVDK_PRIMARY_NIC
+            RVDK_PROGBAR_SESSION
+            RVDK_PROG_BASE
+            RVDK_PROG_SPAN
+            RVDK_SKIP_NET_GUARD
+            RVDK_SOC
+            RVDK_SOC_SLUG
+            RVDK_STATE_DIR
+            RVDK_SUB_STATE
+            RVDK_SYSTEMD_UNIT_DIR
+            RVDK_TIMEZONE
+            RVDK_TUNE
+            RVDK_TUNE_MODE
+        )
+        local preserve_csv=""
+        local var_name
+        for var_name in "${_allowlist[@]}"; do
+            if [[ -n "${!var_name+x}" ]]; then
+                preserve_csv+="${preserve_csv:+,}${var_name}"
+            fi
+        done
+
+        local rc=0
+        if [[ -z "$preserve_csv" ]]; then
+            sudo "$@" || rc=$?
+            return "$rc"
+        fi
+
+        local probe_err="" probe_rc=0
+        probe_err="$(sudo --preserve-env="$preserve_csv" -n true 2>&1)" || probe_rc=$?
+        if [[ "$probe_rc" -eq 0 ]]; then
+            sudo --preserve-env="$preserve_csv" "$@" || rc=$?
+            return "$rc"
+        fi
+
+        if [[ "$probe_err" =~ (not[[:space:]]+allowed|SETENV|preserve-env|unrecognized[[:space:]]+option|unknown[[:space:]]+option|illegal[[:space:]]+option|invalid[[:space:]]+option|unexpected[[:space:]]+argument) ]] \
+            || sudo -n true >/dev/null 2>&1; then
+            sudo "$@" || rc=$?
+            return "$rc"
+        fi
+
+        if sudo -v; then
+            if sudo --preserve-env="$preserve_csv" -n true >/dev/null 2>&1; then
+                sudo --preserve-env="$preserve_csv" "$@" || rc=$?
+                return "$rc"
+            fi
+            sudo "$@" || rc=$?
+            return "$rc"
+        fi
+        return 1
+    }
+fi
 
 usage() {
     cat <<EOF
@@ -203,7 +285,9 @@ fi
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
         log_info "Escalating privileges via sudo..."
-        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+        _rvdk_sudo_rc=0
+        rvdk_sudo_preserve bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} || _rvdk_sudo_rc=$?
+        exit "$_rvdk_sudo_rc"
     else
         log_fatal "This script must be run as root."
     fi
@@ -590,11 +674,19 @@ run_headless_debloat() {
 
     if command -v systemctl >/dev/null 2>&1; then
         if [[ "$(systemctl get-default 2>/dev/null || true)" != "multi-user.target" ]]; then
-            systemctl set-default multi-user.target
-            systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-            systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-            systemctl stop gdm3 lightdm sddm 2>/dev/null || true
-            log_ok "Boot target locked to headless multi-user.target"
+            if [[ -d /run/systemd/system ]]; then
+                systemctl set-default multi-user.target
+                systemctl disable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+                systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+                systemctl stop gdm3 lightdm sddm 2>/dev/null || true
+                log_ok "Boot target locked to headless multi-user.target"
+            elif systemctl set-default multi-user.target >/dev/null 2>&1; then
+                systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+                systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+                log_ok "Boot target locked to headless multi-user.target (offline)"
+            else
+                log_skip "Non-systemd rootfs; skipped systemctl set-default multi-user.target"
+            fi
         else
             log_skip "Boot target is already multi-user.target"
         fi
@@ -940,15 +1032,19 @@ run_headless_debloat
 
 # ==============================================================================
 # 4. RVDK IPv4 IP-OPTIONS PREROUTING DROP GUARD (`ip hdrlength > 20B`) & MPTCP LOCKDOWN
-#    Ordered After=nftables.service + nftables ExecStartPost hook so `flush ruleset`
-#    in /etc/nftables.conf cannot wipe `table ip rvdk_net_guard`.
+#    Ordered After=nftables.service + nftables ExecStartPost/ExecReload hooks so
+#    `flush ruleset` in /etc/nftables.conf cannot wipe `table ip rvdk_net_guard`.
 # ==============================================================================
 rvdk_prog 85 "Converging rvdk-net-guard IPv4 IP-options & MPTCP guard..."
 
 # Retire legacy synthetic cve-2026-98432* units/files/tables on upgrade
 LEGACY_GUARD_REMOVED="false"
 if [[ -f /etc/systemd/system/cve-2026-98432-guard.service ]]; then
-    systemctl disable --now cve-2026-98432-guard.service >/dev/null 2>&1 || true
+    if [[ -d /run/systemd/system ]]; then
+        systemctl disable --now cve-2026-98432-guard.service >/dev/null 2>&1 || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl disable cve-2026-98432-guard.service >/dev/null 2>&1 || true
+    fi
     rm -f /etc/systemd/system/cve-2026-98432-guard.service
     LEGACY_GUARD_REMOVED="true"
 fi
@@ -962,11 +1058,11 @@ for _legacy_gf in \
         LEGACY_GUARD_REMOVED="true"
     fi
 done
-if command -v nft >/dev/null 2>&1 && nft list table ip cve_2026_98432 >/dev/null 2>&1; then
+if [[ -d /run/systemd/system ]] && command -v nft >/dev/null 2>&1 && nft list table ip cve_2026_98432 >/dev/null 2>&1; then
     nft delete table ip cve_2026_98432 2>/dev/null || true
     LEGACY_GUARD_REMOVED="true"
 fi
-if [[ "$LEGACY_GUARD_REMOVED" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+if [[ "$LEGACY_GUARD_REMOVED" == "true" && -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload 2>/dev/null || true
 fi
 
@@ -1005,7 +1101,10 @@ RemainAfterExit=yes
 WantedBy=multi-user.target"
 
     WANT_NFT_DROPIN="[Service]
-ExecStartPost=-/usr/sbin/nft -f ${NFT_GUARD_FILE}"
+ExecStartPost=-/usr/sbin/nft -f ${NFT_GUARD_FILE}
+ExecReload=
+ExecReload=/usr/sbin/nft -f /etc/nftables.conf
+ExecReload=-/usr/sbin/nft -f ${NFT_GUARD_FILE}"
 
     GUARD_CHANGED="false"
     if ! printf '%s\n' "$WANT_SYSCTL_GUARD" | cmp -s - "$SYSCTL_GUARD_FILE" 2>/dev/null; then
@@ -1035,15 +1134,33 @@ ExecStartPost=-/usr/sbin/nft -f ${NFT_GUARD_FILE}"
         GUARD_CHANGED="true"
     fi
 
-    if [[ "$GUARD_CHANGED" == "true" ]] \
-       || ! systemctl is-active --quiet rvdk-net-guard.service 2>/dev/null \
-       || ! nft list table ip rvdk_net_guard >/dev/null 2>&1; then
-        nft -f "$NFT_GUARD_FILE"
-        systemctl daemon-reload
-        systemctl enable --now rvdk-net-guard.service >/dev/null
-        log_ok "Configured persistent rvdk-net-guard IPv4 IP-Options Prerouting Drop Guard (ip hdrlength > 20B) & MPTCP Lockdown"
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        if [[ "$GUARD_CHANGED" == "true" ]] \
+           || ! systemctl is-active --quiet rvdk-net-guard.service 2>/dev/null \
+           || ! systemctl is-enabled --quiet rvdk-net-guard.service 2>/dev/null \
+           || ! nft list table ip rvdk_net_guard >/dev/null 2>&1; then
+            nft -f "$NFT_GUARD_FILE"
+            systemctl daemon-reload
+            systemctl enable --now rvdk-net-guard.service >/dev/null
+            log_ok "Configured persistent rvdk-net-guard IPv4 IP-Options Prerouting Drop Guard (ip hdrlength > 20B) & MPTCP Lockdown"
+        else
+            log_skip "rvdk-net-guard IPv4 IP-Options Prerouting Drop Guard & MPTCP Lockdown already converged"
+        fi
     else
-        log_skip "rvdk-net-guard IPv4 IP-Options Prerouting Drop Guard & MPTCP Lockdown already converged"
+        if command -v systemctl >/dev/null 2>&1; then
+            if ! systemctl is-enabled --quiet rvdk-net-guard.service 2>/dev/null; then
+                if systemctl enable rvdk-net-guard.service >/dev/null 2>&1; then
+                    GUARD_CHANGED="true"
+                else
+                    log_warn "Non-systemd/chroot rootfs; could not offline-enable rvdk-net-guard.service"
+                fi
+            fi
+        fi
+        if [[ "$GUARD_CHANGED" == "true" ]]; then
+            log_ok "Configured offline rvdk-net-guard IPv4 IP-Options Prerouting Drop Guard (ip hdrlength > 20B) & MPTCP Lockdown"
+        else
+            log_skip "rvdk-net-guard IPv4 IP-Options Prerouting Drop Guard & MPTCP Lockdown already converged (offline)"
+        fi
     fi
 fi
 

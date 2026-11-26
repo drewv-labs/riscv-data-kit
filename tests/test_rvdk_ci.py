@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 
@@ -48,8 +49,8 @@ def _find_bash() -> str:
 def _make_manifest_repo(
     tmp_path: Path,
     *,
-    media: dict[str, object] | None = None,
-    manifest_overrides: dict[str, object] | None = None,
+    media: Mapping[str, object] | None = None,
+    manifest_overrides: Mapping[str, object] | None = None,
     omit_keys: tuple[str, ...] = (),
 ) -> Path:
     (tmp_path / "bsp" / "demo" / "soc1").mkdir(parents=True)
@@ -653,4 +654,143 @@ class TestWave1SecurityAndIdempotencyInvariants:
         assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
         assert "no_apt_update=0" in proc.stdout
         assert not stamp_file.exists()
+
+
+class TestSudoDashEBan:
+    def test_repo_has_no_sudo_dash_e(self) -> None:
+        assert rvdk_ci.check_sudo_dash_e(REPO_ROOT, REPO_ROOT) == []
+
+    def test_catches_executable_sudo_dash_e_and_allows_comments_or_other_flags(
+        self, tmp_path: Path
+    ) -> None:
+        bad_lines = [
+            "sudo " + "-E bash \"$0\"",
+            "sudo -n " + "-E id",
+            "sudo " + "-nE id",
+            "sudo -u root " + "-E env",
+            "sudo --preserve-env=FOO " + "-E id",
+        ]
+        for idx, cmd in enumerate(bad_lines):
+            sh = tmp_path / f"bad_{idx}.sh"
+            sh.write_text(f"#!/usr/bin/env bash\n{cmd}\n", encoding="utf-8")
+            errs = rvdk_ci.check_sudo_dash_e(tmp_path, tmp_path)
+            assert len(errs) == 1, f"Expected violation for {cmd!r}, got {errs}"
+            assert f"bad_{idx}.sh:2:" in errs[0]
+            sh.unlink()
+
+        clean = tmp_path / "clean.sh"
+        clean.write_text(
+            "#!/usr/bin/env bash\n"
+            + "# Never run sudo "
+            + "-E in RVDK\n"
+            + "sudo sed -E 's/a/b/' /tmp/file\n"
+            + "sudo -u root grep -E 'foo' /tmp/file\n"
+            + "sudo -- grep -E 'foo' /tmp/file\n"
+            + 'sudo --preserve-env=RVDK_TUNE bash "$0"\n'
+            + 'rvdk_sudo_preserve bash "$0"\n',
+            encoding="utf-8",
+        )
+        assert rvdk_ci.check_sudo_dash_e(tmp_path, tmp_path) == []
+
+    def test_bundle_dist_rejects_sudo_dash_e_after_inlining(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        (repo / "lib").mkdir(parents=True)
+        (repo / "lib" / "badlib.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "_RVDK_BADLIB_SH_LOADED=1\n"
+            "run_bad() {\n"
+            "    sudo " + '-E bash "$@"\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        (repo / "bootstrap.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "# @RVDK_INLINE_LIBS: badlib\n"
+            "run_bad\n",
+            encoding="utf-8",
+        )
+        out_dir = tmp_path / "out_site"
+        errs = rvdk_ci.bundle_dist(repo, out_dir, skip_shellcheck=True, quiet=True)
+        assert any("bootstrap.sh:" in e and "Forbidden 'sudo -E'" in e for e in errs), errs
+
+
+class TestKitBoardAliasSync:
+    def test_repo_kit_aliases_stay_in_sync_with_all_17_manifests(self) -> None:
+        manifests = sorted((REPO_ROOT / "boards").glob("*/*/media.json"))
+        assert len(manifests) == 17
+        assert rvdk_ci.check_kit_board_aliases(REPO_ROOT) == []
+
+    def test_detects_missing_or_drifted_kit_alias_tag_soc_and_flash_parity(
+        self, tmp_path: Path
+    ) -> None:
+        repo = tmp_path / "repo"
+        (repo / "lib").mkdir(parents=True)
+        shutil.copy2(REPO_ROOT / "lib" / "kit.sh", repo / "lib" / "kit.sh")
+        shutil.copy2(REPO_ROOT / "lib" / "flash.sh", repo / "lib" / "flash.sh")
+
+        # Copy one valid manifest first and confirm clean pass
+        p550_dir = repo / "boards" / "sifive" / "p550"
+        p550_dir.mkdir(parents=True)
+        shutil.copy2(REPO_ROOT / "boards" / "sifive" / "p550" / "media.json", p550_dir / "media.json")
+        assert rvdk_ci.check_kit_board_aliases(repo) == []
+
+        # Drift 1: tag mismatch in manifest vs lib/kit.sh
+        p550_doc = json.loads((p550_dir / "media.json").read_text(encoding="utf-8"))
+        p550_doc["tag"] = "p550_drift"
+        (p550_dir / "media.json").write_text(json.dumps(p550_doc), encoding="utf-8")
+        errs_tag = rvdk_ci.check_kit_board_aliases(repo)
+        assert any("p550_drift" in e for e in errs_tag), errs_tag
+
+        # Restore p550 manifest, then add unmapped board manifest
+        shutil.copy2(REPO_ROOT / "boards" / "sifive" / "p550" / "media.json", p550_dir / "media.json")
+        drift_dir = repo / "boards" / "acme" / "driftboard"
+        drift_dir.mkdir(parents=True)
+        (drift_dir / "media.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "board": "acme/driftboard",
+                    "tag": "driftb",
+                    "name": "Acme Drift",
+                    "soc": "spacemit/k1",
+                    "default_os": "debian-13",
+                    "media": {},
+                    "quirks": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        errs_missing = rvdk_ci.check_kit_board_aliases(repo)
+        assert any("acme/driftboard" in e and "rvdk_normalize_board_id" in e for e in errs_missing), errs_missing
+        assert any("acme/driftboard" in e and "soc" in e for e in errs_missing), errs_missing
+
+        # Remove unmapped board, drift lib/flash.sh alias dict
+        shutil.rmtree(repo / "boards" / "acme")
+        flash_text = (repo / "lib" / "flash.sh").read_text(encoding="utf-8")
+        (repo / "lib" / "flash.sh").write_text(
+            flash_text.replace('"p550": "sifive/p550",', '"p550": "acme/wrong",', 1),
+            encoding="utf-8",
+        )
+        errs_flash = rvdk_ci.check_kit_board_aliases(repo)
+        assert any("lib/flash.sh" in e for e in errs_flash), errs_flash
+
+
+class TestConsolidatedCommonHelpersBundling:
+    def test_flash_sh_bundle_inlines_common_rewriters_without_duplicates(self) -> None:
+        raw = (REPO_ROOT / "lib" / "flash.sh").read_text(encoding="utf-8")
+        assert "_rvdk_flash_strip_fstab_commit()" not in raw
+        assert "_rvdk_flash_rewrite_literal()" not in raw
+
+        bsp_raw = (REPO_ROOT / "lib" / "bsp.sh").read_text(encoding="utf-8")
+        assert "_rvdk_bsp_strip_fstab_commit()" not in bsp_raw
+        assert "_rvdk_bsp_rewrite_literal()" not in bsp_raw
+
+        rendered = rvdk_ci.render_standalone_script(raw, REPO_ROOT)
+        assert "# --- BEGIN INLINED lib/common.sh ---" in rendered
+        assert "_rvdk_strip_fstab_commit()" in rendered
+        assert "_rvdk_rewrite_label_token()" in rendered
+        assert "_rvdk_rewrite_literal()" in rendered
+        syn = subprocess.run([_find_bash(), "-n"], input=rendered, capture_output=True, text=True, check=False)
+        assert syn.returncode == 0, syn.stderr
 

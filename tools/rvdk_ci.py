@@ -15,9 +15,13 @@ Modes:
       5. Scans repository files for downstream project bleed, PII/hostnames,
          and security anti-patterns (untrusted `.env` sourcing, `kptr_restrict=0`,
          unsigned HTTP APT repos, hardcoded `10.0.10.0/24`, etc.).
-      6. Stages a dry-run standalone bundle in a temporary directory and validates
-         all rendered `.sh` endpoints (`bash -n`, `shellcheck`, and stub-clobber
-         invariants).
+      6. Prohibits executable `sudo -E` invocations in source and bundled `.sh`
+         scripts (enforcing `rvdk_sudo_preserve` allowlist escalation).
+      7. Validates `lib/kit.sh` board aliases and SoC/tag mappings stay in sync
+         with all `boards/*/*/media.json` manifests (and `lib/flash.sh` fallback).
+      8. Stages a dry-run standalone bundle in a temporary directory and validates
+         all rendered `.sh` endpoints (`bash -n`, `shellcheck`, `sudo -E` ban,
+         and stub-clobber invariants).
 
   python3 tools/rvdk_ci.py --bundle-dist <out_dir>
       1. Stages static GitHub Pages tree (`rvdk.drewv-labs.dev`), dereferencing
@@ -45,6 +49,7 @@ from pathlib import Path
 
 IGNORED_DIRS = {
     ".git",
+    ".venv",
     "_site",
     "dist",
     "__pycache__",
@@ -177,7 +182,7 @@ def check_manifests(repo_root: Path) -> list[str]:
         return errors
 
     required_keys = {"schema_version", "board", "tag", "name", "soc", "default_os", "media", "quirks"}
-    seen_tags = {}
+    seen_tags: dict[str, str] = {}
     sha256_re = re.compile(r"^[0-9a-f]{64}$")
 
     for m_str in manifest_paths:
@@ -188,6 +193,9 @@ def check_manifests(repo_root: Path) -> list[str]:
             data = json.loads(m_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{rel}: invalid JSON ({exc})")
+            continue
+        if not isinstance(data, dict):
+            errors.append(f"{rel}: manifest root must be a JSON object")
             continue
 
         missing = required_keys - set(data.keys())
@@ -353,6 +361,209 @@ def check_shellcheck(root_dir: Path, label_root: Path, external_sources: bool = 
     return []
 
 
+SUDO_DASH_E_RE = re.compile(
+    r"(?<![A-Za-z0-9_/-])sudo\s+"
+    r"(?:(?:--[A-Za-z0-9][A-Za-z0-9-]*(?:=\S+)?|-[A-Za-z]+)(?:\s+[^-\s]\S*)?\s+)*"
+    r"-[A-Za-z]*E\b"
+)
+
+
+def check_sudo_dash_e(root_dir: Path, label_root: Path) -> list[str]:
+    """Reject executable `sudo -E` invocations in shell scripts."""
+    errors: list[str] = []
+    for sh in collect_sh_files(root_dir):
+        if sh.is_symlink():
+            continue
+        try:
+            text = sh.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        rel = sh.relative_to(label_root)
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if line.lstrip().startswith("#"):
+                continue
+            if SUDO_DASH_E_RE.search(line):
+                errors.append(
+                    f"{rel}:{lineno}: Forbidden 'sudo -E' (use rvdk_sudo_preserve allowlist): {line.strip()}"
+                )
+    return errors
+
+
+def check_kit_board_aliases(repo_root: Path) -> list[str]:
+    """Verify lib/kit.sh (and lib/flash.sh) board aliases stay in sync with all boards/*/*/media.json manifests."""
+    errors: list[str] = []
+    kit_path = repo_root / "lib" / "kit.sh"
+    if not kit_path.is_file():
+        return ["lib/kit.sh not found; cannot validate board alias parity"]
+
+    manifest_paths = sorted(glob.glob(str(repo_root / "boards" / "*" / "*" / "media.json")))
+    if not manifest_paths:
+        return ["No board manifests found at boards/*/*/media.json"]
+
+    kit_text = kit_path.read_text(encoding="utf-8")
+
+    norm_fn_match = re.search(
+        r"^rvdk_normalize_board_id\(\)\s*\{(.*?)^\}",
+        kit_text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if norm_fn_match is None:
+        return ["lib/kit.sh: missing rvdk_normalize_board_id() definition"]
+
+    norm_aliases: dict[str, str] = {}
+    for pat_raw, target in re.findall(
+        r"^\s*([^)\n]+)\)\s*\n\s*echo\s+\"([^\"]+)\"\s*;;",
+        norm_fn_match.group(1),
+        flags=re.MULTILINE,
+    ):
+        for raw_alias in pat_raw.split("|"):
+            alias = raw_alias.strip().lower()
+            if alias in ("*/*", "*"):
+                continue
+            if alias in norm_aliases and norm_aliases[alias] != target:
+                errors.append(
+                    f"lib/kit.sh: conflicting rvdk_normalize_board_id alias {alias!r}: "
+                    f"{norm_aliases[alias]!r} vs {target!r}"
+                )
+            else:
+                norm_aliases[alias] = target
+
+    tag_case_match = re.search(
+        r'if \[\[ -n "\$cli_board" \]\]; then.*?case "\$board" in(.*?)^\s*esac',
+        kit_text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    kit_tag_map: dict[str, str] = {}
+    if tag_case_match is None:
+        errors.append("lib/kit.sh: missing cli_board -> tag case block in rvdk_kit_resolve()")
+    else:
+        for line in tag_case_match.group(1).splitlines():
+            m_arm = re.match(r"^\s*([^)\n]+)\)\s*(.*?)\s*;;", line)
+            if not m_arm:
+                continue
+            pat_raw, body = m_arm.group(1), m_arm.group(2)
+            m_lit = re.search(r'tag="([^"$]+)"', body)
+            is_slug_default = 'tag="${board##*/}"' in body
+            for raw_b in pat_raw.split("|"):
+                b_pat = raw_b.strip().lower()
+                if b_pat == "*":
+                    continue
+                if m_lit:
+                    kit_tag_map[b_pat] = m_lit.group(1)
+                elif is_slug_default and "/" in b_pat:
+                    kit_tag_map[b_pat] = b_pat.split("/", 1)[1]
+
+    soc_case_match = re.search(
+        r'elif \[\[ -z "\$soc" && -n "\$board" \]\]; then\s*\n\s*case "\$board" in(.*?)^\s*esac',
+        kit_text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    kit_soc_map: dict[str, str] = {}
+    if soc_case_match is None:
+        errors.append("lib/kit.sh: missing board -> soc case block in rvdk_kit_resolve()")
+    else:
+        for pat_raw, soc_val in re.findall(
+            r'^\s*([^)\n]+)\)\s*soc="([^"]+)"\s*;;',
+            soc_case_match.group(1),
+            flags=re.MULTILINE,
+        ):
+            for raw_b in pat_raw.split("|"):
+                b_pat = raw_b.strip().lower()
+                if b_pat != "*":
+                    kit_soc_map[b_pat] = soc_val
+
+    dt_fn_match = re.search(
+        r"^_rvdk_infer_from_dt_model\(\)\s*\{(.*?)^\}",
+        kit_text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    dt_triples: set[tuple[str, str, str]] = set()
+    if dt_fn_match is None:
+        errors.append("lib/kit.sh: missing _rvdk_infer_from_dt_model() definition")
+    else:
+        for soc_val, board_val, tag_val, _ in re.findall(
+            r'echo\s+"([^|"]*)\|([^|"]*)\|([^|"]*)\|([^"]*)"',
+            dt_fn_match.group(1),
+        ):
+            if board_val:
+                dt_triples.add((board_val.lower(), tag_val.lower(), soc_val.lower()))
+
+    flash_path = repo_root / "lib" / "flash.sh"
+    flash_aliases: dict[str, str] | None = None
+    if flash_path.is_file():
+        flash_text = flash_path.read_text(encoding="utf-8")
+        m_flash = re.search(r"aliases\s*=\s*\{(.*?)\}", flash_text, flags=re.DOTALL)
+        if m_flash is None:
+            errors.append("lib/flash.sh: missing aliases dict in _rvdk_flash_resolve_manifest()")
+        else:
+            flash_aliases = dict(re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', m_flash.group(1)))
+            if flash_aliases != norm_aliases:
+                only_kit = sorted(set(norm_aliases.items()) - set(flash_aliases.items()))
+                only_flash = sorted(set(flash_aliases.items()) - set(norm_aliases.items()))
+                if only_kit:
+                    errors.append(
+                        f"lib/flash.sh: _rvdk_flash_resolve_manifest aliases missing/mismatched entries from lib/kit.sh: {only_kit}"
+                    )
+                if only_flash:
+                    errors.append(
+                        f"lib/flash.sh: _rvdk_flash_resolve_manifest has extra/mismatched aliases absent in lib/kit.sh: {only_flash}"
+                    )
+
+    for m_str in manifest_paths:
+        m_path = Path(m_str)
+        rel = m_path.relative_to(repo_root)
+        try:
+            data = json.loads(m_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(data, dict):
+            continue
+        board = str(data.get("board", "")).strip().lower()
+        tag = str(data.get("tag", "")).strip().lower()
+        soc = str(data.get("soc", "")).strip().lower()
+        if not board or not tag or not soc:
+            continue
+
+        if norm_aliases.get(board) != board:
+            errors.append(
+                f"{rel}: board {board!r} is missing or mismatched in lib/kit.sh rvdk_normalize_board_id() "
+                f"(got {norm_aliases.get(board)!r})"
+            )
+        if norm_aliases.get(tag) != board:
+            errors.append(
+                f"{rel}: tag {tag!r} is missing or mismatched in lib/kit.sh rvdk_normalize_board_id() "
+                f"(expected {board!r}, got {norm_aliases.get(tag)!r})"
+            )
+
+        if tag_case_match is not None and "/" in board:
+            resolved_tag = kit_tag_map.get(board, board.split("/", 1)[1])
+            if resolved_tag != tag:
+                errors.append(
+                    f"{rel}: lib/kit.sh rvdk_kit_resolve() maps {board!r} to tag {resolved_tag!r}, "
+                    f"expected {tag!r}"
+                )
+
+        if soc_case_match is not None and kit_soc_map.get(board) != soc:
+            errors.append(
+                f"{rel}: lib/kit.sh rvdk_kit_resolve() maps {board!r} to soc {kit_soc_map.get(board)!r}, "
+                f"expected {soc!r}"
+            )
+
+        if dt_fn_match is not None and (board, tag, soc) not in dt_triples:
+            errors.append(
+                f"{rel}: ({board}, {tag}, {soc}) missing from lib/kit.sh _rvdk_infer_from_dt_model()"
+            )
+
+        if flash_aliases is not None and (
+            flash_aliases.get(board) != board or flash_aliases.get(tag) != board
+        ):
+            errors.append(
+                f"{rel}: board/tag ({board!r}, {tag!r}) out of sync in lib/flash.sh aliases"
+            )
+
+    return errors
+
+
 def check_forbidden_patterns(repo_root: Path) -> list[str]:
     errors: list[str] = []
     self_path = (repo_root / "tools" / "rvdk_ci.py").resolve()
@@ -477,9 +688,8 @@ def bundle_dist(
     }
 
     if (
-        out_real == repo_real
+        out_real in (repo_real, home_real)
         or repo_real.is_relative_to(out_real)
-        or out_real == home_real
         or len(out_abs.parts) <= 2
         or len(out_real.parts) <= 2
         or out_real in forbidden_roots
@@ -521,6 +731,7 @@ def bundle_dist(
     if not quiet:
         print(f"[RVDK:BUNDLE] Staged static site in {out_real} ({bundled_count} standalone scripts inlined).")
     errors = check_bundled_invariants(out_real)
+    errors.extend(check_sudo_dash_e(out_real, out_real))
     errors.extend(check_bash_syntax(out_real, out_real))
     if not skip_shellcheck:
         errors.extend(check_shellcheck(out_real, out_real, external_sources=False))
@@ -530,11 +741,13 @@ def bundle_dist(
 def run_checks(repo_root: Path, skip_shellcheck: bool = False) -> int:
     all_errors: list[str] = []
     all_errors.extend(check_manifests(repo_root))
+    all_errors.extend(check_kit_board_aliases(repo_root))
     all_errors.extend(check_symlinks(repo_root))
     all_errors.extend(check_bash_syntax(repo_root, repo_root))
     if not skip_shellcheck:
         all_errors.extend(check_shellcheck(repo_root, repo_root, external_sources=True))
     all_errors.extend(check_forbidden_patterns(repo_root))
+    all_errors.extend(check_sudo_dash_e(repo_root, repo_root))
 
     with tempfile.TemporaryDirectory(prefix="rvdk_ci_bundle_") as tmp_dir:
         bundle_errs = bundle_dist(

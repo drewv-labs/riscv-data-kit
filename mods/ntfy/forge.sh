@@ -5,9 +5,9 @@
 #
 # Security, Supply-Chain & Persistence Hardening:
 #   • SHA-256 verifies precompiled RVDK catalog binary bundles (.tar.zst) by default
-#     (requiring explicit --bundle-sha256 or --allow-remote-sha256 for unpinned sidecars)
-#   • Automatically falls back to (or forces via --force-build) an unprivileged source
-#     compile using SHA-256 verified go.dev/dl toolchains + lib/kit.sh compiler profiles
+#     (failing fast unless pinned in catalog or --bundle-sha256 / --allow-remote-sha256 / --force-build)
+#   • Supports explicit --force-build unprivileged source compilation using SHA-256
+#     verified go.dev/dl toolchains + lib/kit.sh compiler profiles
 #   • Binds HTTP listener to `127.0.0.1:2586` + `0660` `/run/ntfy/ntfy.sock` (`Group=ntfy`)
 #   • Non-loopback `--bind` requires `--ntfy-user` + `--ntfy-password`/`--ntfy-password-file`
 #     OR explicit `--allow-anonymous`
@@ -18,6 +18,7 @@ set -Eeuo pipefail
 
 ORIG_ARGS=("$@")
 export DEBIAN_FRONTEND=noninteractive
+# shellcheck disable=SC2034 # Consumed by lib/apt.sh rvdk_apt_ensure
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 _SCRIPT_DIR=""
@@ -41,7 +42,7 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
         rvdk_log_init() { :; }
         rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
         rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
-        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; }
+        rvdk_resolve_caller() { REAL_USER="${SUDO_USER:-root}"; REAL_GRP="root"; export REAL_USER REAL_GRP; }
         rvdk_load_config_env() { :; }
         rvdk_normalize_mount_path() {
             local p="${1:-}"
@@ -380,6 +381,20 @@ BUNDLE_URL="${NTFY_PREBUILT_URL:-${RVDK_RELEASE_BASE}/${BUNDLE_NAME}}"
 LOCAL_BUNDLE="${BUNDLE_DIR}/${BUNDLE_NAME}"
 LOCAL_BUNDLE_SHA="${LOCAL_BUNDLE}.sha256"
 
+# Official rvdk-v1 release bundle SHA-256 registry, keyed by TARGET_SLUG and BUNDLE_NAME.
+# Returns empty when a target/bundle has no published pinned digest recorded yet.
+_ntfy_pinned_bundle_sha256() {
+    local target_slug="${1:-${TARGET_SLUG:-}}"
+    local bundle_name="${2:-${BUNDLE_NAME:-ntfy-${NTFY_VERSION:-2.38.1}-${target_slug}.tar.zst}}"
+    case "${target_slug}:${bundle_name}" in
+        # Add only verified rvdk-v1 release digests here as:
+        # <target_slug>:<bundle_name>) printf '%s\n' '<64-char lowercase hex>' ;;
+        *)
+            printf ''
+            ;;
+    esac
+}
+
 go_meets_min_version() {
     local go_bin="$1"
     local req_ver="${2:-1.26}"
@@ -518,6 +533,9 @@ else
             if [[ -z "$EXPECTED_LOCAL_SHA" && -f "$LOCAL_BUNDLE_SHA" ]]; then
                 EXPECTED_LOCAL_SHA="$(awk '{print tolower($1); exit}' "$LOCAL_BUNDLE_SHA")"
             fi
+            if [[ -z "$EXPECTED_LOCAL_SHA" && -z "${NTFY_PREBUILT_URL:-}" && "${RVDK_RELEASE_BASE%/}" == */rvdk-v1 ]]; then
+                EXPECTED_LOCAL_SHA="$(_ntfy_pinned_bundle_sha256 "$TARGET_SLUG" "$BUNDLE_NAME" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
+            fi
             if [[ "$EXPECTED_LOCAL_SHA" =~ ^[0-9a-f]{64}$ ]]; then
                 if [[ "$(rvdk_sha256_file "$LOCAL_BUNDLE")" == "$EXPECTED_LOCAL_SHA" ]]; then
                     HAVE_VERIFIED_LOCAL="true"
@@ -528,19 +546,24 @@ else
 
         if [[ "$HAVE_VERIFIED_LOCAL" == "false" ]]; then
             EXPECTED_BUNDLE_SHA="$(printf '%s' "$BUNDLE_SHA256" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
+            if [[ -z "$EXPECTED_BUNDLE_SHA" && -z "${NTFY_PREBUILT_URL:-}" && "${RVDK_RELEASE_BASE%/}" == */rvdk-v1 ]]; then
+                EXPECTED_BUNDLE_SHA="$(_ntfy_pinned_bundle_sha256 "$TARGET_SLUG" "$BUNDLE_NAME" | tr '[:upper:]' '[:lower:]' | awk '{print $1}')"
+            fi
             if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" != "true" && "$SKIP_BUNDLE_SHA" != "true" ]]; then
                 if [[ -n "${NTFY_PREBUILT_URL:-}" ]]; then
-                    log_fatal "Refusing to trust unpinned NTFY_PREBUILT_URL (${BUNDLE_URL}) without --bundle-sha256 <hex64> or explicit --allow-remote-sha256."
+                    log_fatal "Refusing to trust unpinned NTFY_PREBUILT_URL (${BUNDLE_URL}) without --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
                 fi
-                log_warn "No pinned SHA-256 provided for ${BUNDLE_NAME} (pass --bundle-sha256 or --allow-remote-sha256 to use remote .sha256 sidecar); building from source..."
-                FORCE_BUILD="true"
+                log_fatal "No pinned SHA-256 digest is recorded for ${BUNDLE_NAME} (${TARGET_SLUG}). Pass --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
             else
+                if [[ -n "$EXPECTED_BUNDLE_SHA" ]] && [[ ! "$EXPECTED_BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+                    log_fatal "Invalid SHA-256 format '${EXPECTED_BUNDLE_SHA}' for ${BUNDLE_URL}."
+                fi
                 if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" && "$BUNDLE_URL" != https://* ]]; then
                     log_fatal "Refusing to fetch remote .sha256 sidecar over insecure non-HTTPS URL (${BUNDLE_URL}); use https:// or pass an explicit --bundle-sha256 <hex64> pin."
                 fi
                 rvdk_prog 32 "ntfy ${NTFY_VERSION}: pulling ${TARGET_SLUG} binary bundle..."
                 log_info "Pulling precompiled ${TARGET_SLUG} bundle from ${BUNDLE_URL}..."
-                _NTFY_TMP_ARCHIVE="$(mktemp /tmp/rvdk-ntfy-bundle.XXXXXX.tar.zst)"
+                _NTFY_TMP_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/rvdk-ntfy-bundle.XXXXXX")"
                 if _ntfy_curl "$BUNDLE_URL" -fL --retry 3 -o "$_NTFY_TMP_ARCHIVE" 2>/dev/null; then
                     if [[ -z "$EXPECTED_BUNDLE_SHA" && "$ALLOW_REMOTE_SHA" == "true" ]]; then
                         if _ntfy_curl "${BUNDLE_URL}.sha256" -fsSL --retry 3 -o "${_NTFY_TMP_ARCHIVE}.sha256" 2>/dev/null; then
@@ -550,6 +573,11 @@ else
                             _NTFY_TMP_ARCHIVE=""
                             log_fatal "Fail-closed security check: missing SHA-256 manifest at ${BUNDLE_URL}.sha256. Supply --bundle-sha256 <hex> or --force-build."
                         fi
+                    fi
+                    if [[ -z "$EXPECTED_BUNDLE_SHA" && "$SKIP_BUNDLE_SHA" != "true" ]]; then
+                        rm -f "$_NTFY_TMP_ARCHIVE" "${_NTFY_TMP_ARCHIVE}.sha256"
+                        _NTFY_TMP_ARCHIVE=""
+                        log_fatal "Fail-closed security check: empty SHA-256 manifest at ${BUNDLE_URL}.sha256. Supply --bundle-sha256 <hex> or --force-build."
                     fi
                     if [[ -n "$EXPECTED_BUNDLE_SHA" ]]; then
                         [[ "$EXPECTED_BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]] || log_fatal "Invalid SHA-256 format '${EXPECTED_BUNDLE_SHA}' for ${BUNDLE_URL}."
@@ -567,8 +595,11 @@ else
                     _NTFY_TMP_ARCHIVE=""
                     chmod 0644 "$LOCAL_BUNDLE"
                 else
-                    rm -f "$_NTFY_TMP_ARCHIVE"
+                    rm -f "$_NTFY_TMP_ARCHIVE" "${_NTFY_TMP_ARCHIVE}.sha256"
                     _NTFY_TMP_ARCHIVE=""
+                    if [[ -n "$EXPECTED_BUNDLE_SHA" || -n "${NTFY_PREBUILT_URL:-}" ]]; then
+                        log_fatal "Failed to download prebuilt bundle from ${BUNDLE_URL} (pass --force-build to compile from source)."
+                    fi
                     log_warn "No prebuilt bundle published at ${BUNDLE_URL}; falling back to unprivileged source compile (--force-build)..."
                     FORCE_BUILD="true"
                 fi

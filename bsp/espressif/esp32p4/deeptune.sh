@@ -53,6 +53,60 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
             chmod "$_mode" "$_tmp"
             mv -f "$_tmp" "$_dst"
         }
+        rvdk_sudo_preserve() {
+            [[ $# -gt 0 ]] || return 1
+            local -a _allow=(
+                RVDK_ALLOW_CIDR RVDK_APT_DISTRO_DEFAULT RVDK_ARCH RVDK_BACKUP_ROOT
+                RVDK_BASE_URL RVDK_BOARD RVDK_BOARDS_DIR RVDK_BOARD_QUIRKS RVDK_BOARD_TAG
+                RVDK_BOOT_BACKUP_DIR RVDK_BRANCH RVDK_CACHE_DIR RVDK_DEEPTUNE_CHAIN
+                RVDK_DEEPTUNE_ENV RVDK_DEEPTUNE_LAYERS RVDK_DT_MODEL RVDK_ENGINE_DIR
+                RVDK_ENV_FILE RVDK_FLASH_FORCE_RAW RVDK_HOSTNAME RVDK_KEEP_VENDOR_MIRRORS
+                RVDK_KIT_CACHE_FILE RVDK_LOCALE RVDK_MAX_VALID_EPOCH RVDK_MIN_VALID_EPOCH
+                RVDK_MIRROR_URL RVDK_MMU RVDK_NO_APT_UPDATE RVDK_NO_PROGBAR RVDK_OS_ID
+                RVDK_OS_VERSION_ID RVDK_P550_HDMI_STATE_FILE RVDK_P550_PLAT_DRV_BASE
+                RVDK_PARENT_BADGE_SGR RVDK_PARENT_BAR_SGR RVDK_PARENT_LABEL
+                RVDK_PARENT_PROGBAR RVDK_PARENT_STATE RVDK_PRIMARY_NIC
+                RVDK_PROGBAR_SESSION RVDK_PROG_BASE RVDK_PROG_SPAN RVDK_RELEASE_BASE
+                RVDK_REPO_URL RVDK_SECONDARY_NIC RVDK_SKIP_NET_GUARD RVDK_SOC
+                RVDK_SOC_SLUG RVDK_STATE_DIR RVDK_SUB_STATE RVDK_SYSTEMD_UNIT_DIR
+                RVDK_TIMEZONE RVDK_TUNE RVDK_TUNE_MODE
+            )
+            local -a _present=()
+            local _v _csv=""
+            for _v in "${_allow[@]}"; do
+                if [[ -n "${!_v+x}" ]]; then
+                    _present+=("$_v")
+                fi
+            done
+            local _rc=0
+            if [[ ${#_present[@]} -eq 0 ]]; then
+                sudo "$@" || _rc=$?
+                return "$_rc"
+            fi
+            for _v in "${_present[@]}"; do
+                _csv="${_csv:+${_csv},}${_v}"
+            done
+            local _probe_err="" _probe_rc=0
+            _probe_err="$(sudo --preserve-env="$_csv" -n true 2>&1)" || _probe_rc=$?
+            if [[ "$_probe_rc" -eq 0 ]]; then
+                sudo --preserve-env="$_csv" "$@" || _rc=$?
+                return "$_rc"
+            fi
+            if [[ "$_probe_err" =~ (not[[:space:]]+allowed|SETENV|preserve-env|unrecognized[[:space:]]+option|unknown[[:space:]]+option|illegal[[:space:]]+option|invalid[[:space:]]+option|unexpected[[:space:]]+argument) ]] \
+                || sudo -n true >/dev/null 2>&1; then
+                sudo "$@" || _rc=$?
+                return "$_rc"
+            fi
+            if sudo -v; then
+                if sudo --preserve-env="$_csv" -n true >/dev/null 2>&1; then
+                    sudo --preserve-env="$_csv" "$@" || _rc=$?
+                    return "$_rc"
+                fi
+                sudo "$@" || _rc=$?
+                return "$_rc"
+            fi
+            return 1
+        }
     fi
 fi
 if [[ -z "${_RVDK_KIT_SH_LOADED:-}" ]]; then
@@ -182,8 +236,10 @@ if [[ "$ACTION" == "status" ]]; then
 fi
 
 if [[ -z "$STAGE_DIR" && "${EUID:-$(id -u)}" -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
+        _sudo_rc=0
+        rvdk_sudo_preserve bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} || _sudo_rc=$?
+        exit "$_sudo_rc"
     else
         log_fatal "Root privileges required for on-target /etc/rvdk writes (or pass --stage-dir <dir>)."
     fi

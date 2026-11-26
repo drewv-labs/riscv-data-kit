@@ -2,7 +2,7 @@
 # ==============================================================================
 # DREW-V Labs // Espressif ESP32-P4 (2x HP RISC-V32 NoMMU + ESP32-C6 SDIO) BSP
 # Path: riscv-data-kit/bsp/espressif/esp32p4/forge.sh
-# Boards: Waveshare ESP32-P4-WIFI6-DEV-KIT (waveshare/esp32-p4-wifi6)
+# Boards: Espressif ESP32-P4 carrier boards (parameterized via --board / RVDK_BOARD)
 # ==============================================================================
 
 if [[ -n "${ZSH_VERSION:-}" ]]; then
@@ -138,23 +138,47 @@ fi
 rvdk_sanitize_locale
 
 _CALLER_BOARD="${CLI_BOARD:-${RVDK_BOARD:-}}"
-TARGET_BOARD="${_CALLER_BOARD:-waveshare/esp32-p4-wifi6}"
+_CALLER_TAG=""
+if [[ -z "$CLI_BOARD" || "$CLI_BOARD" == "${RVDK_BOARD:-}" ]]; then
+    _CALLER_TAG="${RVDK_BOARD_TAG:-}"
+fi
 if typeset -f rvdk_kit_resolve >/dev/null 2>&1; then
-    rvdk_kit_resolve --no-cache --soc "espressif/esp32p4" --board "$TARGET_BOARD" || true
+    if [[ -n "$_CALLER_BOARD" ]]; then
+        rvdk_kit_resolve --no-cache --soc "espressif/esp32p4" --board "$_CALLER_BOARD" || true
+    else
+        RVDK_DT_MODEL="${RVDK_DT_MODEL:-Unknown}" rvdk_kit_resolve --no-cache --soc "espressif/esp32p4" || true
+    fi
 fi
 RESOLVED_BOARD="${RVDK_BOARD:-}"
-RESOLVED_TAG="${RVDK_BOARD_TAG:-}"
-if [[ -z "$RESOLVED_BOARD" ]] && ! typeset -f rvdk_kit_resolve >/dev/null 2>&1; then
-    RESOLVED_BOARD="$TARGET_BOARD"
+if [[ -z "$RESOLVED_BOARD" ]]; then
+    if [[ -n "$_CALLER_BOARD" ]]; then
+        RESOLVED_BOARD="$_CALLER_BOARD"
+    elif ! typeset -f rvdk_kit_resolve >/dev/null 2>&1; then
+        RESOLVED_BOARD="espressif/esp32p4"
+    fi
 fi
 if [[ ! "$RESOLVED_BOARD" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ || "$RESOLVED_BOARD" == *..* ]]; then
-    log_fatal "Invalid board identifier '${TARGET_BOARD}'."
+    log_fatal "Invalid board identifier '${_CALLER_BOARD:-${RESOLVED_BOARD}}'."
 fi
+RESOLVED_TAG="${_CALLER_TAG:-${RVDK_BOARD_TAG:-}}"
 if [[ -z "$RESOLVED_TAG" ]]; then
-    if [[ "$RESOLVED_BOARD" == "waveshare/esp32-p4-wifi6" ]]; then
-        RESOLVED_TAG="p4"
+    RESOLVED_TAG="${RESOLVED_BOARD##*/}"
+fi
+if [[ ! "$RESOLVED_TAG" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ || "$RESOLVED_TAG" == *..* ]]; then
+    log_fatal "Invalid board tag '${RESOLVED_TAG}'."
+fi
+if [[ -n "${RVDK_SD_LABEL:-}" ]]; then
+    if [[ ! "$RVDK_SD_LABEL" =~ ^[A-Za-z0-9_.-]{1,11}$ ]]; then
+        log_fatal "Invalid FAT32 volume label RVDK_SD_LABEL='${RVDK_SD_LABEL}' (max 11 chars: [A-Za-z0-9_.-])."
+    fi
+    RESOLVED_SD_LABEL="$RVDK_SD_LABEL"
+else
+    _sd_tag_upper="$(printf '%s' "$RESOLVED_TAG" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
+    [[ -z "$_sd_tag_upper" ]] && _sd_tag_upper="P4"
+    if (( ${#_sd_tag_upper} <= 3 )); then
+        RESOLVED_SD_LABEL="RVDK_${_sd_tag_upper}_SD"
     else
-        RESOLVED_TAG="${RESOLVED_BOARD##*/}"
+        RESOLVED_SD_LABEL="RVDK_${_sd_tag_upper:0:6}"
     fi
 fi
 
@@ -242,7 +266,7 @@ RVDK_ARCH=\"riscv32\"
 RVDK_MMU=\"none\"
 RVDK_CPU_HARTS=\"2\"
 RVDK_STORAGE_MEDIA=\"sd\"
-RVDK_SD_LABEL=\"RVDK_P4_SD\""
+RVDK_SD_LABEL=\"${RESOLVED_SD_LABEL}\""
 
 if [[ -f "$KIT_ENV_FILE" && ! -L "$KIT_ENV_FILE" ]] && printf '%s\n' "$WANT_KIT_ENV" | cmp -s - "$KIT_ENV_FILE" 2>/dev/null; then
     log_skip "ESP32-P4 kit provenance already converged (${KIT_ENV_FILE})"

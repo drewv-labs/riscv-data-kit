@@ -481,7 +481,7 @@ rvdk_normalize_mount_path() {
     while [[ "$p" != "/" && "$p" == */ ]]; do
         p="${p%/}"
     done
-    printf '%s' "$p"
+    printf '%s\n' "$p"
 }
 
 # Resolve target data mountpoint without legacy appliance bleed:
@@ -492,7 +492,6 @@ rvdk_resolve_data_mount() {
     local explicit="${1:-${MOUNT_POINT:-}}"
     if [[ -n "$explicit" ]]; then
         rvdk_normalize_mount_path "$explicit"
-        printf '\n'
         return 0
     fi
     if command -v mountpoint >/dev/null 2>&1 && mountpoint -q /mnt/nvme_data 2>/dev/null; then
@@ -500,6 +499,87 @@ rvdk_resolve_data_mount() {
         return 0
     fi
     printf '\n'
+}
+
+# Strip commit=<10+s> mount options ONLY from active root ext4 entries ($2 == "/" && $3 == "ext4").
+# Falls back to "defaults" if commit=... was the sole mount option.
+_rvdk_strip_fstab_commit() {
+    awk '{
+        if ($1 !~ /^#/ && NF >= 4 && $2 == "/" && $3 == "ext4") {
+            n = split($4, opts, ",")
+            out_opts = ""
+            changed = 0
+            for (i = 1; i <= n; i++) {
+                if (opts[i] ~ /^commit=[0-9][0-9]+$/) {
+                    changed = 1
+                    continue
+                }
+                if (opts[i] == "") continue
+                out_opts = (out_opts == "" ? opts[i] : out_opts "," opts[i])
+            }
+            if (changed) {
+                if (out_opts == "") out_opts = "defaults"
+                $4 = out_opts
+            }
+        }
+        print
+    }'
+}
+
+# Rewrite token-bounded LABEL=<old_lbl> -> LABEL=<new_lbl> safely without regex/backref hazards.
+_rvdk_rewrite_label_token() {
+    local old_lbl="$1"
+    local new_lbl="$2"
+    RVDK_OLD_LBL="$old_lbl" RVDK_NEW_LBL="$new_lbl" awk '
+    BEGIN {
+        old_val = ENVIRON["RVDK_OLD_LBL"]
+        needle = "LABEL=" old_val
+        repl = "LABEL=" ENVIRON["RVDK_NEW_LBL"]
+        nlen = length(needle)
+    }
+    {
+        if (length(old_val) == 0) {
+            print $0
+            next
+        }
+        s = $0
+        out = ""
+        while ((pos = index(s, needle)) > 0) {
+            out = out substr(s, 1, pos - 1)
+            prev = (length(out) > 0) ? substr(out, length(out), 1) : ""
+            after = substr(s, pos + nlen, 1)
+            prev_ok = (prev == "" || prev ~ /[[:space:]]/ || index(",=\"\047", prev) > 0)
+            after_ok = (after == "" || after ~ /[[:space:]]/ || index(",\"\047", after) > 0)
+            if (prev_ok && after_ok) {
+                out = out repl
+            } else {
+                out = out needle
+            }
+            s = substr(s, pos + nlen)
+        }
+        print out s
+    }'
+}
+
+# Rewrite literal substring <old_str> -> <new_str> safely without regex/backref hazards.
+_rvdk_rewrite_literal() {
+    local old_str="$1"
+    local new_str="$2"
+    RVDK_OLD_STR="$old_str" RVDK_NEW_STR="$new_str" awk '
+    BEGIN {
+        needle = ENVIRON["RVDK_OLD_STR"]
+        repl = ENVIRON["RVDK_NEW_STR"]
+        nlen = length(needle)
+    }
+    {
+        s = $0
+        out = ""
+        while (nlen > 0 && (pos = index(s, needle)) > 0) {
+            out = out substr(s, 1, pos - 1) repl
+            s = substr(s, pos + nlen)
+        }
+        print out s
+    }'
 }
 
 # Safe non-executing key-value loader. Never invokes `source` or command expansion.

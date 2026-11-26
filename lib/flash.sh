@@ -154,82 +154,25 @@ _rvdk_flash_curl() {
     fi
 }
 
-_rvdk_flash_strip_fstab_commit() {
-    awk '{
-        if ($1 !~ /^#/ && NF >= 4 && $2 == "/" && $3 == "ext4") {
-            n = split($4, opts, ",")
-            out_opts = ""
-            changed = 0
-            for (i = 1; i <= n; i++) {
-                if (opts[i] ~ /^commit=[0-9][0-9]+$/) {
-                    changed = 1
-                    continue
-                }
-                if (opts[i] == "") continue
-                out_opts = (out_opts == "" ? opts[i] : out_opts "," opts[i])
-            }
-            if (changed) {
-                if (out_opts == "") out_opts = "defaults"
-                $4 = out_opts
-            }
-        }
-        print
-    }'
+_rvdk_flash_download_to_part() {
+    local url="$1"
+    local part_file="$2"
+
+    _RVDK_FLASH_PART_FILE="$part_file"
+    if [[ -f "$part_file" && ! -L "$part_file" ]]; then
+        if _rvdk_flash_curl "$url" -fL --retry 3 -C - -o "$part_file"; then
+            return 0
+        fi
+        log_warn "Resumed download failed for ${url}; purging stale ${part_file} and retrying from byte 0..."
+        rm -f "$part_file" 2>/dev/null || true
+    elif [[ -e "$part_file" || -L "$part_file" ]]; then
+        rm -f "$part_file" 2>/dev/null || true
+    fi
+    _rvdk_flash_curl "$url" -fL --retry 3 -o "$part_file"
 }
 
-_rvdk_flash_rewrite_label_token() {
-    local old_lbl="$1"
-    local new_lbl="$2"
-    RVDK_OLD_LBL="$old_lbl" RVDK_NEW_LBL="$new_lbl" awk '
-    BEGIN {
-        old_val = ENVIRON["RVDK_OLD_LBL"]
-        needle = "LABEL=" old_val
-        repl = "LABEL=" ENVIRON["RVDK_NEW_LBL"]
-        nlen = length(needle)
-    }
-    {
-        if (length(old_val) == 0) {
-            print $0
-            next
-        }
-        s = $0
-        out = ""
-        while ((pos = index(s, needle)) > 0) {
-            out = out substr(s, 1, pos - 1)
-            prev = (length(out) > 0) ? substr(out, length(out), 1) : ""
-            after = substr(s, pos + nlen, 1)
-            prev_ok = (prev == "" || prev ~ /[[:space:]]/ || index(",=\"\047", prev) > 0)
-            after_ok = (after == "" || after ~ /[[:space:]]/ || index(",\"\047", after) > 0)
-            if (prev_ok && after_ok) {
-                out = out repl
-            } else {
-                out = out needle
-            }
-            s = substr(s, pos + nlen)
-        }
-        print out s
-    }'
-}
-
-_rvdk_flash_rewrite_literal() {
-    local old_str="$1"
-    local new_str="$2"
-    RVDK_OLD_STR="$old_str" RVDK_NEW_STR="$new_str" awk '
-    BEGIN {
-        needle = ENVIRON["RVDK_OLD_STR"]
-        repl = ENVIRON["RVDK_NEW_STR"]
-        nlen = length(needle)
-    }
-    {
-        s = $0
-        out = ""
-        while (nlen > 0 && (pos = index(s, needle)) > 0) {
-            out = out substr(s, 1, pos - 1) repl
-            s = substr(s, pos + nlen)
-        }
-        print out s
-    }'
-}
+# Backwards-compatible wrapper delegating to unified helper in lib/common.sh.
+_rvdk_flash_rewrite_label_token() { _rvdk_rewrite_label_token "$@"; }
 
 _rvdk_udev_settle() {
     if command -v udevadm >/dev/null 2>&1; then
@@ -444,6 +387,7 @@ _rvdk_flash_verify_sha256() {
     local skip_sha="$5"
     local owner_user="$6"
     local allow_remote_sha="${7:-false}"
+    local allow_purge="${8:-false}"
 
     local expected=""
     if [[ -n "$pinned_sha" ]]; then
@@ -487,15 +431,23 @@ _rvdk_flash_verify_sha256() {
     fi
 
     if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
-        rm -f "$sha_file" 2>/dev/null || true
+        if [[ "$allow_purge" == "true" && -n "$sha_file" ]]; then
+            rm -f "$sha_file" 2>/dev/null || true
+        fi
         log_fatal "Invalid SHA-256 digest format '${expected}' for ${img_file}."
     fi
 
     local actual
     actual="$(rvdk_sha256_file "$img_file")"
     if [[ "$actual" != "$expected" ]]; then
-        rm -f "$img_file" "$sha_file" 2>/dev/null || true
-        log_fatal "SHA-256 MISMATCH on ${img_file}! Expected ${expected}, got ${actual}. Purged untrusted image."
+        if [[ "$allow_purge" == "true" ]]; then
+            rm -f "$img_file" 2>/dev/null || true
+            if [[ -n "$sha_file" ]]; then
+                rm -f "$sha_file" 2>/dev/null || true
+            fi
+            log_fatal "SHA-256 MISMATCH on ${img_file}! Expected ${expected}, got ${actual}. Purged untrusted image."
+        fi
+        log_fatal "SHA-256 MISMATCH on ${img_file}! Expected ${expected}, got ${actual}. Leaving source file untouched."
     fi
     log_ok "Verified SHA-256   : ${actual}"
 }
@@ -643,7 +595,7 @@ _rvdk_harden_ext4_superblock() {
         cur_fstab="$(_rvdk_dev_priv "$root_slice" "$debugfs_bin" -R "cat /etc/fstab" "$root_slice" 2>/dev/null || true)"
         if grep -Eq '^[[:space:]]*[^#[:space:]]+[[:space:]]+/[[:space:]]+ext4[[:space:]]+[^[:space:]]*commit=[0-9]{2,}' <<< "$cur_fstab"; then
             local stripped_fstab=""
-            stripped_fstab="$(_rvdk_flash_strip_fstab_commit <<< "$cur_fstab")"
+            stripped_fstab="$(_rvdk_strip_fstab_commit <<< "$cur_fstab")"
             if [[ "$stripped_fstab" != "$cur_fstab" ]]; then
                 _rvdk_flash_register_cleanup
                 local tmp_fstab tmp_fcmds
@@ -982,7 +934,7 @@ _rvdk_flash_postprocess_raw() {
                 local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
                 cur_cfg="$(_rvdk_run_priv cat "$cfg_full" 2>/dev/null || true)"
                 if [[ -n "$cur_cfg" ]]; then
-                    new_cfg="$(_rvdk_flash_rewrite_literal "$old_uuid" "$new_uuid" <<< "$cur_cfg")"
+                    new_cfg="$(_rvdk_rewrite_literal "$old_uuid" "$new_uuid" <<< "$cur_cfg")"
                     if [[ "$new_cfg" != "$cur_cfg" ]]; then
                         cfg_dir="$(dirname "$cfg_full")"
                         cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$cfg_full").rvdk.XXXXXX")"
@@ -1000,7 +952,7 @@ _rvdk_flash_postprocess_raw() {
                 local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
                 cur_cfg="$(_rvdk_run_priv cat "$cfg_full" 2>/dev/null || true)"
                 if [[ -n "$cur_cfg" ]]; then
-                    new_cfg="$(_rvdk_flash_rewrite_label_token "$old_label" "$root_label" <<< "$cur_cfg")"
+                    new_cfg="$(_rvdk_rewrite_label_token "$old_label" "$root_label" <<< "$cur_cfg")"
                     if [[ "$new_cfg" != "$cur_cfg" ]]; then
                         cfg_dir="$(dirname "$cfg_full")"
                         cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$cfg_full").rvdk.XXXXXX")"
@@ -1442,7 +1394,7 @@ PY
         [[ ! -f "$image_path" ]] && log_fatal "Custom image file not found: ${image_path}"
         log_info "Using custom image : ${image_path}"
         if [[ -n "$cli_sha256" ]]; then
-            _rvdk_flash_verify_sha256 "$image_path" "" "" "$cli_sha256" "$skip_sha256" "$REAL_USER" "$allow_remote_sha256"
+            _rvdk_flash_verify_sha256 "$image_path" "" "" "$cli_sha256" "$skip_sha256" "$REAL_USER" "$allow_remote_sha256" "false"
         fi
     else
         [[ -z "$default_img" ]] && log_fatal "No default image configured for ${board_id} (${medium}). Pass --image /path/to/img."
@@ -1463,8 +1415,7 @@ PY
             log_ok "Found cached upstream image: ${image_path}"
         else
             log_info "Downloading ${primary_url}..."
-            _RVDK_FLASH_PART_FILE="${image_path}.part"
-            if _rvdk_flash_curl "$primary_url" -fL --retry 3 -C - -o "${image_path}.part"; then
+            if _rvdk_flash_download_to_part "$primary_url" "${image_path}.part"; then
                 mv -f "${image_path}.part" "$image_path"
                 _RVDK_FLASH_PART_FILE=""
                 chown "$REAL_USER" "$image_path" 2>/dev/null || true
@@ -1477,8 +1428,7 @@ PY
                 sha_path="${image_path}.sha256"
                 active_url="$fallback_url"
                 active_pinned_sha="${cli_sha256:-$fallback_sha}"
-                _RVDK_FLASH_PART_FILE="${image_path}.part"
-                if ! _rvdk_flash_curl "$fallback_url" -fL --retry 3 -C - -o "${image_path}.part"; then
+                if ! _rvdk_flash_download_to_part "$fallback_url" "${image_path}.part"; then
                     rm -f "${image_path}.part" 2>/dev/null || true
                     _RVDK_FLASH_PART_FILE=""
                     log_fatal "Failed to download ${fallback_url}."
@@ -1494,7 +1444,7 @@ PY
             fi
         fi
 
-        _rvdk_flash_verify_sha256 "$image_path" "$sha_path" "${active_url}.sha256" "$active_pinned_sha" "$skip_sha256" "$REAL_USER" "$allow_remote_sha256"
+        _rvdk_flash_verify_sha256 "$image_path" "$sha_path" "${active_url}.sha256" "$active_pinned_sha" "$skip_sha256" "$REAL_USER" "$allow_remote_sha256" "true"
     fi
 
     _rvdk_require_decompressor "$image_path" "$os_type"

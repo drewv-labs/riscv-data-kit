@@ -161,8 +161,17 @@ EOF
 }
 
 _RVDK_BSP_TMP_MNT="${_RVDK_BSP_TMP_MNT:-}"
+_RVDK_BSP_TMP_BOOT_MNT="${_RVDK_BSP_TMP_BOOT_MNT:-}"
 
 _rvdk_bsp_cleanup_tmp_mnt() {
+    if [[ -n "${_RVDK_BSP_TMP_BOOT_MNT:-}" && -d "${_RVDK_BSP_TMP_BOOT_MNT}" ]]; then
+        if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "${_RVDK_BSP_TMP_BOOT_MNT}" 2>/dev/null; then
+            umount "${_RVDK_BSP_TMP_BOOT_MNT}" 2>/dev/null || umount -l "${_RVDK_BSP_TMP_BOOT_MNT}" 2>/dev/null || true
+        else
+            umount "${_RVDK_BSP_TMP_BOOT_MNT}" 2>/dev/null || true
+        fi
+        _RVDK_BSP_TMP_BOOT_MNT=""
+    fi
     if [[ -n "${_RVDK_BSP_TMP_MNT:-}" && -d "${_RVDK_BSP_TMP_MNT}" ]]; then
         if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "${_RVDK_BSP_TMP_MNT}" 2>/dev/null; then
             umount "${_RVDK_BSP_TMP_MNT}" 2>/dev/null || umount -l "${_RVDK_BSP_TMP_MNT}" 2>/dev/null || true
@@ -174,84 +183,8 @@ _rvdk_bsp_cleanup_tmp_mnt() {
     _RVDK_BSP_TMP_MNT=""
 }
 
-# Strip commit=<10+s> mount options ONLY from active root ext4 entries ($2 == "/" && $3 == "ext4").
-# Falls back to "defaults" if commit=... was the sole mount option.
-_rvdk_bsp_strip_fstab_commit() {
-    awk '{
-        if ($1 !~ /^#/ && NF >= 4 && $2 == "/" && $3 == "ext4") {
-            n = split($4, opts, ",")
-            out_opts = ""
-            changed = 0
-            for (i = 1; i <= n; i++) {
-                if (opts[i] ~ /^commit=[0-9][0-9]+$/) {
-                    changed = 1
-                    continue
-                }
-                if (opts[i] == "") continue
-                out_opts = (out_opts == "" ? opts[i] : out_opts "," opts[i])
-            }
-            if (changed) {
-                if (out_opts == "") out_opts = "defaults"
-                $4 = out_opts
-            }
-        }
-        print
-    }'
-}
-
-_rvdk_bsp_rewrite_label_token() {
-    local old_lbl="$1"
-    local new_lbl="$2"
-    RVDK_OLD_LBL="$old_lbl" RVDK_NEW_LBL="$new_lbl" awk '
-    BEGIN {
-        old_val = ENVIRON["RVDK_OLD_LBL"]
-        needle = "LABEL=" old_val
-        repl = "LABEL=" ENVIRON["RVDK_NEW_LBL"]
-        nlen = length(needle)
-    }
-    {
-        if (length(old_val) == 0) {
-            print $0
-            next
-        }
-        s = $0
-        out = ""
-        while ((pos = index(s, needle)) > 0) {
-            out = out substr(s, 1, pos - 1)
-            prev = (length(out) > 0) ? substr(out, length(out), 1) : ""
-            after = substr(s, pos + nlen, 1)
-            prev_ok = (prev == "" || prev ~ /[[:space:]]/ || index(",=\"\047", prev) > 0)
-            after_ok = (after == "" || after ~ /[[:space:]]/ || index(",\"\047", after) > 0)
-            if (prev_ok && after_ok) {
-                out = out repl
-            } else {
-                out = out needle
-            }
-            s = substr(s, pos + nlen)
-        }
-        print out s
-    }'
-}
-
-_rvdk_bsp_rewrite_literal() {
-    local old_str="$1"
-    local new_str="$2"
-    RVDK_OLD_STR="$old_str" RVDK_NEW_STR="$new_str" awk '
-    BEGIN {
-        needle = ENVIRON["RVDK_OLD_STR"]
-        repl = ENVIRON["RVDK_NEW_STR"]
-        nlen = length(needle)
-    }
-    {
-        s = $0
-        out = ""
-        while (nlen > 0 && (pos = index(s, needle)) > 0) {
-            out = out substr(s, 1, pos - 1) repl
-            s = substr(s, pos + nlen)
-        }
-        print out s
-    }'
-}
+# Backwards-compatible wrapper delegating to unified helper in lib/common.sh.
+_rvdk_bsp_rewrite_label_token() { _rvdk_rewrite_label_token "$@"; }
 
 # Parse one `lsblk -P -b -o PATH,TYPE,FSTYPE,SIZE,LABEL` line safely without `eval`.
 # Sets: _RVDK_LSBLK_PATH, _RVDK_LSBLK_TYPE, _RVDK_LSBLK_FSTYPE, _RVDK_LSBLK_SIZE, _RVDK_LSBLK_LABEL
@@ -309,6 +242,93 @@ _rvdk_bsp_select_root_part() {
     printf '%s\n' "${best_pref:-$best_size_dev}"
 }
 
+_rvdk_bsp_select_boot_part() {
+    local dev_path="$1"
+    local root_part="$2"
+    local _line p_lbl_lc
+    while IFS= read -r _line; do
+        [[ -z "$_line" ]] && continue
+        _rvdk_bsp_parse_lsblk_line "$_line"
+        [[ "$_RVDK_LSBLK_TYPE" == "part" && -n "$_RVDK_LSBLK_PATH" && "$_RVDK_LSBLK_PATH" != "$root_part" ]] || continue
+        p_lbl_lc="$(tr '[:upper:]' '[:lower:]' <<< "${_RVDK_LSBLK_LABEL:-}")"
+        if [[ -z "$p_lbl_lc" ]]; then
+            p_lbl_lc="$(blkid -s LABEL -o value "$_RVDK_LSBLK_PATH" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+        fi
+        case "$p_lbl_lc" in
+            boot|bootfs|opi_boot|armbi_boot)
+                printf '%s\n' "$_RVDK_LSBLK_PATH"
+                return 0
+                ;;
+        esac
+    done < <(lsblk -P -b -o PATH,TYPE,FSTYPE,SIZE,LABEL "$dev_path" 2>/dev/null || true)
+    return 0
+}
+
+_rvdk_bsp_rewrite_boot_configs() {
+    local root_prefix="$1"
+    local old_uuid="$2"
+    local new_uuid="$3"
+    local old_lbl="$4"
+    local new_lbl="$5"
+
+    local canon_root=""
+    if [[ -n "$root_prefix" ]]; then
+        canon_root="$(readlink -f "$root_prefix" 2>/dev/null || true)"
+        [[ -n "$canon_root" ]] || return 1
+
+        local check_dir canon_dir
+        for check_dir in etc boot boot/extlinux boot/boot boot/boot/extlinux boot/spacemit boot/efi; do
+            if [[ -e "${root_prefix}/${check_dir}" || -L "${root_prefix}/${check_dir}" ]]; then
+                canon_dir="$(readlink -f "${root_prefix}/${check_dir}" 2>/dev/null || true)"
+                if [[ -z "$canon_dir" || ( "$canon_dir" != "$canon_root" && "$canon_dir" != "${canon_root}/"* ) ]]; then
+                    return 1
+                fi
+            fi
+        done
+    fi
+
+    local rel_cfg cfg_path target_cfg canon_cfg content updated
+    for rel_cfg in \
+        etc/fstab \
+        boot/orangepiEnv.txt \
+        boot/armbianEnv.txt \
+        boot/env_k1-x.txt \
+        boot/spacemit/env_k1-x.txt \
+        boot/extlinux/extlinux.conf \
+        boot/boot/extlinux/extlinux.conf \
+        boot/efi/extlinux.conf \
+        boot/uEnv.txt; do
+        cfg_path="${root_prefix}/${rel_cfg}"
+        target_cfg="$cfg_path"
+        if [[ -n "$root_prefix" && ( -e "$cfg_path" || -L "$cfg_path" ) ]]; then
+            canon_cfg="$(readlink -f "$cfg_path" 2>/dev/null || true)"
+            if [[ -z "$canon_cfg" || "$canon_cfg" != "${canon_root}/"* ]]; then
+                return 1
+            fi
+            target_cfg="$canon_cfg"
+        fi
+        [[ -f "$target_cfg" && ! -L "$target_cfg" ]] || continue
+
+        content="$(cat "$target_cfg" 2>/dev/null || true)"
+        [[ -n "$content" ]] || continue
+        updated="$content"
+
+        if [[ -n "$old_uuid" && -n "$new_uuid" && "$old_uuid" != "$new_uuid" ]] && grep -qF "$old_uuid" <<< "$updated" 2>/dev/null; then
+            updated="$(_rvdk_rewrite_literal "$old_uuid" "$new_uuid" <<< "$updated")"
+        fi
+        if [[ -n "$old_lbl" && -n "$new_lbl" && "$old_lbl" != "$new_lbl" ]] && grep -qF "LABEL=${old_lbl}" <<< "$updated" 2>/dev/null; then
+            updated="$(_rvdk_rewrite_label_token "$old_lbl" "$new_lbl" <<< "$updated")"
+        fi
+
+        if [[ "$updated" != "$content" ]] && ! printf '%s\n' "$updated" | cmp -s - "$target_cfg" 2>/dev/null; then
+            if ! printf '%s\n' "$updated" | rvdk_atomic_write "$target_cfg" 0644; then
+                return 1
+            fi
+        fi
+    done
+    return 0
+}
+
 # Converge non-colliding ext4 rootfs labels (`rvdk_sd_root` vs `rvdk_emmc_root`)
 # and repair duplicate UUIDs across dual-populated SD + eMMC SBCs.
 rvdk_bsp_converge_mmc_root_labels() {
@@ -345,7 +365,7 @@ rvdk_bsp_converge_mmc_root_labels() {
         fi
         if [[ -f /etc/fstab ]] && grep -Eq '^[[:space:]]*[^#[:space:]]+[[:space:]]+/[[:space:]]+ext4[[:space:]]+[^[:space:]]*commit=[0-9]{2,}' /etc/fstab 2>/dev/null; then
             local _fstab_clean
-            _fstab_clean="$(_rvdk_bsp_strip_fstab_commit < /etc/fstab)"
+            _fstab_clean="$(_rvdk_strip_fstab_commit < /etc/fstab)"
             if ! printf '%s\n' "$_fstab_clean" | cmp -s - /etc/fstab 2>/dev/null; then
                 printf '%s\n' "$_fstab_clean" | rvdk_atomic_write /etc/fstab 0644
                 mount -o remount,commit=5 / 2>/dev/null || true
@@ -400,67 +420,131 @@ rvdk_bsp_converge_mmc_root_labels() {
         local cur_lbl=""
         cur_lbl="$(e2label "$root_part" 2>/dev/null | tr -d '[:space:]' || true)"
 
-        # Repair duplicate root UUID on unmounted peer MMC device if both SD & eMMC came from identical raw images
-        if [[ -n "$live_uuid" && "$root_part" != "$live_root" ]]; then
-            local peer_uuid="" peer_mnt=""
-            peer_uuid="$(blkid -s UUID -o value "$root_part" 2>/dev/null || true)"
-            if command -v findmnt >/dev/null 2>&1; then
-                peer_mnt="$(findmnt -rn -S "$root_part" -o TARGET 2>/dev/null | head -n1 || true)"
-            fi
-            if [[ -n "$peer_uuid" && "$peer_uuid" == "$live_uuid" && -z "$peer_mnt" ]] && command -v tune2fs >/dev/null 2>&1 && command -v e2fsck >/dev/null 2>&1; then
-                local fsck_rc=0
-                e2fsck -pf "$root_part" >/dev/null 2>&1 || fsck_rc=$?
-                if (( fsck_rc <= 1 )); then
-                    local new_uuid=""
-                    new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
-                    tune2fs -U "$new_uuid" "$root_part" >/dev/null
-                    if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
-                        rvdk_register_cleanup _rvdk_bsp_cleanup_tmp_mnt
-                    fi
-                    _RVDK_BSP_TMP_MNT="$(mktemp -d "/tmp/rvdk_mmc_uuid.XXXXXX")"
-                    if mount "$root_part" "$_RVDK_BSP_TMP_MNT" 2>/dev/null; then
-                        local rel_cfg
-                        for rel_cfg in etc/fstab boot/orangepiEnv.txt boot/armbianEnv.txt boot/env_k1-x.txt boot/spacemit/env_k1-x.txt boot/extlinux/extlinux.conf boot/efi/extlinux.conf; do
-                            if [[ -f "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" ]] && grep -qF "$peer_uuid" "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 2>/dev/null; then
-                                local _peer_rewritten
-                                _peer_rewritten="$(_rvdk_bsp_rewrite_literal "$peer_uuid" "$new_uuid" < "${_RVDK_BSP_TMP_MNT}/${rel_cfg}")"
-                                if ! printf '%s\n' "$_peer_rewritten" | cmp -s - "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 2>/dev/null; then
-                                    printf '%s\n' "$_peer_rewritten" | rvdk_atomic_write "${_RVDK_BSP_TMP_MNT}/${rel_cfg}" 0644
-                                fi
-                            fi
-                        done
-                        sync
-                    fi
-                    _rvdk_bsp_cleanup_tmp_mnt
-                    log_ok "De-collided duplicate ${mmc_kind} ext4 UUID on ${root_part} -> ${new_uuid}"
+        if [[ "$root_part" == "$live_root" ]]; then
+            if [[ "$cur_lbl" != "$want_lbl" ]]; then
+                if [[ -n "$cur_lbl" ]]; then
+                    _rvdk_bsp_rewrite_boot_configs "" "" "" "$cur_lbl" "$want_lbl"
                 fi
+                e2label "$root_part" "$want_lbl"
+                log_ok "Labeled ${mmc_kind} ext4 rootfs: ${root_part} -> ${want_lbl}"
+            else
+                log_skip "${mmc_kind} ext4 rootfs label already converged (${root_part} = ${want_lbl})"
+            fi
+            continue
+        fi
+
+        # Peer MMC device: mount rootfs + sibling /boot BEFORE mutating superblocks via tune2fs -U / e2label
+        local peer_uuid="" peer_mnt=""
+        peer_uuid="$(blkid -s UUID -o value "$root_part" 2>/dev/null || true)"
+        if command -v findmnt >/dev/null 2>&1; then
+            peer_mnt="$(findmnt -rn -S "$root_part" -o TARGET 2>/dev/null | head -n1 || true)"
+        fi
+
+        local need_uuid_fix="false" need_label_fix="false"
+        if [[ -n "$live_uuid" && -n "$peer_uuid" && "$peer_uuid" == "$live_uuid" ]] && command -v tune2fs >/dev/null 2>&1 && command -v e2fsck >/dev/null 2>&1; then
+            need_uuid_fix="true"
+        fi
+        if [[ "$cur_lbl" != "$want_lbl" ]]; then
+            need_label_fix="true"
+        fi
+
+        if [[ "$need_uuid_fix" != "true" && "$need_label_fix" != "true" ]]; then
+            log_skip "${mmc_kind} ext4 rootfs label already converged (${root_part} = ${want_lbl})"
+            continue
+        fi
+
+        if [[ -n "$peer_mnt" ]]; then
+            log_warn "Peer ${mmc_kind} ext4 rootfs ${root_part} is already mounted at ${peer_mnt}; aborting peer UUID/label convergence without altering superblocks."
+            continue
+        fi
+
+        local new_uuid=""
+        if [[ "$need_uuid_fix" == "true" ]]; then
+            local fsck_rc=0
+            e2fsck -pf "$root_part" >/dev/null 2>&1 || fsck_rc=$?
+            if (( fsck_rc <= 1 )); then
+                new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+                if [[ -z "$new_uuid" || "$new_uuid" == "$peer_uuid" ]]; then
+                    log_warn "Unable to generate unique UUID for peer ${root_part}; aborting peer UUID/label convergence without mounting or altering superblocks."
+                    continue
+                fi
+            else
+                log_warn "e2fsck returned ${fsck_rc} on ${root_part}; aborting peer UUID/label convergence without mounting or altering superblocks."
+                continue
             fi
         fi
 
-        if [[ "$cur_lbl" != "$want_lbl" ]]; then
-            if [[ "$root_part" == "$live_root" && -n "$cur_lbl" ]]; then
-                local live_cfg _lbl_rewritten
-                for live_cfg in \
-                    /etc/fstab \
-                    /boot/extlinux/extlinux.conf \
-                    /boot/efi/extlinux.conf \
-                    /boot/armbianEnv.txt \
-                    /boot/orangepiEnv.txt \
-                    /boot/env_k1-x.txt \
-                    /boot/spacemit/env_k1-x.txt; do
-                    if [[ -f "$live_cfg" ]] && grep -qF "LABEL=${cur_lbl}" "$live_cfg" 2>/dev/null; then
-                        _lbl_rewritten="$(_rvdk_bsp_rewrite_label_token "$cur_lbl" "$want_lbl" < "$live_cfg")"
-                        if ! printf '%s\n' "$_lbl_rewritten" | cmp -s - "$live_cfg" 2>/dev/null; then
-                            printf '%s\n' "$_lbl_rewritten" | rvdk_atomic_write "$live_cfg" 0644
-                        fi
-                    fi
-                done
+        local boot_slice="" boot_mnt=""
+        boot_slice="$(_rvdk_bsp_select_boot_part "/dev/${mmc_name}" "$root_part")"
+        if [[ -n "$boot_slice" ]] && command -v findmnt >/dev/null 2>&1; then
+            boot_mnt="$(findmnt -rn -S "$boot_slice" -o TARGET 2>/dev/null | head -n1 || true)"
+            if [[ -n "$boot_mnt" ]]; then
+                log_warn "Peer ${mmc_kind} boot partition ${boot_slice} is already mounted at ${boot_mnt}; aborting peer UUID/label convergence without altering superblocks."
+                continue
             fi
+        fi
+
+        if typeset -f rvdk_register_cleanup >/dev/null 2>&1; then
+            rvdk_register_cleanup _rvdk_bsp_cleanup_tmp_mnt
+        fi
+        _RVDK_BSP_TMP_MNT="$(mktemp -d "/tmp/rvdk_mmc_uuid.XXXXXX")"
+        if ! mount "$root_part" "$_RVDK_BSP_TMP_MNT" 2>/dev/null; then
+            log_warn "Failed to mount peer ${mmc_kind} rootfs ${root_part}; aborting peer UUID/label convergence without altering superblocks."
+            _rvdk_bsp_cleanup_tmp_mnt
+            continue
+        fi
+
+        if [[ -n "$boot_slice" ]]; then
+            if [[ -L "${_RVDK_BSP_TMP_MNT}/boot" || ! -d "${_RVDK_BSP_TMP_MNT}/boot" ]] || ! mount "$boot_slice" "${_RVDK_BSP_TMP_MNT}/boot" 2>/dev/null; then
+                log_warn "Failed to mount peer ${mmc_kind} boot partition ${boot_slice}; aborting peer UUID/label convergence without altering superblocks."
+                _rvdk_bsp_cleanup_tmp_mnt
+                continue
+            fi
+            _RVDK_BSP_TMP_BOOT_MNT="${_RVDK_BSP_TMP_MNT}/boot"
+        fi
+
+        local rewrite_old_uuid="" rewrite_new_uuid="" rewrite_old_lbl="" rewrite_new_lbl=""
+        if [[ "$need_uuid_fix" == "true" ]]; then
+            rewrite_old_uuid="$peer_uuid"
+            rewrite_new_uuid="$new_uuid"
+        fi
+        if [[ "$need_label_fix" == "true" && -n "$cur_lbl" ]]; then
+            rewrite_old_lbl="$cur_lbl"
+            rewrite_new_lbl="$want_lbl"
+        fi
+
+        if ! _rvdk_bsp_rewrite_boot_configs "$_RVDK_BSP_TMP_MNT" "$rewrite_old_uuid" "$rewrite_new_uuid" "$rewrite_old_lbl" "$rewrite_new_lbl"; then
+            log_warn "Failed to update boot configs on peer ${mmc_kind} (${root_part}); aborting peer UUID/label convergence without altering superblocks."
+            _rvdk_bsp_cleanup_tmp_mnt
+            continue
+        fi
+
+        sync
+        if [[ -n "${_RVDK_BSP_TMP_BOOT_MNT:-}" ]]; then
+            if ! umount "$_RVDK_BSP_TMP_BOOT_MNT" 2>/dev/null; then
+                log_warn "Failed to unmount peer ${mmc_kind} boot partition ${_RVDK_BSP_TMP_BOOT_MNT}; aborting superblock mutation."
+                _rvdk_bsp_cleanup_tmp_mnt
+                continue
+            fi
+            _RVDK_BSP_TMP_BOOT_MNT=""
+        fi
+        if ! umount "$_RVDK_BSP_TMP_MNT" 2>/dev/null; then
+            log_warn "Failed to unmount peer ${mmc_kind} rootfs ${_RVDK_BSP_TMP_MNT}; aborting superblock mutation."
+            _rvdk_bsp_cleanup_tmp_mnt
+            continue
+        fi
+        rmdir "$_RVDK_BSP_TMP_MNT" 2>/dev/null || true
+        _RVDK_BSP_TMP_MNT=""
+
+        if [[ "$need_uuid_fix" == "true" ]]; then
+            tune2fs -U "$new_uuid" "$root_part" >/dev/null
+            log_ok "De-collided duplicate ${mmc_kind} ext4 UUID on ${root_part} -> ${new_uuid}"
+        fi
+        if [[ "$need_label_fix" == "true" ]]; then
             e2label "$root_part" "$want_lbl"
             log_ok "Labeled ${mmc_kind} ext4 rootfs: ${root_part} -> ${want_lbl}"
-        else
-            log_skip "${mmc_kind} ext4 rootfs label already converged (${root_part} = ${want_lbl})"
         fi
+        sync
     done
 
     if [[ "$found_any" != "true" ]]; then

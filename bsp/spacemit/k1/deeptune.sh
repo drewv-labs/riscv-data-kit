@@ -65,6 +65,60 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
             [[ -n "$_own" ]] && chown "$_own" "$_tmp"
             mv -f "$_tmp" "$_dst"
         }
+        rvdk_sudo_preserve() {
+            [[ $# -gt 0 ]] || return 1
+            local -a _allow=(
+                RVDK_ALLOW_CIDR RVDK_APT_DISTRO_DEFAULT RVDK_ARCH RVDK_BACKUP_ROOT
+                RVDK_BASE_URL RVDK_BOARD RVDK_BOARDS_DIR RVDK_BOARD_QUIRKS RVDK_BOARD_TAG
+                RVDK_BOOT_BACKUP_DIR RVDK_BRANCH RVDK_CACHE_DIR RVDK_DEEPTUNE_CHAIN
+                RVDK_DEEPTUNE_ENV RVDK_DEEPTUNE_LAYERS RVDK_DT_MODEL RVDK_ENGINE_DIR
+                RVDK_ENV_FILE RVDK_FLASH_FORCE_RAW RVDK_HOSTNAME RVDK_KEEP_VENDOR_MIRRORS
+                RVDK_KIT_CACHE_FILE RVDK_LOCALE RVDK_MAX_VALID_EPOCH RVDK_MIN_VALID_EPOCH
+                RVDK_MIRROR_URL RVDK_MMU RVDK_NO_APT_UPDATE RVDK_NO_PROGBAR RVDK_OS_ID
+                RVDK_OS_VERSION_ID RVDK_P550_HDMI_STATE_FILE RVDK_P550_PLAT_DRV_BASE
+                RVDK_PARENT_BADGE_SGR RVDK_PARENT_BAR_SGR RVDK_PARENT_LABEL
+                RVDK_PARENT_PROGBAR RVDK_PARENT_STATE RVDK_PRIMARY_NIC
+                RVDK_PROGBAR_SESSION RVDK_PROG_BASE RVDK_PROG_SPAN RVDK_RELEASE_BASE
+                RVDK_REPO_URL RVDK_SECONDARY_NIC RVDK_SKIP_NET_GUARD RVDK_SOC
+                RVDK_SOC_SLUG RVDK_STATE_DIR RVDK_SUB_STATE RVDK_SYSTEMD_UNIT_DIR
+                RVDK_TIMEZONE RVDK_TUNE RVDK_TUNE_MODE
+            )
+            local -a _present=()
+            local _v _csv=""
+            for _v in "${_allow[@]}"; do
+                if [[ -n "${!_v+x}" ]]; then
+                    _present+=("$_v")
+                fi
+            done
+            local _rc=0
+            if [[ ${#_present[@]} -eq 0 ]]; then
+                sudo "$@" || _rc=$?
+                return "$_rc"
+            fi
+            for _v in "${_present[@]}"; do
+                _csv="${_csv:+${_csv},}${_v}"
+            done
+            local _probe_err="" _probe_rc=0
+            _probe_err="$(sudo --preserve-env="$_csv" -n true 2>&1)" || _probe_rc=$?
+            if [[ "$_probe_rc" -eq 0 ]]; then
+                sudo --preserve-env="$_csv" "$@" || _rc=$?
+                return "$_rc"
+            fi
+            if [[ "$_probe_err" =~ (not[[:space:]]+allowed|SETENV|preserve-env|unrecognized[[:space:]]+option|unknown[[:space:]]+option|illegal[[:space:]]+option|invalid[[:space:]]+option|unexpected[[:space:]]+argument) ]] \
+                || sudo -n true >/dev/null 2>&1; then
+                sudo "$@" || _rc=$?
+                return "$_rc"
+            fi
+            if sudo -v; then
+                if sudo --preserve-env="$_csv" -n true >/dev/null 2>&1; then
+                    sudo --preserve-env="$_csv" "$@" || _rc=$?
+                    return "$_rc"
+                fi
+                sudo "$@" || _rc=$?
+                return "$_rc"
+            fi
+            return 1
+        }
     fi
 fi
 if [[ -z "${_RVDK_KIT_SH_LOADED:-}" ]]; then
@@ -186,11 +240,16 @@ if [[ "$ACTION" != "status" ]]; then
     [[ -n "${RVDK_PRIMARY_NIC:-}" ]] && _k1_validate_nic "$RVDK_PRIMARY_NIC" "RVDK_PRIMARY_NIC"
     [[ -n "${RVDK_SECONDARY_NIC:-}" ]] && _k1_validate_nic "$RVDK_SECONDARY_NIC" "RVDK_SECONDARY_NIC"
     [[ -n "${SECONDARY_NIC:-}" ]] && _k1_validate_nic "$SECONDARY_NIC" "SECONDARY_NIC"
+    if [[ -n "${SECONDARY_NIC:-}" && -z "${RVDK_SECONDARY_NIC:-}" ]]; then
+        export RVDK_SECONDARY_NIC="$SECONDARY_NIC"
+    fi
 fi
 
 if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
+        _sudo_rc=0
+        rvdk_sudo_preserve bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} || _sudo_rc=$?
+        exit "$_sudo_rc"
     else
         log_fatal "Root privileges required. Pipe into 'sudo bash' or run via 'sudo rvdk deeptune'."
     fi
@@ -203,20 +262,6 @@ if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
     DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
 fi
 DT_MODEL_LC="$(tr '[:upper:]' '[:lower:]' <<< "$DT_MODEL")"
-
-_K1_IS_ORANGEPI="false"
-_K1_IS_ORANGEPI_RV2="false"
-if [[ "${RVDK_BOARD:-}" == orangepi/* || "$DT_MODEL_LC" == *"orangepi"* || "$DT_MODEL_LC" == *"orange pi"* ]]; then
-    _K1_IS_ORANGEPI="true"
-fi
-if [[ "${RVDK_BOARD:-}" == "orangepi/rv2" || "$DT_MODEL_LC" == *"orangepi-rv2"* || "$DT_MODEL_LC" == *"orangepi rv2"* || "$DT_MODEL_LC" == *"orange pi rv2"* ]]; then
-    _K1_IS_ORANGEPI_RV2="true"
-fi
-_K1_OPI_AFTER=""
-if [[ "$_K1_IS_ORANGEPI" == "true" ]] \
-    || [[ -f /etc/systemd/system/orangepi-hardware-optimize.service || -f /lib/systemd/system/orangepi-hardware-optimize.service || -f /usr/lib/systemd/system/orangepi-hardware-optimize.service ]]; then
-    _K1_OPI_AFTER=" orangepi-hardware-optimize.service"
-fi
 
 if [[ "$FORCE_SOC" != "true" && "${RVDK_SOC:-}" != "spacemit/k1" ]]; then
     case "$DT_MODEL_LC" in
@@ -376,9 +421,6 @@ log_info "Converging SpacemiT K1 / Ky X1 Silicon DeepTune (--tune ${TUNE_LABEL} 
 rvdk_prog 35 "SpacemiT K1 DeepTune: converging wireless, audio & GPU/Hailo modules (--tune ${TUNE_LABEL})..."
 
 MOD_LOAD_CFGS=(/etc/modules)
-if [[ "$_K1_IS_ORANGEPI_RV2" == "true" && -f /etc/modules-load.d/orangepirv2.conf ]]; then
-    MOD_LOAD_CFGS+=(/etc/modules-load.d/orangepirv2.conf)
-fi
 
 RESTORED_WIFI_AUTOLOAD="false"
 _K1_WAS_WIFI_BLACKLISTED="false"
@@ -543,7 +585,7 @@ if [[ "$TUNE_MODE" == "iot" ]]; then
 
     WANT_IOT_GOV_UNIT="[Unit]
 Description=RVDK SpacemiT K1 IoT CPUFreq Governor (schedutil -> ondemand -> performance)
-After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service${_K1_OPI_AFTER} armbian-hardware-optimize.service spacemit-k1-cpufreq-performance.service
+After=multi-user.target power-profiles-daemon.service ondemand.service cpufrequtils.service armbian-hardware-optimize.service spacemit-k1-cpufreq-performance.service
 
 [Service]
 Type=oneshot
@@ -643,7 +685,7 @@ WANT_IRQ_SCRIPT="${_k1_irq_header}"$'\n'"PRIMARY_NIC=${_q_primary_nic}"$'\n'"SEC
 
 WANT_IRQ_UNIT="[Unit]
 Description=RVDK SpacemiT K1 Dual-Cluster X60 Interrupt & RPS Affinity (${PRIMARY_NIC} + xHCI + MMC)
-After=network-online.target multi-user.target${_K1_OPI_AFTER} armbian-hardware-optimize.service
+After=network-online.target multi-user.target armbian-hardware-optimize.service
 Wants=network-online.target
 
 [Service]

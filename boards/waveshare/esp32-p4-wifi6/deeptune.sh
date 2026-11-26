@@ -74,6 +74,79 @@ fi
 
 rvdk_log_init "RVDK:WAVESHARE-P4-DEEPTUNE"
 
+if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
+    rvdk_sudo_preserve() {
+        [[ $# -gt 0 ]] || return 1
+        local -a _allowlist=(
+            RVDK_ARCH
+            RVDK_BACKUP_ROOT
+            RVDK_BOARD
+            RVDK_BOARD_TAG
+            RVDK_DEEPTUNE_CHAIN
+            RVDK_DEEPTUNE_ENV
+            RVDK_DEEPTUNE_LAYERS
+            RVDK_DT_MODEL
+            RVDK_ENV_FILE
+            RVDK_KIT_CACHE_FILE
+            RVDK_MMU
+            RVDK_NO_APT_UPDATE
+            RVDK_NO_PROGBAR
+            RVDK_OS_ID
+            RVDK_OS_VERSION_ID
+            RVDK_PARENT_BADGE_SGR
+            RVDK_PARENT_BAR_SGR
+            RVDK_PARENT_LABEL
+            RVDK_PARENT_PROGBAR
+            RVDK_PARENT_STATE
+            RVDK_PROGBAR_SESSION
+            RVDK_PROG_BASE
+            RVDK_PROG_SPAN
+            RVDK_SOC
+            RVDK_SOC_SLUG
+            RVDK_STATE_DIR
+            RVDK_SUB_STATE
+            RVDK_TUNE
+            RVDK_TUNE_MODE
+        )
+        local preserve_csv=""
+        local var_name
+        for var_name in "${_allowlist[@]}"; do
+            if [[ -n "${!var_name+x}" ]]; then
+                preserve_csv+="${preserve_csv:+,}${var_name}"
+            fi
+        done
+
+        local rc=0
+        if [[ -z "$preserve_csv" ]]; then
+            sudo "$@" || rc=$?
+            return "$rc"
+        fi
+
+        local probe_err="" probe_rc=0
+        probe_err="$(sudo --preserve-env="$preserve_csv" -n true 2>&1)" || probe_rc=$?
+        if [[ "$probe_rc" -eq 0 ]]; then
+            sudo --preserve-env="$preserve_csv" "$@" || rc=$?
+            return "$rc"
+        fi
+
+        if [[ "$probe_err" =~ (not[[:space:]]+allowed|SETENV|preserve-env|unrecognized[[:space:]]+option|unknown[[:space:]]+option|illegal[[:space:]]+option|invalid[[:space:]]+option|unexpected[[:space:]]+argument) ]] \
+            || sudo -n true >/dev/null 2>&1; then
+            sudo "$@" || rc=$?
+            return "$rc"
+        fi
+
+        if sudo -v; then
+            if sudo --preserve-env="$preserve_csv" -n true >/dev/null 2>&1; then
+                sudo --preserve-env="$preserve_csv" "$@" || rc=$?
+                return "$rc"
+            fi
+            sudo "$@" || rc=$?
+            return "$rc"
+        fi
+        return 1
+    }
+fi
+
 ACTION="apply"
 TUNE_REQUEST="${RVDK_TUNE:-}"
 STAGE_DIR=""
@@ -179,8 +252,10 @@ if [[ "$ACTION" == "status" ]]; then
 fi
 
 if [[ -z "$STAGE_DIR" && "${EUID:-$(id -u)}" -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
+        _rvdk_sudo_rc=0
+        rvdk_sudo_preserve bash "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} || _rvdk_sudo_rc=$?
+        exit "$_rvdk_sudo_rc"
     else
         log_fatal "Root privileges required for on-target /etc/rvdk writes (or pass --stage-dir <dir>)."
     fi

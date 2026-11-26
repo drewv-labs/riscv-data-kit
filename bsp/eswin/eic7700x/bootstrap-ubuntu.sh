@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // SiFive HiFive Premier P550 / Milk-V Megrez (ESWIN EIC7700X) BSP
+# DREW-V Labs // ESWIN EIC7700X (SiFive P550 Core Complex) Ubuntu/Debian BSP
 # Path: riscv-data-kit/bsp/eswin/eic7700x/bootstrap-ubuntu.sh
 # Description: Bootloader protection, SSH-safe wired NIC check, sleep target
-#              lockout, cpufreq performance governor, PWM fan control, and
-#              KASLR-safe SiFive P550 PMU counter exposure for ESWIN EIC7700X.
+#              lockout, cpufreq performance governor, and KASLR-safe SiFive
+#              P550 PMU counter exposure for ESWIN EIC7700X.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -20,7 +20,7 @@ fi
 _REPO_ROOT=""
 [[ -n "$_SCRIPT_DIR" ]] && _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
 
-# @RVDK_INLINE_LIBS: common apt bsp progbar
+# @RVDK_INLINE_LIBS: common bsp progbar
 if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
     if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/common.sh" ]]; then
         # shellcheck source=lib/common.sh
@@ -34,12 +34,6 @@ if [[ -z "${_RVDK_COMMON_SH_LOADED:-}" ]]; then
         rvdk_log_init() { :; }
         rvdk_require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || log_fatal "Root privileges required."; }
         rvdk_sanitize_locale() { export LANG="C.UTF-8" LC_ALL="C.UTF-8"; }
-    fi
-fi
-if [[ -z "${_RVDK_APT_SH_LOADED:-}" ]]; then
-    if [[ -n "$_REPO_ROOT" && -f "${_REPO_ROOT}/lib/apt.sh" ]]; then
-        # shellcheck source=lib/apt.sh
-        source "${_REPO_ROOT}/lib/apt.sh"
     fi
 fi
 if [[ -z "${_RVDK_BSP_SH_LOADED:-}" ]]; then
@@ -95,33 +89,26 @@ rvdk_sanitize_locale
 rvdk_prog_init "EIC7700X BSP: inspecting device tree..."
 log_info "Detected Device-Tree Model: $(rvdk_bsp_read_dt_model)"
 
+_eic_board_tag="${RVDK_BOARD_TAG:-eic7700x}"
+if [[ ! "$_eic_board_tag" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    log_warn "Invalid RVDK_BOARD_TAG '${_eic_board_tag}'; defaulting to 'eic7700x'"
+    _eic_board_tag="eic7700x"
+fi
+
 rvdk_prog 15 "EIC7700X BSP: protecting bootloader & DTB hooks..."
-rvdk_bsp_protect_dpkg "/etc/apt/apt.conf.d/90-p550-bsp-protect" "ESWIN EIC7700X U-Boot/DTB"
+rvdk_bsp_protect_dpkg "/etc/apt/apt.conf.d/90-${_eic_board_tag}-bsp-protect" "ESWIN EIC7700X U-Boot/DTB"
 rvdk_bsp_backup_boot_configs /boot/extlinux/extlinux.conf /boot/efi/extlinux.conf
 
-rvdk_prog 35 "EIC7700X BSP: checking primary wired NIC (end0)..."
-rvdk_bsp_persist_wired_nic "p550" end0 eth0
+rvdk_prog 35 "EIC7700X BSP: checking primary wired NIC..."
+rvdk_bsp_persist_wired_nic "${_eic_board_tag}" end0 eth0
 
 rvdk_prog 55 "EIC7700X BSP: masking sleep/suspend targets..."
 rvdk_bsp_mask_sleep_targets
 
-rvdk_prog 75 "EIC7700X BSP: locking P550 performance governor..."
+rvdk_prog 75 "EIC7700X BSP: locking SiFive P550 performance governor..."
 rvdk_bsp_lock_cpufreq_performance "eic7700x" "Lock ESWIN EIC7700X SiFive P550 Harts to Performance Governor"
 
-rvdk_prog 90 "EIC7700X BSP: PWM fan controller & P550 PMU unlock..."
-if [[ "${RVDK_BOARD:-}" == "sifive/p550" ]]; then
-    if command -v apt-cache >/dev/null 2>&1 && apt-cache show fancontrol-config-p550-premier >/dev/null 2>&1; then
-        if ! dpkg -s fancontrol-config-p550-premier >/dev/null 2>&1; then
-            rvdk_apt_ensure fancontrol-config-p550-premier
-            log_ok "Installed fancontrol-config-p550-premier"
-        else
-            log_skip "fancontrol-config-p550-premier already installed"
-        fi
-    fi
-else
-    log_skip "Skipping fancontrol-config-p550-premier (board=${RVDK_BOARD:-unspecified}, requires sifive/p550)"
-fi
-
+rvdk_prog 90 "EIC7700X BSP: unlocking SiFive P550 PMU counters..."
 rvdk_bsp_unlock_pmu "/etc/sysctl.d/90-sifive-p550-pmu.conf" "SiFive P550 L1/PL2/L3" "$EXPOSE_KALLSYMS"
 
 rvdk_prog 100 "ESWIN EIC7700X BSP hardening complete"

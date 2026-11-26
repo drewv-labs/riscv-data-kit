@@ -22,6 +22,7 @@ set -Eeuo pipefail
 
 ORIG_ARGS=("$@")
 export DEBIAN_FRONTEND=noninteractive
+# shellcheck disable=SC2034 # Consumed by lib/apt.sh rvdk_apt_ensure
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 _SCRIPT_DIR=""
@@ -88,10 +89,10 @@ rvdk_log_init "RVDK:NVME"
 
 usage() {
     cat <<'EOF'
-Usage: sudo rvdk mods/nvme-4kn [options]
+Usage: sudo rvdk mods/nvme-4kn --device <dev> [options]
 
 Options:
-  --device <dev>            Target NVMe namespace (default: /dev/nvme0n1)
+  --device <dev>            Target NVMe block device (required unless NVME_DEV is set in config.env)
   --mount <path>            Primary mountpoint (default: /mnt/nvme_data)
   --label <label>           Primary filesystem label (default: RVDK_NVME)
   --fs <auto|xfs|ext4|btrfs> Primary filesystem type (default: auto -> xfs, ext4 fallback)
@@ -107,6 +108,7 @@ Options:
   --secondary-pct <pct>     Dual-LV secondary allocation (default: 30%VG)
   --no-lvm                  Use raw GPT partition instead of LVM2
   --force-wipe              Permit wiping pre-existing non-OS filesystems on --device
+  -y, --yes                 Confirm destructive --force-wipe non-interactively
   --no-apt-update           Skip redundant apt-get update calls
   --noprogbar               Disable persistent bottom progress bar
   -h, --help                Show this help message and exit
@@ -130,7 +132,7 @@ rvdk_load_config_env \
     DUAL_PRIMARY_PCT DUAL_SECONDARY_PCT DUAL_NFS_PCT \
     USE_LVM FORCE_WIPE_NVME
 
-NVME_DEV="${NVME_DEV:-/dev/nvme0n1}"
+NVME_DEV="${NVME_DEV:-}"
 MOUNT_POINT="${MOUNT_POINT:-/mnt/nvme_data}"
 FS_LABEL="${FS_LABEL:-RVDK_NVME}"
 VG_NAME="${VG_NAME:-vg_rvdk}"
@@ -148,6 +150,7 @@ DUAL_SECONDARY_PCT="${DUAL_SECONDARY_PCT:-${DUAL_NFS_PCT:-30%VG}}"
 
 USE_LVM="${USE_LVM:-true}"
 FORCE_WIPE="${FORCE_WIPE_NVME:-false}"
+SKIP_CONFIRM="false"
 
 _require_arg() {
     [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '$1' requires an argument."
@@ -157,6 +160,7 @@ _require_arg() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --device)                               _require_arg "$1" "${2:-}"; NVME_DEV="$2"; shift 2 ;;
+        --device=*)                             NVME_DEV="${1#*=}"; [[ -n "$NVME_DEV" ]] || log_fatal "Option '--device=' requires an argument."; shift ;;
         --mount)                                _require_arg "$1" "${2:-}"; MOUNT_POINT="$2"; shift 2 ;;
         --label)                                _require_arg "$1" "${2:-}"; FS_LABEL="$2"; shift 2 ;;
         --fs|--fstype)                          _require_arg "$1" "${2:-}"; PRIMARY_FSTYPE="$2"; shift 2 ;;
@@ -173,12 +177,71 @@ while [[ $# -gt 0 ]]; do
         --secondary-pct|--nfs-pct)              _require_arg "$1" "${2:-}"; DUAL_SECONDARY_PCT="$2"; shift 2 ;;
         --no-lvm)                               USE_LVM="false"; shift ;;
         --force-wipe|--force-wipe-nvme)         FORCE_WIPE="true"; shift ;;
+        -y|--yes)                               SKIP_CONFIRM="true"; shift ;;
         --no-apt-update|--skip-apt-update)      export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)               export RVDK_NO_PROGBAR="1"; shift ;;
         -h|--help)                              usage; exit 0 ;;
         *)                                      log_fatal "Unknown argument: $1 (try --help)" ;;
     esac
 done
+
+_nvme_list_candidates() {
+    local -a candidates=()
+    local lsblk_out="" line="" path="" size="" type="" model="" entry="" sys_node="" blk_name="" sz_bytes=""
+    if command -v lsblk >/dev/null 2>&1; then
+        lsblk_out="$(lsblk -dn -o PATH,SIZE,TYPE,MODEL 2>/dev/null || true)"
+        if [[ -z "$lsblk_out" ]]; then
+            lsblk_out="$(lsblk -dn -o PATH,SIZE,TYPE 2>/dev/null || true)"
+        fi
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            read -r path size type model <<< "$line"
+            [[ "$path" == /dev/nvme* ]] || continue
+            if [[ -n "$type" && "$type" != "disk" ]]; then
+                continue
+            fi
+            if [[ -z "$type" && ! "$path" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]]; then
+                continue
+            fi
+            entry="${path}"
+            [[ -n "$size" ]] && entry="${entry} (${size}${model:+ ${model}})"
+            candidates+=("$entry")
+        done <<< "$lsblk_out"
+    fi
+    if (( ${#candidates[@]} == 0 )) && compgen -G "/sys/block/nvme*" >/dev/null 2>&1; then
+        for sys_node in /sys/block/nvme*; do
+            [[ -e "$sys_node" ]] || continue
+            blk_name="$(basename "$sys_node")"
+            sz_bytes=""
+            if [[ -r "${sys_node}/size" ]]; then
+                sz_bytes="$(cat "${sys_node}/size" 2>/dev/null || true)"
+            fi
+            if [[ "$sz_bytes" =~ ^[0-9]+$ ]] && (( sz_bytes > 0 )); then
+                candidates+=("/dev/${blk_name} ($(( (sz_bytes * 512) / 1073741824 ))GiB)")
+            else
+                candidates+=("/dev/${blk_name}")
+            fi
+        done
+    fi
+    if (( ${#candidates[@]} == 0 )); then
+        printf 'none detected'
+    else
+        local joined="" c=""
+        for c in "${candidates[@]}"; do
+            if [[ -z "$joined" ]]; then
+                joined="$c"
+            else
+                joined="${joined}, ${c}"
+            fi
+        done
+        printf '%s' "$joined"
+    fi
+}
+
+if [[ -z "$NVME_DEV" ]]; then
+    _nvme_candidates="$(_nvme_list_candidates)"
+    log_fatal "Missing target NVMe block device: pass --device <dev> (or set NVME_DEV in /etc/rvdk/config.env). Candidate NVMe block devices: ${_nvme_candidates}"
+fi
 
 if [[ "$WITH_NFS_LV" == "true" ]]; then
     SECONDARY_LV_NAME="${CLI_SEC_LV:-${NFS_LV_NAME:-lv_nfsvault}}"
@@ -226,6 +289,20 @@ NVME_DEV="$(readlink -f "$NVME_DEV")"
 [[ ! -b "$NVME_DEV" ]] && log_fatal "NVMe block device not found after canonicalization: ${NVME_DEV}"
 if rvdk_device_backs_os_or_swap "$NVME_DEV"; then
     log_fatal "Safety Interlock: ${NVME_DEV} backs a critical OS filesystem or active SWAP! Aborting."
+fi
+
+if [[ "$FORCE_WIPE" == "true" && "$SKIP_CONFIRM" != "true" ]]; then
+    if [[ -t 0 ]]; then
+        printf "\033[1;33m[CONFIRM]\033[0m --force-wipe will DESTROY existing partitions/data on %s. Continue? [y/N]: " "$NVME_DEV"
+        _wipe_reply=""
+        read -r _wipe_reply || true
+        case "$_wipe_reply" in
+            [Yy]|[Yy][Ee][Ss]) ;;
+            *) log_fatal "Aborted by user." ;;
+        esac
+    else
+        log_fatal "Refusing destructive '--force-wipe' without '--yes' (-y) when stdin is not a TTY."
+    fi
 fi
 
 rvdk_prog_init "NVMe 4Kn: validating ${NVME_DEV}..."

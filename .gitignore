@@ -18,9 +18,12 @@ config.env
 *.tmp
 *.bak
 
-# Python Bytecode (tools/rvdk_ci.py)
+# Python Bytecode & Tooling Caches (tools/rvdk_ci.py, uv, ruff, pytest)
 __pycache__/
 *.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
 
 # OS / Editor / Workspace Artifacts
 .DS_Store

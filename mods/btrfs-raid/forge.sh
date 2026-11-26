@@ -13,6 +13,7 @@ set -Eeuo pipefail
 
 ORIG_ARGS=("$@")
 export DEBIAN_FRONTEND=noninteractive
+# shellcheck disable=SC2034 # Consumed by lib/apt.sh rvdk_apt_ensure
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 _SCRIPT_DIR=""
@@ -191,6 +192,30 @@ _btrfs_converge_fstab_entry() {
     rvdk_converge_fstab_entry "$1" "$2" "btrfs" "$3" "${4:-/etc/fstab}"
 }
 
+_btrfs_collect_explicit_devices() {
+    local arr_name="$1"
+    local devs_raw="$2"
+    _BTRFS_EXPLICIT_DEVS=()
+    local -a _explicit_devs=()
+    local explicit_dev _canon_dev _dup_dev _seen_dev
+    IFS=$'\x1f' read -r -a _explicit_devs <<< "$devs_raw"
+    (( ${#_explicit_devs[@]} > 0 )) || log_fatal "${arr_name}: explicit .devices[] contains an empty device entry."
+    for explicit_dev in "${_explicit_devs[@]}"; do
+        [[ -n "$explicit_dev" ]] || log_fatal "${arr_name}: explicit .devices[] contains an empty device entry."
+        [[ -b "$explicit_dev" ]] || log_fatal "${arr_name}: explicit device '${explicit_dev}' is not a valid block device."
+        _canon_dev="$(readlink -f "$explicit_dev")"
+        [[ -b "$_canon_dev" ]] || log_fatal "${arr_name}: explicit device '${explicit_dev}' resolved to invalid block device '${_canon_dev}'."
+        _dup_dev="false"
+        for _seen_dev in ${_BTRFS_EXPLICIT_DEVS[@]+"${_BTRFS_EXPLICIT_DEVS[@]}"}; do
+            if [[ "$_seen_dev" == "$_canon_dev" ]]; then
+                _dup_dev="true"
+                break
+            fi
+        done
+        [[ "$_dup_dev" == "false" ]] && _BTRFS_EXPLICIT_DEVS+=("$_canon_dev")
+    done
+}
+
 for (( i=0; i<ARRAY_COUNT; i++ )); do
     # Single-pass jq extraction for all per-array scalar & list fields
     _ARR_FIELDS=()
@@ -248,12 +273,78 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
     EFFECTIVE_ARR_LABEL="$ARR_LABEL"
     EFFECTIVE_ARR_SPEC="LABEL=${ARR_LABEL}"
     if [[ -n "$EXISTING_DEV" && "$FORCE_WIPE_RAID" == "false" ]]; then
+        _arr_fstype="$(blkid -s TYPE -o value "$EXISTING_DEV" 2>/dev/null || true)"
+        if [[ "$_arr_fstype" != "btrfs" ]]; then
+            log_fatal "${ARR_NAME}: existing device '${EXISTING_DEV}' (label '${ARR_LABEL}' / mount '${ARR_MOUNT}') has filesystem type '${_arr_fstype:-unknown}', expected 'btrfs'."
+        fi
         _arr_lbl="$(blkid -s LABEL -o value "$EXISTING_DEV" 2>/dev/null || true)"
         _arr_uuid="$(blkid -s UUID -o value "$EXISTING_DEV" 2>/dev/null || true)"
+        [[ -n "$_arr_uuid" ]] || log_fatal "${ARR_NAME}: existing Btrfs device '${EXISTING_DEV}' has no filesystem UUID."
+
+        if mountpoint -q "$ARR_MOUNT" 2>/dev/null; then
+            _mnt_src="$(findmnt -rn -o SOURCE -M "$ARR_MOUNT" 2>/dev/null || true)"
+            _mnt_src="${_mnt_src%%\[*}"
+            if [[ -n "$_mnt_src" ]]; then
+                _mnt_fstype="$(blkid -s TYPE -o value "$_mnt_src" 2>/dev/null || true)"
+                _mnt_uuid="$(blkid -s UUID -o value "$_mnt_src" 2>/dev/null || true)"
+                if [[ "$_mnt_fstype" != "btrfs" || "$_mnt_uuid" != "$_arr_uuid" ]]; then
+                    log_fatal "${ARR_NAME}: mountpoint '${ARR_MOUNT}' is mounted from '${_mnt_src}' (${_mnt_fstype:-unknown}, UUID=${_mnt_uuid:-none}), expected Btrfs UUID=${_arr_uuid}."
+                fi
+            fi
+        fi
+
+        if [[ -n "$ARR_DEVS_RAW" ]] || (( ARR_EXPLICIT_DEVS_CNT > 0 )); then
+            _btrfs_collect_explicit_devices "$ARR_NAME" "$ARR_DEVS_RAW"
+            _existing_canon="$(readlink -f "$EXISTING_DEV" 2>/dev/null || echo "$EXISTING_DEV")"
+            _existing_in_explicit="false"
+            for _cand_dev in "${_BTRFS_EXPLICIT_DEVS[@]}"; do
+                _cand_type="$(blkid -s TYPE -o value "$_cand_dev" 2>/dev/null || true)"
+                _cand_uuid="$(blkid -s UUID -o value "$_cand_dev" 2>/dev/null || true)"
+                if [[ "$_cand_type" != "btrfs" || "$_cand_uuid" != "$_arr_uuid" ]]; then
+                    log_fatal "${ARR_NAME}: explicit device '${_cand_dev}' (${_cand_type:-unknown}, UUID=${_cand_uuid:-none}) does not match existing Btrfs filesystem on ${EXISTING_DEV} (UUID=${_arr_uuid})."
+                fi
+                [[ "$_cand_dev" == "$_existing_canon" ]] && _existing_in_explicit="true"
+            done
+            if [[ "$_existing_in_explicit" != "true" ]]; then
+                log_fatal "${ARR_NAME}: existing Btrfs device '${EXISTING_DEV}' is not in explicit .devices[] (${_BTRFS_EXPLICIT_DEVS[*]})."
+            fi
+
+            _btrfs_show_out="$(btrfs filesystem show "$_arr_uuid" 2>/dev/null || btrfs filesystem show "$EXISTING_DEV" 2>/dev/null || true)"
+            if [[ -n "$_btrfs_show_out" ]]; then
+                _show_total="$(awk '/Total devices[[:space:]]+[0-9]+/ {
+                    for (j = 1; j <= NF; j++) {
+                        if ($j == "devices" && $(j + 1) ~ /^[0-9]+$/) { print $(j + 1); exit }
+                    }
+                }' <<< "$_btrfs_show_out")"
+                if [[ -n "$_show_total" ]] && (( _show_total != ${#_BTRFS_EXPLICIT_DEVS[@]} )); then
+                    log_fatal "${ARR_NAME}: existing Btrfs filesystem (UUID=${_arr_uuid}) spans ${_show_total} member device(s), but explicit .devices[] lists ${#_BTRFS_EXPLICIT_DEVS[@]}."
+                fi
+                while IFS= read -r _member_path; do
+                    [[ -n "$_member_path" ]] || continue
+                    _member_canon="$(readlink -f "$_member_path" 2>/dev/null || echo "$_member_path")"
+                    _member_found="false"
+                    for _cand_dev in "${_BTRFS_EXPLICIT_DEVS[@]}"; do
+                        if [[ "$_cand_dev" == "$_member_canon" ]]; then
+                            _member_found="true"
+                            break
+                        fi
+                    done
+                    if [[ "$_member_found" != "true" ]]; then
+                        log_fatal "${ARR_NAME}: existing Btrfs member '${_member_path}' is missing from explicit .devices[] (${_BTRFS_EXPLICIT_DEVS[*]})."
+                    fi
+                done < <(awk '/^[[:space:]]*devid[[:space:]]+[0-9]+[[:space:]]+.*path[[:space:]]+/ {
+                    sub(/^.*[[:space:]]path[[:space:]]+/, "")
+                    gsub(/\r$/, "")
+                    sub(/[[:space:]]+$/, "")
+                    print
+                }' <<< "$_btrfs_show_out")
+            fi
+        fi
+
         if [[ -n "$_arr_lbl" ]]; then
             EFFECTIVE_ARR_LABEL="$_arr_lbl"
             EFFECTIVE_ARR_SPEC="LABEL=${_arr_lbl}"
-        elif [[ -n "$_arr_uuid" ]]; then
+        else
             EFFECTIVE_ARR_SPEC="UUID=${_arr_uuid}"
         fi
         log_skip "${ARR_NAME} volume '${EFFECTIVE_ARR_LABEL}' already exists on ${EXISTING_DEV}"
@@ -261,22 +352,8 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
         CANDIDATE_DISKS=()
 
         if [[ -n "$ARR_DEVS_RAW" ]] || (( ARR_EXPLICIT_DEVS_CNT > 0 )); then
-            IFS=$'\x1f' read -r -a _explicit_devs <<< "$ARR_DEVS_RAW"
-            (( ${#_explicit_devs[@]} > 0 )) || log_fatal "${ARR_NAME}: explicit .devices[] contains an empty device entry."
-            for explicit_dev in "${_explicit_devs[@]}"; do
-                [[ -n "$explicit_dev" ]] || log_fatal "${ARR_NAME}: explicit .devices[] contains an empty device entry."
-                [[ -b "$explicit_dev" ]] || log_fatal "${ARR_NAME}: explicit device '${explicit_dev}' is not a valid block device."
-                _canon_dev="$(readlink -f "$explicit_dev")"
-                [[ -b "$_canon_dev" ]] || log_fatal "${ARR_NAME}: explicit device '${explicit_dev}' resolved to invalid block device '${_canon_dev}'."
-                _dup_dev="false"
-                for _seen_dev in ${CANDIDATE_DISKS[@]+"${CANDIDATE_DISKS[@]}"}; do
-                    if [[ "$_seen_dev" == "$_canon_dev" ]]; then
-                        _dup_dev="true"
-                        break
-                    fi
-                done
-                [[ "$_dup_dev" == "false" ]] && CANDIDATE_DISKS+=("$_canon_dev")
-            done
+            _btrfs_collect_explicit_devices "$ARR_NAME" "$ARR_DEVS_RAW"
+            CANDIDATE_DISKS=("${_BTRFS_EXPLICIT_DEVS[@]}")
         else
             while IFS= read -r line; do
                 [[ -z "$line" ]] && continue
@@ -337,17 +414,12 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
     fi
 
     mkdir -p "$ARR_MOUNT"
-    ARR_FSTYPE=""
-    if [[ -n "$EXISTING_DEV" ]]; then
+    if [[ -n "$EXISTING_DEV" && "$FORCE_WIPE_RAID" == "false" ]]; then
         ARR_FSTYPE="$(blkid -s TYPE -o value "$EXISTING_DEV" 2>/dev/null || true)"
+        [[ "$ARR_FSTYPE" == "btrfs" ]] || log_fatal "${ARR_NAME}: existing device '${EXISTING_DEV}' has filesystem type '${ARR_FSTYPE:-unknown}', expected 'btrfs'."
     fi
-    [[ -z "$ARR_FSTYPE" ]] && ARR_FSTYPE="btrfs"
-    if [[ "$ARR_FSTYPE" == "btrfs" ]]; then
-        FSTAB_RAID="${EFFECTIVE_ARR_SPEC}  ${ARR_MOUNT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=30s  0  2"
-    else
-        FSTAB_RAID="${EFFECTIVE_ARR_SPEC}  ${ARR_MOUNT}  ${ARR_FSTYPE}  rw,noatime,nofail,x-systemd.device-timeout=30s  0  2"
-    fi
-    rvdk_converge_fstab_entry "$EFFECTIVE_ARR_SPEC" "$ARR_MOUNT" "$ARR_FSTYPE" "$FSTAB_RAID"
+    FSTAB_RAID="${EFFECTIVE_ARR_SPEC}  ${ARR_MOUNT}  btrfs  rw,noatime,compress=zstd:3,space_cache=v2,nofail,x-systemd.device-timeout=30s  0  2"
+    rvdk_converge_fstab_entry "$EFFECTIVE_ARR_SPEC" "$ARR_MOUNT" "btrfs" "$FSTAB_RAID"
 
     if ! mountpoint -q "$ARR_MOUNT"; then
         mount "$ARR_MOUNT"
