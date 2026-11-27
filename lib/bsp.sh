@@ -329,6 +329,56 @@ _rvdk_bsp_rewrite_boot_configs() {
     return 0
 }
 
+_rvdk_bsp_rollback_peer_configs() {
+    local root_part="$1"
+    local boot_slice="$2"
+    local revert_from_uuid="$3"
+    local revert_to_uuid="$4"
+    local revert_from_lbl="$5"
+    local revert_to_lbl="$6"
+
+    _RVDK_BSP_TMP_MNT="$(mktemp -d "/tmp/rvdk_mmc_uuid.XXXXXX")"
+    if ! mount "$root_part" "$_RVDK_BSP_TMP_MNT" 2>/dev/null; then
+        log_err "Rollback failed: unable to remount ${root_part} to restore boot configs."
+        _rvdk_bsp_cleanup_tmp_mnt
+        return 1
+    fi
+    if [[ -n "$boot_slice" ]]; then
+        if [[ -L "${_RVDK_BSP_TMP_MNT}/boot" || ! -d "${_RVDK_BSP_TMP_MNT}/boot" ]] || ! mount "$boot_slice" "${_RVDK_BSP_TMP_MNT}/boot" 2>/dev/null; then
+            log_err "Rollback failed: unable to remount ${boot_slice} to restore /boot configs."
+            _rvdk_bsp_cleanup_tmp_mnt
+            return 1
+        fi
+        _RVDK_BSP_TMP_BOOT_MNT="${_RVDK_BSP_TMP_MNT}/boot"
+    fi
+
+    local rb_ok="true"
+    if ! _rvdk_bsp_rewrite_boot_configs "$_RVDK_BSP_TMP_MNT" "$revert_from_uuid" "$revert_to_uuid" "$revert_from_lbl" "$revert_to_lbl"; then
+        log_err "Rollback failed: unable to restore original boot configs on ${root_part}."
+        rb_ok="false"
+    fi
+    sync
+    if [[ -n "${_RVDK_BSP_TMP_BOOT_MNT:-}" ]]; then
+        if ! umount "$_RVDK_BSP_TMP_BOOT_MNT" 2>/dev/null; then
+            log_err "Rollback warning: failed to unmount ${_RVDK_BSP_TMP_BOOT_MNT} cleanly."
+            rb_ok="false"
+        else
+            _RVDK_BSP_TMP_BOOT_MNT=""
+        fi
+    fi
+    if [[ -n "${_RVDK_BSP_TMP_MNT:-}" ]]; then
+        if ! umount "$_RVDK_BSP_TMP_MNT" 2>/dev/null; then
+            log_err "Rollback warning: failed to unmount ${_RVDK_BSP_TMP_MNT} cleanly."
+            rb_ok="false"
+        else
+            rmdir "$_RVDK_BSP_TMP_MNT" 2>/dev/null || true
+            _RVDK_BSP_TMP_MNT=""
+        fi
+    fi
+    _rvdk_bsp_cleanup_tmp_mnt
+    [[ "$rb_ok" == "true" ]]
+}
+
 # Converge non-colliding ext4 rootfs labels (`rvdk_sd_root` vs `rvdk_emmc_root`)
 # and repair duplicate UUIDs across dual-populated SD + eMMC SBCs.
 rvdk_bsp_converge_mmc_root_labels() {
@@ -384,8 +434,11 @@ rvdk_bsp_converge_mmc_root_labels() {
         mmc_name="$(basename "$sys_mmc")"
         [[ "$mmc_name" =~ ^mmcblk[0-9]+$ ]] || continue
 
-        dev_type=""
-        [[ -r "${sys_mmc}/device/type" ]] && dev_type="$(tr -d '[:space:]' < "${sys_mmc}/device/type" 2>/dev/null || true)"
+        if [[ ! -r "${sys_mmc}/device/type" ]]; then
+            log_warn "Cannot read ${sys_mmc}/device/type; skipping ${mmc_name} without guessing SD/eMMC identity."
+            continue
+        fi
+        dev_type="$(tr -d '[:space:]' < "${sys_mmc}/device/type" 2>/dev/null || true)"
         case "$dev_type" in
             SDIO) continue ;;
             SD|SDcombo)
@@ -397,11 +450,8 @@ rvdk_bsp_converge_mmc_root_labels() {
                 want_lbl="rvdk_emmc_root"
                 ;;
             *)
-                case "$mmc_name" in
-                    mmcblk0) mmc_kind="SD";   want_lbl="rvdk_sd_root" ;;
-                    mmcblk2) mmc_kind="eMMC"; want_lbl="rvdk_emmc_root" ;;
-                    *)       continue ;;
-                esac
+                log_warn "Unrecognized MMC device/type '${dev_type:-<empty>}' at ${sys_mmc}/device/type; skipping ${mmc_name}."
+                continue
                 ;;
         esac
 
@@ -515,6 +565,7 @@ rvdk_bsp_converge_mmc_root_labels() {
 
         if ! _rvdk_bsp_rewrite_boot_configs "$_RVDK_BSP_TMP_MNT" "$rewrite_old_uuid" "$rewrite_new_uuid" "$rewrite_old_lbl" "$rewrite_new_lbl"; then
             log_warn "Failed to update boot configs on peer ${mmc_kind} (${root_part}); aborting peer UUID/label convergence without altering superblocks."
+            _rvdk_bsp_rewrite_boot_configs "$_RVDK_BSP_TMP_MNT" "$rewrite_new_uuid" "$rewrite_old_uuid" "$rewrite_new_lbl" "$rewrite_old_lbl" || true
             _rvdk_bsp_cleanup_tmp_mnt
             continue
         fi
@@ -537,11 +588,30 @@ rvdk_bsp_converge_mmc_root_labels() {
         _RVDK_BSP_TMP_MNT=""
 
         if [[ "$need_uuid_fix" == "true" ]]; then
-            tune2fs -U "$new_uuid" "$root_part" >/dev/null
+            local post_fsck_rc=0
+            e2fsck -pf "$root_part" >/dev/null 2>&1 || post_fsck_rc=$?
+            if (( post_fsck_rc > 1 )); then
+                log_err "Post-unmount e2fsck returned ${post_fsck_rc} on ${root_part}; reverting rewritten boot configs."
+                _rvdk_bsp_rollback_peer_configs "$root_part" "$boot_slice" "$rewrite_new_uuid" "$rewrite_old_uuid" "$rewrite_new_lbl" "$rewrite_old_lbl" || true
+                return 1
+            fi
+            if ! tune2fs -U "$new_uuid" "$root_part" >/dev/null; then
+                log_err "tune2fs -U failed on ${root_part}; reverting rewritten boot configs."
+                _rvdk_bsp_rollback_peer_configs "$root_part" "$boot_slice" "$rewrite_new_uuid" "$rewrite_old_uuid" "$rewrite_new_lbl" "$rewrite_old_lbl" || true
+                return 1
+            fi
             log_ok "De-collided duplicate ${mmc_kind} ext4 UUID on ${root_part} -> ${new_uuid}"
         fi
         if [[ "$need_label_fix" == "true" ]]; then
-            e2label "$root_part" "$want_lbl"
+            if ! e2label "$root_part" "$want_lbl"; then
+                if [[ -n "$rewrite_new_lbl" ]]; then
+                    log_err "e2label failed on ${root_part}; reverting rewritten label configs."
+                    _rvdk_bsp_rollback_peer_configs "$root_part" "$boot_slice" "" "" "$rewrite_new_lbl" "$rewrite_old_lbl" || true
+                else
+                    log_err "e2label failed on ${root_part}."
+                fi
+                return 1
+            fi
             log_ok "Labeled ${mmc_kind} ext4 rootfs: ${root_part} -> ${want_lbl}"
         fi
         sync

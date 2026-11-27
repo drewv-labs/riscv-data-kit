@@ -18,6 +18,7 @@ set -Eeuo pipefail
 
 ORIG_ARGS=("$@")
 export DEBIAN_FRONTEND=noninteractive
+# shellcheck disable=SC2034 # Consumed by lib/apt.sh rvdk_apt_ensure
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 _SCRIPT_DIR=""
@@ -189,7 +190,9 @@ case "$TRACK" in
     stable|unstable) ;;
     *) log_fatal "Unknown Tailscale track '${TRACK}' (expected: stable | unstable)" ;;
 esac
-[[ "$TS_PORT" =~ ^[0-9]+$ ]] && (( TS_PORT >= 1 && TS_PORT <= 65535 )) || log_fatal "Invalid --port '${TS_PORT}'."
+if [[ ! "$TS_PORT" =~ ^[0-9]+$ ]] || (( TS_PORT < 1 || TS_PORT > 65535 )); then
+    log_fatal "Invalid --port '${TS_PORT}'."
+fi
 if [[ -n "$TS_HOSTNAME" ]] && ! rvdk_validate_hostname "$TS_HOSTNAME"; then
     log_fatal "Invalid --hostname '${TS_HOSTNAME}'."
 fi

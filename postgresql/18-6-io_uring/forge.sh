@@ -5,7 +5,9 @@
 #
 # Security, Supply-Chain & Performance Hardening:
 #   • SHA-256 verifies precompiled binary bundles prior to extraction
-#     (failing fast unless pinned in catalog or --bundle-sha256 / --allow-remote-sha256 / --force-build)
+#     (reading pinned digests from catalog/bundles.json and falling back cleanly
+#     to verified PGDG source compilation unless --prebuilt-only or a custom URL
+#     lacks a SHA-256 pin)
 #   • Verifies PGDG signing key fingerprint (B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8)
 #     and compiles source packages under unprivileged `_apt` account
 #   • Consolidates silicon compiler profiles via `lib/kit.sh` (including QEMU riscv64-generic)
@@ -125,6 +127,7 @@ Options:
   --auto-subnet                      Auto-detect primary NIC IPv4 subnet for --allow-cidr
   --register-tablespace <name>:<dir> Create & idempotently register PostgreSQL tablespace (repeatable)
   --force-build                      Compile PostgreSQL 18 from PGDG source with SoC -march/-mtune flags
+  --prebuilt-only                    Require verified prebuilt bundle (never fall back to source compilation)
   --keep-build-dir                   Retain build workspace after --force-build
   --bundle-sha256 <hex64>            Expected SHA-256 digest for prebuilt .tar.zst bundle
   --allow-remote-sha256              Trust same-origin .sha256 sidecar when --bundle-sha256 is unset
@@ -153,7 +156,9 @@ rvdk_load_config_env \
     PG_PREBUILT_DEB_URL PG_PREBUILT_SHA256 RVDK_RELEASE_BASE
 
 PG_VERSION="18"
+PG_CATALOG_VERSION="18.6"
 FORCE_BUILD="false"
+PREBUILT_ONLY="false"
 KEEP_BUILD_DIR="false"
 ALLOW_REMOTE_SHA="false"
 SKIP_BUNDLE_SHA="false"
@@ -176,6 +181,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --force-build|--force-rebuild-pg|--compile)
             FORCE_BUILD="true"; shift ;;
+        --prebuilt-only)
+            PREBUILT_ONLY="true"; shift ;;
         --keep-build-dir)
             KEEP_BUILD_DIR="true"; shift ;;
         --bundle-sha256)
@@ -209,6 +216,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$FORCE_BUILD" == "true" && "$PREBUILT_ONLY" == "true" ]]; then
+    log_fatal "Conflicting options: --force-build and --prebuilt-only cannot be used together."
+fi
+
 if [[ "$SKIP_BUNDLE_SHA" == "true" ]]; then
     log_warn "SECURITY WARNING: --insecure-skip-sha256 enabled — prebuilt bundle SHA-256 verification is DISABLED!"
 fi
@@ -221,7 +232,9 @@ for _ts_spec in ${TABLESPACE_SPECS[@]+"${TABLESPACE_SPECS[@]}"}; do
     _ts_name="${_ts_spec%%:*}"
     _ts_dir="$(rvdk_normalize_mount_path "${_ts_spec#*:}")"
     rvdk_validate_pg_ident "$_ts_name" || log_fatal "Invalid PostgreSQL tablespace identifier '${_ts_name}' (expected lowercase [a-z_][a-z0-9_]{0,62})."
-    [[ -n "$_ts_dir" && "$_ts_dir" != "/" ]] && rvdk_validate_abs_path "$_ts_dir" || log_fatal "Invalid PostgreSQL tablespace directory '${_ts_dir}'."
+    if [[ -z "$_ts_dir" || "$_ts_dir" == "/" ]] || ! rvdk_validate_abs_path "$_ts_dir"; then
+        log_fatal "Invalid PostgreSQL tablespace directory '${_ts_dir}'."
+    fi
 done
 
 if [[ -z "$ALLOW_CIDR" && "$AUTO_SUBNET" == "true" ]]; then
@@ -335,13 +348,64 @@ LOCAL_REPO_DIR="${PG_LIB_ROOT}/debs"
 LOCAL_LIST="/etc/apt/sources.list.d/rvdk-local-pgdg.list"
 WANT_LOCAL_LIST="deb [trusted=yes check-date=no lang=none] file://${LOCAL_REPO_DIR} ./"
 
-# Official rvdk-v1 release bundle SHA-256 registry, keyed by TARGET_SLUG and BUNDLE_NAME.
+# Official rvdk-v1 release bundle SHA-256 registry backed by catalog/bundles.json,
+# with an embedded fallback for standalone bundled execution.
 # Returns empty when a target/bundle has no published pinned digest recorded yet.
 _pg_pinned_bundle_sha256() {
     local target_slug="${1:-${TARGET_SLUG:-}}"
     local bundle_name="${2:-${BUNDLE_NAME:-postgresql18-6-io_uring-${target_slug}.tar.zst}}"
+    local catalog_ver="${PG_CATALOG_VERSION:-18.6}"
+    local catalog_file="${3:-${RVDK_BUNDLE_CATALOG:-}}"
+    if [[ -z "$catalog_file" && -n "${_REPO_ROOT:-}" ]]; then
+        catalog_file="${_REPO_ROOT}/catalog/bundles.json"
+    fi
+
+    if [[ -n "$catalog_file" && -f "$catalog_file" && ! -L "$catalog_file" && -r "$catalog_file" ]]; then
+        local cat_sha=""
+        if command -v python3 >/dev/null 2>&1; then
+            cat_sha="$(python3 - "$catalog_file" "$catalog_ver" "$target_slug" "$bundle_name" 2>/dev/null <<'PY' || true
+import json
+import sys
+
+cat_path, ver, slug, want_bundle = sys.argv[1:5]
+with open(cat_path, encoding="utf-8") as fh:
+    data = json.load(fh)
+if isinstance(data, dict) and data.get("schema_version") == 1:
+    bundles = data.get("bundles")
+    if isinstance(bundles, dict):
+        mod = bundles.get("postgresql") or bundles.get("postgresql/18-6-io_uring")
+        if isinstance(mod, dict):
+            ver_map = mod.get(ver) or mod.get(ver.split(".", 1)[0])
+            if isinstance(ver_map, dict):
+                entry = ver_map.get(slug)
+                if isinstance(entry, dict):
+                    rel_tag = entry.get("release_tag", data.get("release_tag", "rvdk-v1"))
+                    if entry.get("bundle") == want_bundle and rel_tag == "rvdk-v1":
+                        sha = entry.get("sha256", "")
+                        if isinstance(sha, str) and sha:
+                            print(sha.strip())
+PY
+            )"
+        elif command -v jq >/dev/null 2>&1; then
+            cat_sha="$(jq -r \
+                --arg ver "$catalog_ver" \
+                --arg slug "$target_slug" \
+                --arg bname "$bundle_name" \
+                'if .schema_version == 1 then
+                    ((.bundles.postgresql[$ver][$slug] // .bundles["postgresql/18-6-io_uring"][$ver][$slug]) // empty) as $e
+                    | if ($e | type) == "object" and $e.bundle == $bname and (($e.release_tag // .release_tag // "rvdk-v1") == "rvdk-v1") then
+                        ($e.sha256 // empty)
+                      else empty end
+                 else empty end' "$catalog_file" 2>/dev/null || true)"
+        fi
+        if [[ -n "$cat_sha" ]]; then
+            printf '%s\n' "$cat_sha"
+            return 0
+        fi
+    fi
+
     case "${target_slug}:${bundle_name}" in
-        # Add only verified rvdk-v1 release digests here as:
+        # Standalone embedded fallback for verified rvdk-v1 release digests:
         # <target_slug>:<bundle_name>) printf '%s\n' '<64-char lowercase hex>' ;;
         *)
             printf ''
@@ -641,7 +705,11 @@ else
                 if [[ -n "${PG_PREBUILT_DEB_URL:-}" ]]; then
                     log_fatal "Refusing to trust unpinned PG_PREBUILT_DEB_URL (${BUNDLE_URL}) without --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
                 fi
-                log_fatal "No pinned SHA-256 digest is recorded for ${BUNDLE_NAME} (${TARGET_SLUG}). Pass --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
+                if [[ "${PREBUILT_ONLY:-false}" == "true" ]]; then
+                    log_fatal "No pinned SHA-256 digest is recorded for ${BUNDLE_NAME} (${TARGET_SLUG}) and --prebuilt-only was requested. Pass --bundle-sha256 <hex64> or --allow-remote-sha256."
+                fi
+                log_warn "No pinned SHA-256 digest is recorded in catalog/bundles.json for ${BUNDLE_NAME} (${TARGET_SLUG}); falling back to verified PGDG source compilation (--force-build)..."
+                FORCE_BUILD="true"
             else
                 if [[ -n "$EXPECTED_BUNDLE_SHA" ]] && [[ ! "$EXPECTED_BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
                     log_fatal "Invalid SHA-256 format '${EXPECTED_BUNDLE_SHA}' for ${BUNDLE_URL}."
@@ -696,7 +764,7 @@ else
                 else
                     rm -f "$_PG_TMP_ARCHIVE" "${_PG_TMP_ARCHIVE}.sha256"
                     _PG_TMP_ARCHIVE=""
-                    if [[ -n "$EXPECTED_BUNDLE_SHA" || -n "${PG_PREBUILT_DEB_URL:-}" ]]; then
+                    if [[ -n "$EXPECTED_BUNDLE_SHA" || -n "${PG_PREBUILT_DEB_URL:-}" || "${PREBUILT_ONLY:-false}" == "true" ]]; then
                         log_fatal "Failed to download prebuilt bundle from ${BUNDLE_URL} (pass --force-build to compile from source)."
                     fi
                     log_warn "No prebuilt bundle published at ${BUNDLE_URL}; falling back to verified PGDG source compile (--force-build)..."
@@ -780,6 +848,7 @@ else
             mkdir -p "${BUILD_DIR}/home" "${BUILD_DIR}/work"
             chown -R "${BUILD_USER}:${BUILD_GRP}" "$BUILD_DIR"
             apt-get build-dep "${APT_FLAGS[@]}" postgresql-common
+            # shellcheck disable=SC2016
             run_as_user "$BUILD_USER" env \
                 HOME="${BUILD_DIR}/home" \
                 DEB_BUILD_OPTIONS="$DEB_BUILD_OPTIONS" \
@@ -797,6 +866,7 @@ else
         mkdir -p "${BUILD_DIR}/home" "${BUILD_DIR}/work"
         chown -R "${BUILD_USER}:${BUILD_GRP}" "$BUILD_DIR"
         apt-get build-dep "${APT_FLAGS[@]}" "postgresql-${PG_VERSION}"
+        # shellcheck disable=SC2016
         run_as_user "$BUILD_USER" env \
             HOME="${BUILD_DIR}/home" \
             DEB_BUILD_OPTIONS="$DEB_BUILD_OPTIONS" \

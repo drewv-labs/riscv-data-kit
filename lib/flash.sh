@@ -116,6 +116,12 @@ _rvdk_flash_cleanup() {
         _RVDK_FLASH_PART_FILE=""
     fi
     if [[ -n "${_RVDK_FLASH_TMP_MNT:-}" && -d "${_RVDK_FLASH_TMP_MNT}" ]]; then
+        local _tf
+        for _tf in ${_RVDK_TMPFILES[@]+"${_RVDK_TMPFILES[@]}"}; do
+            if [[ -n "$_tf" && "$_tf" == "${_RVDK_FLASH_TMP_MNT}/"* ]]; then
+                _rvdk_run_priv rm -f "$_tf" 2>/dev/null || true
+            fi
+        done
         if [[ -d "${_RVDK_FLASH_TMP_MNT}/boot" ]]; then
             _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}/boot" 2>/dev/null || true
         fi
@@ -734,6 +740,173 @@ EOF
     fi
 }
 
+_rvdk_flash_rewrite_target_configs() {
+    local mnt_root="$1"
+    local old_uuid="$2"
+    local new_uuid="$3"
+    local old_label="$4"
+    local new_label="$5"
+    local quiet="${6:-false}"
+
+    local canon_root=""
+    canon_root="$(readlink -f "$mnt_root" 2>/dev/null || true)"
+    [[ -n "$canon_root" ]] || return 1
+
+    local check_dir canon_dir
+    for check_dir in etc boot boot/extlinux boot/boot boot/boot/extlinux boot/spacemit boot/efi; do
+        if [[ -e "${mnt_root}/${check_dir}" || -L "${mnt_root}/${check_dir}" ]]; then
+            canon_dir="$(readlink -f "${mnt_root}/${check_dir}" 2>/dev/null || true)"
+            if [[ -z "$canon_dir" || ( "$canon_dir" != "$canon_root" && "$canon_dir" != "${canon_root}/"* ) ]]; then
+                log_err "Refusing post-flash config rewrite: /${check_dir} escapes target rootfs mount (${canon_root})."
+                return 1
+            fi
+        fi
+    done
+
+    local -a cfg_list=(
+        etc/fstab
+        boot/orangepiEnv.txt
+        boot/armbianEnv.txt
+        boot/env_k1-x.txt
+        boot/spacemit/env_k1-x.txt
+        boot/extlinux/extlinux.conf
+        boot/boot/extlinux/extlinux.conf
+        boot/efi/extlinux.conf
+        boot/uEnv.txt
+    )
+
+    local cfg_rel cfg_full canon_cfg
+    for cfg_rel in "${cfg_list[@]}"; do
+        cfg_full="${mnt_root}/${cfg_rel}"
+        if [[ -L "$cfg_full" ]]; then
+            log_err "Refusing post-flash config rewrite: target /${cfg_rel} is a symbolic link."
+            return 1
+        fi
+        if [[ -e "$cfg_full" ]]; then
+            canon_cfg="$(readlink -f "$cfg_full" 2>/dev/null || true)"
+            canon_dir="$(readlink -f "$(dirname "$cfg_full")" 2>/dev/null || true)"
+            if [[ -z "$canon_cfg" || "$canon_cfg" != "${canon_root}/"* || -z "$canon_dir" || ( "$canon_dir" != "$canon_root" && "$canon_dir" != "${canon_root}/"* ) ]]; then
+                log_err "Refusing post-flash config rewrite: target /${cfg_rel} resolves outside ${canon_root}."
+                return 1
+            fi
+        fi
+    done
+
+    for cfg_rel in "${cfg_list[@]}"; do
+        cfg_full="${mnt_root}/${cfg_rel}"
+        [[ ! -L "$cfg_full" && -f "$cfg_full" ]] || continue
+        canon_cfg="$(readlink -f "$cfg_full" 2>/dev/null || true)"
+        if [[ -z "$canon_cfg" || "$canon_cfg" != "${canon_root}/"* || ! -f "$canon_cfg" || -L "$canon_cfg" ]]; then
+            return 1
+        fi
+
+        if [[ -n "$old_uuid" && -n "$new_uuid" && "$old_uuid" != "$new_uuid" ]] && _rvdk_run_priv grep -qF "$old_uuid" "$canon_cfg" 2>/dev/null; then
+            local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
+            cur_cfg="$(_rvdk_run_priv cat "$canon_cfg" 2>/dev/null || true)"
+            if [[ -n "$cur_cfg" ]]; then
+                new_cfg="$(_rvdk_rewrite_literal "$old_uuid" "$new_uuid" <<< "$cur_cfg")"
+                if [[ "$new_cfg" != "$cur_cfg" ]]; then
+                    cfg_dir="$(dirname "$canon_cfg")"
+                    cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$canon_cfg").rvdk.XXXXXX")"
+                    _RVDK_TMPFILES+=("$cfg_tmp")
+                    if printf '%s\n' "$new_cfg" | _rvdk_run_priv tee "$cfg_tmp" >/dev/null; then
+                        _rvdk_run_priv chmod --reference="$canon_cfg" "$cfg_tmp" 2>/dev/null || _rvdk_run_priv chmod 0644 "$cfg_tmp" 2>/dev/null || true
+                        _rvdk_run_priv mv -f "$cfg_tmp" "$canon_cfg"
+                        if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                            _rvdk_untrack_tmpfile "$cfg_tmp"
+                        fi
+                        if [[ "$quiet" != "true" ]]; then
+                            log_ok "Updated root UUID in target /${cfg_rel}"
+                        fi
+                    else
+                        _rvdk_run_priv rm -f "$cfg_tmp" 2>/dev/null || true
+                        if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                            _rvdk_untrack_tmpfile "$cfg_tmp"
+                        fi
+                        return 1
+                    fi
+                fi
+            fi
+        fi
+
+        if [[ -n "$old_label" && -n "$new_label" && "$old_label" != "$new_label" ]] && _rvdk_run_priv grep -qF "LABEL=${old_label}" "$canon_cfg" 2>/dev/null; then
+            local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
+            cur_cfg="$(_rvdk_run_priv cat "$canon_cfg" 2>/dev/null || true)"
+            if [[ -n "$cur_cfg" ]]; then
+                new_cfg="$(_rvdk_rewrite_label_token "$old_label" "$new_label" <<< "$cur_cfg")"
+                if [[ "$new_cfg" != "$cur_cfg" ]]; then
+                    cfg_dir="$(dirname "$canon_cfg")"
+                    cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$canon_cfg").rvdk.XXXXXX")"
+                    _RVDK_TMPFILES+=("$cfg_tmp")
+                    if printf '%s\n' "$new_cfg" | _rvdk_run_priv tee "$cfg_tmp" >/dev/null; then
+                        _rvdk_run_priv chmod --reference="$canon_cfg" "$cfg_tmp" 2>/dev/null || _rvdk_run_priv chmod 0644 "$cfg_tmp" 2>/dev/null || true
+                        _rvdk_run_priv mv -f "$cfg_tmp" "$canon_cfg"
+                        if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                            _rvdk_untrack_tmpfile "$cfg_tmp"
+                        fi
+                        if [[ "$quiet" != "true" ]]; then
+                            log_ok "Updated root LABEL in target /${cfg_rel} (${old_label} -> ${new_label})"
+                        fi
+                    else
+                        _rvdk_run_priv rm -f "$cfg_tmp" 2>/dev/null || true
+                        if typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+                            _rvdk_untrack_tmpfile "$cfg_tmp"
+                        fi
+                        return 1
+                    fi
+                fi
+            fi
+        fi
+    done
+    return 0
+}
+
+_rvdk_flash_rollback_target_configs() {
+    local root_slice="$1"
+    local boot_slice="$2"
+    local revert_from_uuid="$3"
+    local revert_to_uuid="$4"
+    local revert_from_lbl="$5"
+    local revert_to_lbl="$6"
+
+    _RVDK_FLASH_TMP_MNT="$(mktemp -d "/tmp/rvdk_postflash.XXXXXX")"
+    if ! _rvdk_run_priv mount "$root_slice" "$_RVDK_FLASH_TMP_MNT"; then
+        log_err "Rollback failed: unable to remount ${root_slice} to restore boot configs."
+        rmdir "$_RVDK_FLASH_TMP_MNT" 2>/dev/null || true
+        _RVDK_FLASH_TMP_MNT=""
+        return 1
+    fi
+    if [[ -n "$boot_slice" ]]; then
+        if [[ -L "${_RVDK_FLASH_TMP_MNT}/boot" || ! -d "${_RVDK_FLASH_TMP_MNT}/boot" ]] || ! _rvdk_run_priv mount "$boot_slice" "${_RVDK_FLASH_TMP_MNT}/boot"; then
+            log_err "Rollback failed: unable to remount ${boot_slice} to restore /boot configs."
+            _rvdk_run_priv umount "$_RVDK_FLASH_TMP_MNT" 2>/dev/null || true
+            rmdir "$_RVDK_FLASH_TMP_MNT" 2>/dev/null || true
+            _RVDK_FLASH_TMP_MNT=""
+            return 1
+        fi
+    fi
+
+    local rb_ok="true"
+    if ! _rvdk_flash_rewrite_target_configs "$_RVDK_FLASH_TMP_MNT" "$revert_from_uuid" "$revert_to_uuid" "$revert_from_lbl" "$revert_to_lbl" "true"; then
+        log_err "Rollback failed: unable to restore original boot configs on ${root_slice}."
+        rb_ok="false"
+    fi
+    sync
+    if [[ -n "$boot_slice" ]]; then
+        if ! _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}/boot"; then
+            log_err "Rollback warning: failed to unmount ${boot_slice} cleanly."
+            rb_ok="false"
+        fi
+    fi
+    if ! _rvdk_run_priv umount "$_RVDK_FLASH_TMP_MNT"; then
+        log_err "Rollback warning: failed to unmount ${root_slice} cleanly."
+        rb_ok="false"
+    fi
+    rmdir "$_RVDK_FLASH_TMP_MNT" 2>/dev/null || true
+    _RVDK_FLASH_TMP_MNT=""
+    [[ "$rb_ok" == "true" ]]
+}
+
 _rvdk_flash_postprocess_raw() {
     local os_type="$1"
     local block_dev="$2"
@@ -878,11 +1051,6 @@ _rvdk_flash_postprocess_raw() {
         done < <(_rvdk_run_priv blkid -t "UUID=${old_uuid}" -o device 2>/dev/null || true)
     fi
 
-    local need_mount="false"
-    [[ "$regen_uuid" == "true" || "$uuid_collision" == "true" ]] && need_mount="true"
-    [[ "$emmc_boot0" == "true" && -b "${block_dev}boot0" ]] && need_mount="true"
-    [[ -n "$old_label" && -n "$root_label" && "$old_label" != "$root_label" ]] && need_mount="true"
-
     local new_uuid=""
     if [[ "$regen_uuid" == "true" || "$uuid_collision" == "true" ]]; then
         if [[ -x "$tune2fs_bin" && -x "$e2fsck_bin" ]]; then
@@ -890,8 +1058,10 @@ _rvdk_flash_postprocess_raw() {
             _rvdk_run_priv "$e2fsck_bin" -pf "$root_slice" >/dev/null 2>&1 || fsck_rc=$?
             if (( fsck_rc <= 1 )); then
                 new_uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
-                _rvdk_run_priv "$tune2fs_bin" -U "$new_uuid" "$root_slice" >/dev/null
-                log_ok "Assigned unique ext4 UUID on ${root_slice}: ${new_uuid} (preventing SD/eMMC UUID collision)"
+                if [[ -z "$new_uuid" || "$new_uuid" == "$old_uuid" ]]; then
+                    log_warn "Unable to generate unique UUID for ${root_slice}; preserving existing UUID."
+                    new_uuid=""
+                fi
             else
                 log_warn "e2fsck returned ${fsck_rc} on ${root_slice}; preserving existing UUID."
                 new_uuid=""
@@ -899,12 +1069,20 @@ _rvdk_flash_postprocess_raw() {
         fi
     fi
 
-    if [[ "$need_mount" == "true" ]]; then
-        _RVDK_FLASH_TMP_MNT="$(mktemp -d "/tmp/rvdk_postflash.XXXXXX")"
-        _rvdk_run_priv mount "$root_slice" "$_RVDK_FLASH_TMP_MNT"
+    local want_label_rewrite="false"
+    if [[ -n "$old_label" && -n "$root_label" && "$old_label" != "$root_label" ]]; then
+        want_label_rewrite="true"
+    fi
 
-        # Mount separate /boot partition if the image uses a 2-partition layout
-        local boot_slice="" cand_p cand_lbl
+    local need_mount="false"
+    [[ -n "$new_uuid" ]] && need_mount="true"
+    [[ "$emmc_boot0" == "true" && -b "${block_dev}boot0" ]] && need_mount="true"
+    [[ "$want_label_rewrite" == "true" ]] && need_mount="true"
+
+    local boot_slice=""
+    if [[ "$need_mount" == "true" ]]; then
+        # Detect separate /boot partition if the image uses a 2-partition layout
+        local cand_p cand_lbl
         for cand_p in "${linux_parts[@]}"; do
             [[ "$cand_p" == "$root_slice" ]] && continue
             cand_lbl="$(_rvdk_run_priv blkid -s LABEL -o value "$cand_p" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
@@ -915,58 +1093,34 @@ _rvdk_flash_postprocess_raw() {
                     ;;
             esac
         done
-        if [[ -n "$boot_slice" && -d "${_RVDK_FLASH_TMP_MNT}/boot" ]]; then
-            _rvdk_run_priv mount "$boot_slice" "${_RVDK_FLASH_TMP_MNT}/boot" 2>/dev/null || true
+
+        _RVDK_FLASH_TMP_MNT="$(mktemp -d "/tmp/rvdk_postflash.XXXXXX")"
+        if ! _rvdk_run_priv mount "$root_slice" "$_RVDK_FLASH_TMP_MNT"; then
+            log_fatal "Failed to mount flashed rootfs ${root_slice} during post-flash convergence."
         fi
 
-        local cfg_rel cfg_full
-        for cfg_rel in \
-            etc/fstab \
-            boot/orangepiEnv.txt \
-            boot/armbianEnv.txt \
-            boot/env_k1-x.txt \
-            boot/spacemit/env_k1-x.txt \
-            boot/extlinux/extlinux.conf \
-            boot/efi/extlinux.conf; do
-            cfg_full="${_RVDK_FLASH_TMP_MNT}/${cfg_rel}"
-            [[ -f "$cfg_full" ]] || continue
-            if [[ -n "$old_uuid" && -n "$new_uuid" ]] && _rvdk_run_priv grep -qF "$old_uuid" "$cfg_full" 2>/dev/null; then
-                local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
-                cur_cfg="$(_rvdk_run_priv cat "$cfg_full" 2>/dev/null || true)"
-                if [[ -n "$cur_cfg" ]]; then
-                    new_cfg="$(_rvdk_rewrite_literal "$old_uuid" "$new_uuid" <<< "$cur_cfg")"
-                    if [[ "$new_cfg" != "$cur_cfg" ]]; then
-                        cfg_dir="$(dirname "$cfg_full")"
-                        cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$cfg_full").rvdk.XXXXXX")"
-                        if printf '%s\n' "$new_cfg" | _rvdk_run_priv tee "$cfg_tmp" >/dev/null; then
-                            _rvdk_run_priv chmod --reference="$cfg_full" "$cfg_tmp" 2>/dev/null || _rvdk_run_priv chmod 0644 "$cfg_tmp" 2>/dev/null || true
-                            _rvdk_run_priv mv -f "$cfg_tmp" "$cfg_full"
-                            log_ok "Updated root UUID in target /${cfg_rel}"
-                        else
-                            _rvdk_run_priv rm -f "$cfg_tmp" 2>/dev/null || true
-                        fi
-                    fi
-                fi
+        if [[ -n "$boot_slice" ]]; then
+            if [[ -L "${_RVDK_FLASH_TMP_MNT}/boot" ]]; then
+                log_fatal "Refusing to mount ${boot_slice}: /boot on ${root_slice} is a symbolic link."
             fi
-            if [[ -n "$old_label" && -n "$root_label" && "$old_label" != "$root_label" ]] && _rvdk_run_priv grep -qF "LABEL=${old_label}" "$cfg_full" 2>/dev/null; then
-                local cur_cfg="" new_cfg="" cfg_dir="" cfg_tmp=""
-                cur_cfg="$(_rvdk_run_priv cat "$cfg_full" 2>/dev/null || true)"
-                if [[ -n "$cur_cfg" ]]; then
-                    new_cfg="$(_rvdk_rewrite_label_token "$old_label" "$root_label" <<< "$cur_cfg")"
-                    if [[ "$new_cfg" != "$cur_cfg" ]]; then
-                        cfg_dir="$(dirname "$cfg_full")"
-                        cfg_tmp="$(_rvdk_run_priv mktemp "${cfg_dir}/.$(basename "$cfg_full").rvdk.XXXXXX")"
-                        if printf '%s\n' "$new_cfg" | _rvdk_run_priv tee "$cfg_tmp" >/dev/null; then
-                            _rvdk_run_priv chmod --reference="$cfg_full" "$cfg_tmp" 2>/dev/null || _rvdk_run_priv chmod 0644 "$cfg_tmp" 2>/dev/null || true
-                            _rvdk_run_priv mv -f "$cfg_tmp" "$cfg_full"
-                            log_ok "Updated root LABEL in target /${cfg_rel} (${old_label} -> ${root_label})"
-                        else
-                            _rvdk_run_priv rm -f "$cfg_tmp" 2>/dev/null || true
-                        fi
-                    fi
-                fi
+            if [[ ! -d "${_RVDK_FLASH_TMP_MNT}/boot" ]]; then
+                log_fatal "Failed to mount separate /boot partition ${boot_slice}: /boot directory missing on ${root_slice}."
             fi
-        done
+            if ! _rvdk_run_priv mount "$boot_slice" "${_RVDK_FLASH_TMP_MNT}/boot"; then
+                log_fatal "Failed to mount separate /boot partition ${boot_slice} during post-flash convergence."
+            fi
+        fi
+
+        local rewrite_old_lbl="" rewrite_new_lbl=""
+        if [[ "$want_label_rewrite" == "true" ]]; then
+            rewrite_old_lbl="$old_label"
+            rewrite_new_lbl="$root_label"
+        fi
+
+        if ! _rvdk_flash_rewrite_target_configs "$_RVDK_FLASH_TMP_MNT" "$old_uuid" "$new_uuid" "$rewrite_old_lbl" "$rewrite_new_lbl" "false"; then
+            _rvdk_flash_rewrite_target_configs "$_RVDK_FLASH_TMP_MNT" "$new_uuid" "$old_uuid" "$rewrite_new_lbl" "$rewrite_old_lbl" "true" || true
+            log_fatal "Failed to update target boot configuration files on ${root_slice}; aborted before mutating superblock."
+        fi
 
         # SpacemiT K1/M1/Ky X1 hardware eMMC boot0 SPL provisioning (bootinfo_emmc.bin @ LBA 0 + FSBL.bin @ LBA 1)
         if [[ "$emmc_boot0" == "true" && -b "${block_dev}boot0" ]]; then
@@ -1001,10 +1155,37 @@ _rvdk_flash_postprocess_raw() {
         fi
 
         sync
-        [[ -n "$boot_slice" ]] && _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}/boot" 2>/dev/null || true
-        _rvdk_run_priv umount "$_RVDK_FLASH_TMP_MNT"
+        if [[ -n "$boot_slice" ]]; then
+            if ! _rvdk_run_priv umount "${_RVDK_FLASH_TMP_MNT}/boot"; then
+                log_fatal "Failed to unmount separate /boot partition ${boot_slice} cleanly; aborting superblock mutation."
+            fi
+        fi
+        if ! _rvdk_run_priv umount "$_RVDK_FLASH_TMP_MNT"; then
+            log_fatal "Failed to unmount rootfs ${root_slice} cleanly; aborting superblock mutation."
+        fi
         rmdir "$_RVDK_FLASH_TMP_MNT"
         _RVDK_FLASH_TMP_MNT=""
+    fi
+
+    if [[ -n "$new_uuid" ]]; then
+        local rollback_from_lbl="" rollback_to_lbl=""
+        if [[ "$want_label_rewrite" == "true" ]]; then
+            rollback_from_lbl="$root_label"
+            rollback_to_lbl="$old_label"
+        fi
+        local post_fsck_rc=0
+        _rvdk_run_priv "$e2fsck_bin" -pf "$root_slice" >/dev/null 2>&1 || post_fsck_rc=$?
+        if (( post_fsck_rc > 1 )); then
+            log_err "Post-unmount e2fsck returned ${post_fsck_rc} on ${root_slice}; reverting rewritten boot configs."
+            _rvdk_flash_rollback_target_configs "$root_slice" "$boot_slice" "$new_uuid" "$old_uuid" "$rollback_from_lbl" "$rollback_to_lbl" || true
+            log_fatal "Aborted ext4 UUID update on ${root_slice} due to post-unmount e2fsck failure (rc=${post_fsck_rc})."
+        fi
+        if ! _rvdk_run_priv "$tune2fs_bin" -U "$new_uuid" "$root_slice" >/dev/null; then
+            log_err "tune2fs -U failed on ${root_slice}; reverting rewritten boot configs."
+            _rvdk_flash_rollback_target_configs "$root_slice" "$boot_slice" "$new_uuid" "$old_uuid" "$rollback_from_lbl" "$rollback_to_lbl" || true
+            log_fatal "Aborted ext4 UUID update on ${root_slice} after tune2fs -U failure."
+        fi
+        log_ok "Assigned unique ext4 UUID on ${root_slice}: ${new_uuid} (preventing SD/eMMC UUID collision)"
     fi
 
     _rvdk_harden_ext4_superblock "$tune2fs_bin" "$e2fsck_bin" "$debugfs_bin" "$root_slice"

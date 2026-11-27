@@ -5,7 +5,9 @@
 #
 # Security, Supply-Chain & Persistence Hardening:
 #   • SHA-256 verifies precompiled RVDK catalog binary bundles (.tar.zst) by default
-#     (failing fast unless pinned in catalog or --bundle-sha256 / --allow-remote-sha256 / --force-build)
+#     (reading pinned digests from catalog/bundles.json and falling back cleanly
+#     to verified source compilation unless --prebuilt-only or a custom URL lacks
+#     a SHA-256 pin)
 #   • Supports explicit --force-build unprivileged source compilation using SHA-256
 #     verified go.dev/dl toolchains + lib/kit.sh compiler profiles
 #   • Binds HTTP listener to `127.0.0.1:2586` + `0660` `/run/ntfy/ntfy.sock` (`Group=ntfy`)
@@ -115,6 +117,7 @@ Options:
   --data-mount <path>         Optional NVMe mount root for persistence directory
   --version <X.Y.Z>           ntfy upstream release version (default: 2.38.1)
   --force-build               Cold-compile ntfy from source & emit RVDK catalog .tar.zst bundle
+  --prebuilt-only             Require verified prebuilt bundle (never fall back to source compilation)
   --keep-build-dir            Retain build workspace after --force-build
   --bundle-sha256 <hex64>     Expected SHA-256 digest for prebuilt .tar.zst bundle
   --allow-remote-sha256       Trust same-origin .sha256 sidecar when --bundle-sha256 is unset
@@ -160,6 +163,7 @@ NTFY_ENABLE_WEB="${NTFY_ENABLE_WEB:-false}"
 NTFY_DATABASE_URL="${NTFY_DATABASE_URL:-}"
 
 FORCE_BUILD="false"
+PREBUILT_ONLY="false"
 KEEP_BUILD_DIR="false"
 ALLOW_REMOTE_SHA="false"
 SKIP_BUNDLE_SHA="false"
@@ -211,6 +215,8 @@ while [[ $# -gt 0 ]]; do
             _require_arg "$1" "${2:-}"; EXPLICIT_DATA_MOUNT="$2"; shift 2 ;;
         --force-build|--force-rebuild-ntfy|--compile)
             FORCE_BUILD="true"; shift ;;
+        --prebuilt-only)
+            PREBUILT_ONLY="true"; shift ;;
         --keep-build-dir)
             KEEP_BUILD_DIR="true"; shift ;;
         --bundle-sha256)
@@ -234,6 +240,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$FORCE_BUILD" == "true" && "$PREBUILT_ONLY" == "true" ]]; then
+    log_fatal "Conflicting options: --force-build and --prebuilt-only cannot be used together."
+fi
+
 if [[ "$SKIP_BUNDLE_SHA" == "true" ]]; then
     log_warn "SECURITY WARNING: --insecure-skip-sha256 enabled — prebuilt bundle SHA-256 verification is DISABLED!"
 fi
@@ -246,7 +256,9 @@ fi
 DATA_MOUNT="$(rvdk_resolve_data_mount "$EXPLICIT_DATA_MOUNT")"
 
 [[ "$NTFY_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]] || log_fatal "Invalid --version '${NTFY_VERSION}'."
-[[ "$NTFY_PORT" =~ ^[0-9]+$ ]] && (( NTFY_PORT >= 1 && NTFY_PORT <= 65535 )) || log_fatal "Invalid --port '${NTFY_PORT}'."
+if [[ ! "$NTFY_PORT" =~ ^[0-9]+$ ]] || (( NTFY_PORT < 1 || NTFY_PORT > 65535 )); then
+    log_fatal "Invalid --port '${NTFY_PORT}'."
+fi
 [[ "$NTFY_BIND" =~ ^[A-Za-z0-9.:_-]+$ ]] || log_fatal "Invalid --bind address '${NTFY_BIND}'."
 [[ "$NTFY_CACHE_DURATION" =~ ^[0-9]+(ms|s|m|h|d)$ ]] || log_fatal "Invalid --cache-duration '${NTFY_CACHE_DURATION}'."
 
@@ -381,13 +393,64 @@ BUNDLE_URL="${NTFY_PREBUILT_URL:-${RVDK_RELEASE_BASE}/${BUNDLE_NAME}}"
 LOCAL_BUNDLE="${BUNDLE_DIR}/${BUNDLE_NAME}"
 LOCAL_BUNDLE_SHA="${LOCAL_BUNDLE}.sha256"
 
-# Official rvdk-v1 release bundle SHA-256 registry, keyed by TARGET_SLUG and BUNDLE_NAME.
+# Official rvdk-v1 release bundle SHA-256 registry backed by catalog/bundles.json,
+# with an embedded fallback for standalone bundled execution.
 # Returns empty when a target/bundle has no published pinned digest recorded yet.
 _ntfy_pinned_bundle_sha256() {
     local target_slug="${1:-${TARGET_SLUG:-}}"
     local bundle_name="${2:-${BUNDLE_NAME:-ntfy-${NTFY_VERSION:-2.38.1}-${target_slug}.tar.zst}}"
+    local catalog_ver="${NTFY_VERSION:-2.38.1}"
+    local catalog_file="${3:-${RVDK_BUNDLE_CATALOG:-}}"
+    if [[ -z "$catalog_file" && -n "${_REPO_ROOT:-}" ]]; then
+        catalog_file="${_REPO_ROOT}/catalog/bundles.json"
+    fi
+
+    if [[ -n "$catalog_file" && -f "$catalog_file" && ! -L "$catalog_file" && -r "$catalog_file" ]]; then
+        local cat_sha=""
+        if command -v python3 >/dev/null 2>&1; then
+            cat_sha="$(python3 - "$catalog_file" "$catalog_ver" "$target_slug" "$bundle_name" 2>/dev/null <<'PY' || true
+import json
+import sys
+
+cat_path, ver, slug, want_bundle = sys.argv[1:5]
+with open(cat_path, encoding="utf-8") as fh:
+    data = json.load(fh)
+if isinstance(data, dict) and data.get("schema_version") == 1:
+    bundles = data.get("bundles")
+    if isinstance(bundles, dict):
+        mod = bundles.get("ntfy") or bundles.get("mods/ntfy")
+        if isinstance(mod, dict):
+            ver_map = mod.get(ver)
+            if isinstance(ver_map, dict):
+                entry = ver_map.get(slug)
+                if isinstance(entry, dict):
+                    rel_tag = entry.get("release_tag", data.get("release_tag", "rvdk-v1"))
+                    if entry.get("bundle") == want_bundle and rel_tag == "rvdk-v1":
+                        sha = entry.get("sha256", "")
+                        if isinstance(sha, str) and sha:
+                            print(sha.strip())
+PY
+            )"
+        elif command -v jq >/dev/null 2>&1; then
+            cat_sha="$(jq -r \
+                --arg ver "$catalog_ver" \
+                --arg slug "$target_slug" \
+                --arg bname "$bundle_name" \
+                'if .schema_version == 1 then
+                    ((.bundles.ntfy[$ver][$slug] // .bundles["mods/ntfy"][$ver][$slug]) // empty) as $e
+                    | if ($e | type) == "object" and $e.bundle == $bname and (($e.release_tag // .release_tag // "rvdk-v1") == "rvdk-v1") then
+                        ($e.sha256 // empty)
+                      else empty end
+                 else empty end' "$catalog_file" 2>/dev/null || true)"
+        fi
+        if [[ -n "$cat_sha" ]]; then
+            printf '%s\n' "$cat_sha"
+            return 0
+        fi
+    fi
+
     case "${target_slug}:${bundle_name}" in
-        # Add only verified rvdk-v1 release digests here as:
+        # Standalone embedded fallback for verified rvdk-v1 release digests:
         # <target_slug>:<bundle_name>) printf '%s\n' '<64-char lowercase hex>' ;;
         *)
             printf ''
@@ -553,7 +616,11 @@ else
                 if [[ -n "${NTFY_PREBUILT_URL:-}" ]]; then
                     log_fatal "Refusing to trust unpinned NTFY_PREBUILT_URL (${BUNDLE_URL}) without --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
                 fi
-                log_fatal "No pinned SHA-256 digest is recorded for ${BUNDLE_NAME} (${TARGET_SLUG}). Pass --bundle-sha256 <hex64>, --allow-remote-sha256, or --force-build."
+                if [[ "${PREBUILT_ONLY:-false}" == "true" ]]; then
+                    log_fatal "No pinned SHA-256 digest is recorded for ${BUNDLE_NAME} (${TARGET_SLUG}) and --prebuilt-only was requested. Pass --bundle-sha256 <hex64> or --allow-remote-sha256."
+                fi
+                log_warn "No pinned SHA-256 digest is recorded in catalog/bundles.json for ${BUNDLE_NAME} (${TARGET_SLUG}); falling back to unprivileged source compilation (--force-build)..."
+                FORCE_BUILD="true"
             else
                 if [[ -n "$EXPECTED_BUNDLE_SHA" ]] && [[ ! "$EXPECTED_BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]]; then
                     log_fatal "Invalid SHA-256 format '${EXPECTED_BUNDLE_SHA}' for ${BUNDLE_URL}."
@@ -597,7 +664,7 @@ else
                 else
                     rm -f "$_NTFY_TMP_ARCHIVE" "${_NTFY_TMP_ARCHIVE}.sha256"
                     _NTFY_TMP_ARCHIVE=""
-                    if [[ -n "$EXPECTED_BUNDLE_SHA" || -n "${NTFY_PREBUILT_URL:-}" ]]; then
+                    if [[ -n "$EXPECTED_BUNDLE_SHA" || -n "${NTFY_PREBUILT_URL:-}" || "${PREBUILT_ONLY:-false}" == "true" ]]; then
                         log_fatal "Failed to download prebuilt bundle from ${BUNDLE_URL} (pass --force-build to compile from source)."
                     fi
                     log_warn "No prebuilt bundle published at ${BUNDLE_URL}; falling back to unprivileged source compile (--force-build)..."
@@ -609,6 +676,9 @@ else
         if [[ "$FORCE_BUILD" == "false" && "$NTFY_ENABLE_WEB" == "true" ]]; then
             _CHECK_INFO="$(tar -I zstd -xOf "$LOCAL_BUNDLE" ./BUILD_INFO.env 2>/dev/null || tar -I zstd -xOf "$LOCAL_BUNDLE" BUILD_INFO.env 2>/dev/null || true)"
             if [[ "$_CHECK_INFO" != *'NTFY_WEB_EMBEDDED="true"'* ]]; then
+                if [[ "${PREBUILT_ONLY:-false}" == "true" ]]; then
+                    log_fatal "Prebuilt bundle ${BUNDLE_NAME} was compiled headless without --with-web UI and --prebuilt-only forbids source compilation."
+                fi
                 log_warn "Prebuilt bundle ${BUNDLE_NAME} was compiled headless; recompiling from source to embed --with-web UI..."
                 FORCE_BUILD="true"
             fi
@@ -660,6 +730,7 @@ else
         WEB_BUILT="false"
         if [[ "$NTFY_ENABLE_WEB" == "true" ]]; then
             rvdk_prog 58 "ntfy ${NTFY_VERSION}: building embedded React web UI as ${BUILD_USER}..."
+            # shellcheck disable=SC2016
             run_as_user "$BUILD_USER" env \
                 HOME="${BUILD_DIR}/home" \
                 NPM_CONFIG_CACHE="${BUILD_DIR}/npm-cache" \

@@ -38,7 +38,7 @@ PERF_GOV_UNIT="/etc/systemd/system/spacemit-k1-cpufreq-performance.service"
 IOT_GOV_UNIT="/etc/systemd/system/spacemit-k1-cpufreq-iot.service"
 
 _SCRIPT_DIR=""
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+if [[ -n "${BASH_SOURCE[0]:-}\" && -f "${BASH_SOURCE[0]}" ]]; then
     _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 _REPO_ROOT=""
@@ -235,6 +235,12 @@ _k1_backup_file() {
         printf '%s\n' "$src_path" | rvdk_atomic_write "$sidecar_path" 0644
     fi
 }
+
+if ! typeset -f rvdk_backup_file >/dev/null 2>&1; then
+    rvdk_backup_file() {
+        _k1_backup_file "$@"
+    }
+fi
 
 if [[ "$ACTION" != "status" ]]; then
     [[ -n "${RVDK_PRIMARY_NIC:-}" ]] && _k1_validate_nic "$RVDK_PRIMARY_NIC" "RVDK_PRIMARY_NIC"
@@ -436,11 +442,7 @@ if [[ "$TUNE_MODE" != "iot" ]]; then
     if [[ "$PRIMARY_IS_WIFI" == "false" ]]; then
         for mod_load_cfg in "${MOD_LOAD_CFGS[@]}"; do
             if [[ -f "$mod_load_cfg" && ! -L "$mod_load_cfg" ]] && grep -Eq '^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]]|$)' "$mod_load_cfg" 2>/dev/null; then
-                if typeset -f rvdk_backup_file >/dev/null 2>&1; then
-                    rvdk_backup_file "$mod_load_cfg" "deeptune"
-                else
-                    _k1_backup_file "$mod_load_cfg" "deeptune"
-                fi
+                rvdk_backup_file "$mod_load_cfg" "deeptune"
                 sed -E 's/^[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?$/# \1\2 # disabled by RVDK spacemit\/k1 deeptune/' "$mod_load_cfg" \
                     | rvdk_atomic_write "$mod_load_cfg" 0644
                 log_ok "Disabled forced SDIO Wi-Fi module autoload in ${mod_load_cfg}"
@@ -450,11 +452,7 @@ if [[ "$TUNE_MODE" != "iot" ]]; then
 else
     for mod_load_cfg in "${MOD_LOAD_CFGS[@]}"; do
         if [[ -f "$mod_load_cfg" && ! -L "$mod_load_cfg" ]] && grep -Eq '^[[:space:]]*#[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?[[:space:]]+#[[:space:]]*disabled by RVDK spacemit/k1 deeptune[[:space:]]*$' "$mod_load_cfg" 2>/dev/null; then
-            if typeset -f rvdk_backup_file >/dev/null 2>&1; then
-                rvdk_backup_file "$mod_load_cfg" "deeptune"
-            else
-                _k1_backup_file "$mod_load_cfg" "deeptune"
-            fi
+            rvdk_backup_file "$mod_load_cfg" "deeptune"
             awk '
                 /^[[:space:]]*#[[:space:]]*(bcmdhd|dhd_static_buf)([[:space:]].*)?[[:space:]]+#[[:space:]]*disabled by RVDK spacemit\/k1 deeptune[[:space:]]*$/ {
                     sub(/^[[:space:]]*#[[:space:]]*/, "")
@@ -562,7 +560,8 @@ if [[ "$TUNE_MODE" == "iot" ]]; then
     rvdk_prog 55 "SpacemiT K1 DeepTune: configuring low-power cpufreq governor..."
     IOT_GOV="$(_k1_select_iot_governor)"
     GOV_CHANGED="false"
-    if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq "^GOVERNOR=\"?${IOT_GOV}\"?\$" /etc/default/cpufrequtils 2>/dev/null; then
+    if [[ -f /etc/default/cpufrequtils && ! -L /etc/default/cpufrequtils ]] && ! grep -Eq "^GOVERNOR=\"?${IOT_GOV}\"?\$" /etc/default/cpufrequtils 2>/dev/null; then
+        rvdk_backup_file /etc/default/cpufrequtils deeptune
         if grep -Eq '^GOVERNOR=' /etc/default/cpufrequtils 2>/dev/null; then
             sed "s/^GOVERNOR=.*/GOVERNOR=\"${IOT_GOV}\"/" /etc/default/cpufrequtils | rvdk_atomic_write /etc/default/cpufrequtils 0644
         else
@@ -616,7 +615,8 @@ elif [[ -f "$IOT_GOV_UNIT" ]]; then
     if [[ -f "$PERF_GOV_UNIT" ]]; then
         systemctl enable --now spacemit-k1-cpufreq-performance.service >/dev/null 2>&1 || true
     fi
-    if [[ -f /etc/default/cpufrequtils ]] && ! grep -Eq '^GOVERNOR="?performance"?$' /etc/default/cpufrequtils 2>/dev/null; then
+    if [[ -f /etc/default/cpufrequtils && ! -L /etc/default/cpufrequtils ]] && ! grep -Eq '^GOVERNOR="?performance"?$' /etc/default/cpufrequtils 2>/dev/null; then
+        rvdk_backup_file /etc/default/cpufrequtils deeptune
         sed 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils | rvdk_atomic_write /etc/default/cpufrequtils 0644
     fi
     _k1_apply_governor_live "performance" || true

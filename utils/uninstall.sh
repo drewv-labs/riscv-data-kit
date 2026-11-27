@@ -16,6 +16,8 @@
 #   • Full Purge (`sudo rvdk uninstall --purge` / `sudo rvdk purge`):
 #       Removes everything above PLUS restores preserved vendor configuration
 #       backups under `/var/lib/rvdk/backups/{apt,boot,deeptune,dns,ntp,openwrt,registries}`
+#       and unmasks RVDK-created `/etc/systemd/user/*` -> `/dev/null` masks
+#       tracked in `/var/lib/rvdk/backups/systemd-user/masked.list`
 #       (unless `--no-restore-backups` is passed), removes `/etc/rvdk/`,
 #       OS/BSP state under `/var/lib/rvdk/`, and all OS/BSP RVDK-authored
 #       systemd/procd tuning units, sysctl/modprobe/journald/APT drop-ins, and
@@ -372,6 +374,7 @@ main() {
     local sys_cache="${RVDK_CACHE_DIR:-/var/cache/rvdk}"
     local state_root="${RVDK_STATE_DIR:-/var/lib/rvdk}"
     local systemd_unit_dir="${RVDK_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    local systemd_user_unit_dir="${RVDK_SYSTEMD_USER_UNIT_DIR:-/etc/systemd/user}"
     local os_type
     os_type="$(uname -s)"
 
@@ -385,6 +388,12 @@ main() {
             log_fatal "Unsafe RVDK_SYSTEMD_UNIT_DIR: '${systemd_unit_dir}' contains a symbolic link component."
         fi
     fi
+    if [[ -n "${RVDK_SYSTEMD_USER_UNIT_DIR:-}" ]]; then
+        rvdk_assert_safe_managed_dir "$systemd_user_unit_dir" "RVDK_SYSTEMD_USER_UNIT_DIR"
+        if _rvdk_uninstall_has_symlink_component "$(_rvdk_uninstall_normalize_path "$systemd_user_unit_dir")"; then
+            log_fatal "Unsafe RVDK_SYSTEMD_USER_UNIT_DIR: '${systemd_user_unit_dir}' contains a symbolic link component."
+        fi
+    fi
     while [[ "$sys_engine" == *//* ]]; do sys_engine="${sys_engine//\/\///}"; done
     while [[ "$sys_engine" != "/" && "$sys_engine" == */ ]]; do sys_engine="${sys_engine%/}"; done
     while [[ "$sys_cache" == *//* ]]; do sys_cache="${sys_cache//\/\///}"; done
@@ -393,6 +402,8 @@ main() {
     while [[ "$state_root" != "/" && "$state_root" == */ ]]; do state_root="${state_root%/}"; done
     while [[ "$systemd_unit_dir" == *//* ]]; do systemd_unit_dir="${systemd_unit_dir//\/\///}"; done
     while [[ "$systemd_unit_dir" != "/" && "$systemd_unit_dir" == */ ]]; do systemd_unit_dir="${systemd_unit_dir%/}"; done
+    while [[ "$systemd_user_unit_dir" == *//* ]]; do systemd_user_unit_dir="${systemd_user_unit_dir//\/\///}"; done
+    while [[ "$systemd_user_unit_dir" != "/" && "$systemd_user_unit_dir" == */ ]]; do systemd_user_unit_dir="${systemd_user_unit_dir%/}"; done
 
     local backup_root="${RVDK_BACKUP_ROOT:-${state_root}/backups}"
     if [[ -n "${RVDK_BACKUP_ROOT:-}" ]]; then
@@ -495,6 +506,7 @@ main() {
         local cat_name cat_dir bfile bbase stem dest bmode bowner
         local path_sidecar sidecar_line sidecar_extra _seg _rest _has_dot_seg _seg_cnt
         local openwrt_uci_restored="false"
+        local journald_restored="false"
 
         for cat_name in apt boot deeptune dns ntp openwrt registries; do
             cat_dir="${backup_root}/${cat_name}"
@@ -617,6 +629,10 @@ main() {
                     if [[ "$dest" == "/etc/config/system" || "$dest" == "/etc/config/dhcp" ]]; then
                         openwrt_uci_restored="true"
                     fi
+                    if [[ "$dest" == "/etc/systemd/journald.conf" ]]; then
+                        journald_restored="true"
+                        systemd_dirty="true"
+                    fi
                 fi
             done
         done
@@ -625,6 +641,44 @@ main() {
             [[ -x /etc/init.d/sysntpd ]] && /etc/init.d/sysntpd reload >/dev/null 2>&1 || true
             [[ -x /etc/init.d/dnsmasq ]] && /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
         fi
+        if [[ "$dry_run" != "true" && "$journald_restored" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+            systemctl restart systemd-journald.service >/dev/null 2>&1 || true
+        fi
+    }
+
+    unmask_systemd_user_units() {
+        [[ -d "$backup_root" && ! -L "$backup_root" ]] || return 0
+        local mask_dir="${backup_root}/systemd-user"
+        local mask_list="${mask_dir}/masked.list"
+        [[ -d "$mask_dir" && ! -L "$mask_dir" ]] || return 0
+        [[ -f "$mask_list" && ! -L "$mask_list" ]] || return 0
+        [[ -d "$systemd_user_unit_dir" && ! -L "$systemd_user_unit_dir" ]] || return 0
+
+        local raw_unit unit_name unit_path link_target
+        local safe_unit_re='^[A-Za-z0-9_.@-]+\.(service|socket|timer|target|path)$'
+        while IFS= read -r raw_unit || [[ -n "$raw_unit" ]]; do
+            unit_name="${raw_unit%$'\r'}"
+            [[ -z "$unit_name" || "$unit_name" == \#* ]] && continue
+            if [[ "$unit_name" == */* || "$unit_name" == *".."* || "$unit_name" == .* || "$unit_name" == -* || ! "$unit_name" =~ $safe_unit_re ]]; then
+                log_warn "Skipped unsafe unit entry in ${mask_list}: '${unit_name}'"
+                continue
+            fi
+            unit_path="${systemd_user_unit_dir}/${unit_name}"
+            [[ -L "$unit_path" ]] || continue
+            link_target="$(readlink "$unit_path" 2>/dev/null || true)"
+            if [[ "$link_target" != "/dev/null" ]]; then
+                log_warn "Skipped ${unit_path}: symlink target is '${link_target}' (expected /dev/null)"
+                continue
+            fi
+            if [[ "$dry_run" == "true" ]]; then
+                log_info "[DRY-RUN] Would unmask systemd user unit: ${unit_path}"
+            else
+                rm -f "$unit_path"
+                log_ok "Unmasked systemd user unit: ${unit_path}"
+            fi
+            removed_count=$(( removed_count + 1 ))
+            systemd_dirty="true"
+        done < "$mask_list"
     }
 
     # ==========================================================================
@@ -758,6 +812,23 @@ main() {
                 fi
             done
             [[ "$dry_run" != "true" ]] && rmdir /etc/systemd/system/nftables.service.d 2>/dev/null || true
+
+            local bsp_systemd_dropin bsp_dropin_dir
+            for bsp_systemd_dropin in \
+                "${systemd_unit_dir}/spacemit-k1-irq-affinity.service.d/90-rvdk-orangepi-rv2.conf" \
+                "${systemd_unit_dir}/spacemit-k1-cpufreq-iot.service.d/90-rvdk-orangepi-rv2.conf"; do
+                bsp_dropin_dir="$(dirname "$bsp_systemd_dropin")"
+                if [[ -f "$bsp_systemd_dropin" || -L "$bsp_systemd_dropin" ]]; then
+                    remove_path "$bsp_systemd_dropin"
+                    systemd_dirty="true"
+                    if [[ "$dry_run" == "true" && -d "$bsp_dropin_dir" && ! -L "$bsp_dropin_dir" ]]; then
+                        log_info "[DRY-RUN] Would remove directory if empty: ${bsp_dropin_dir}"
+                    fi
+                fi
+                if [[ "$dry_run" != "true" && -d "$bsp_dropin_dir" && ! -L "$bsp_dropin_dir" ]]; then
+                    rmdir "$bsp_dropin_dir" 2>/dev/null || true
+                fi
+            done
 
             if [[ -f /etc/systemd/journald.conf.d/90-rvdk-deeptune.conf ]]; then
                 remove_path "/etc/systemd/journald.conf.d/90-rvdk-deeptune.conf"
@@ -914,6 +985,7 @@ main() {
 
             if [[ "$restore_backups" == "true" ]]; then
                 restore_preserved_backups
+                unmask_systemd_user_units
             elif [[ -d "$backup_root" ]]; then
                 log_skip "Skipped restoring config backups from ${backup_root} (--no-restore-backups)"
             fi

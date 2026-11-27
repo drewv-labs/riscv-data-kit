@@ -577,7 +577,7 @@ else
     _RVDK_P4_TMP_MNT="$(mktemp -d "/tmp/rvdk_p4_sd_mnt.XXXXXX")"
     _run_priv mount "$PART_DEV" "$_RVDK_P4_TMP_MNT"
     rvdk_prog 85 "ESP32-P4 SD: copying staged payload to ${PART_DEV}..."
-    _run_priv cp -a "${STAGE_SOURCE}/." "${_RVDK_P4_TMP_MNT}/"
+    _run_priv cp -r --no-preserve=mode,ownership "${STAGE_SOURCE}/." "${_RVDK_P4_TMP_MNT}/"
     sync
     _run_priv umount "$_RVDK_P4_TMP_MNT"
     rmdir "$_RVDK_P4_TMP_MNT"

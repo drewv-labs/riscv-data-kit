@@ -14,6 +14,7 @@ set -Eeuo pipefail
 
 ORIG_ARGS=("$@")
 export DEBIAN_FRONTEND=noninteractive
+# shellcheck disable=SC2034 # Consumed by lib/apt.sh rvdk_apt_ensure
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 _SCRIPT_DIR=""
@@ -147,7 +148,9 @@ fi
 
 DATA_MOUNT="$(rvdk_resolve_data_mount "$EXPLICIT_DATA_MOUNT")"
 
-[[ "$MQTT_PORT" =~ ^[0-9]+$ ]] && (( MQTT_PORT >= 1 && MQTT_PORT <= 65535 )) || log_fatal "Invalid --port '${MQTT_PORT}'."
+if [[ ! "$MQTT_PORT" =~ ^[0-9]+$ ]] || (( MQTT_PORT < 1 || MQTT_PORT > 65535 )); then
+    log_fatal "Invalid --port '${MQTT_PORT}'."
+fi
 [[ "$MQTT_BIND" =~ ^[A-Za-z0-9.:_-]+$ ]] || log_fatal "Invalid --bind address '${MQTT_BIND}'."
 
 IS_LOOPBACK="false"

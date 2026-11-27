@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "release_tag": "rvdk-v1",
+  "bundles": {
+    "postgresql": {
+      "18.6": {}
+    },
+    "ntfy": {
+      "2.38.1": {}
+    }
+  }
+}

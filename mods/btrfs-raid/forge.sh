@@ -7,6 +7,7 @@
 #   • Supports explicit `.devices[]` paths OR size-bounded blank-disk discovery
 #   • Refuses to auto-select or overwrite any disk containing partitions, swap,
 #     LVM/RAID/LUKS headers, or filesystems unless `--force-wipe` is passed
+#     with explicit `.devices[]` and interactive confirmation or `-y`/`--yes`
 #   • Validates relative subdirectory paths and atomically updates `/etc/fstab`
 # ==============================================================================
 set -Eeuo pipefail
@@ -84,7 +85,15 @@ rvdk_log_init "RVDK:RAID"
 
 usage() {
     cat <<'EOF'
-Usage: sudo rvdk mods/btrfs-raid [--json '<arrays_json>'] [--force-wipe]
+Usage: sudo rvdk mods/btrfs-raid [--json '<arrays_json>'] [--force-wipe] [-y|--yes]
+
+Options:
+  --json '<arrays_json>'  Declarative JSON array of Btrfs RAID definitions
+  --force-wipe            Permit wiping pre-existing non-OS data on explicit .devices[]
+  -y, --yes               Confirm destructive --force-wipe non-interactively
+  --no-apt-update         Skip redundant apt-get update calls
+  --noprogbar             Disable persistent bottom progress bar
+  -h, --help              Show this help message and exit
 
 JSON Array Element Schema:
   {
@@ -108,9 +117,10 @@ done
 
 rvdk_require_root "${BASH_SOURCE[0]:-}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
 rvdk_resolve_caller
-rvdk_load_config_env RAID_ARRAYS_JSON FORCE_WIPE_RAID
+rvdk_load_config_env RAID_ARRAYS_JSON
 
-FORCE_WIPE_RAID="${FORCE_WIPE_RAID:-false}"
+FORCE_WIPE_RAID="false"
+ASSUME_YES="false"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --json)
@@ -118,6 +128,7 @@ while [[ $# -gt 0 ]]; do
             RAID_ARRAYS_JSON="$2"
             shift 2 ;;
         --force-wipe|--force-wipe-raid)     FORCE_WIPE_RAID="true"; shift ;;
+        -y|--yes)                           ASSUME_YES="true"; shift ;;
         --no-apt-update|--skip-apt-update)  export RVDK_NO_APT_UPDATE="1"; shift ;;
         --noprogbar|--no-progbar)           export RVDK_NO_PROGBAR="1"; shift ;;
         -h|--help)                          usage; exit 0 ;;
@@ -259,6 +270,10 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
         *) log_fatal "Unsupported Btrfs profile '${ARR_PROFILE}' on array '${ARR_NAME}'." ;;
     esac
 
+    if [[ "$FORCE_WIPE_RAID" == "true" ]] && [[ -z "$ARR_DEVS_RAW" ]] && (( ARR_EXPLICIT_DEVS_CNT == 0 )); then
+        log_fatal "${ARR_NAME}: refusing '--force-wipe' without explicit .devices[] list (implicit size-range auto-discovery only operates on blank disks)."
+    fi
+
     STEP_PCT=$(( 25 + ((i * 70) / ARRAY_COUNT) ))
     TYPE_UPPER="$(tr '[:lower:]' '[:upper:]' <<< "$ARR_TYPE")"
     rvdk_prog "$STEP_PCT" "Btrfs RAID (${ARR_PROFILE}): converging ${ARR_NAME} (${ARR_LABEL})..."
@@ -355,6 +370,9 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
             _btrfs_collect_explicit_devices "$ARR_NAME" "$ARR_DEVS_RAW"
             CANDIDATE_DISKS=("${_BTRFS_EXPLICIT_DEVS[@]}")
         else
+            if [[ "$FORCE_WIPE_RAID" == "true" ]]; then
+                log_fatal "${ARR_NAME}: refusing '--force-wipe' without explicit .devices[] list."
+            fi
             while IFS= read -r line; do
                 [[ -z "$line" ]] && continue
                 d_path="$(awk '{print $1}' <<< "$line")"
@@ -364,7 +382,7 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
                 [[ "$d_path" == /dev/nvme* || "$d_path" == /dev/mmcblk* || "$d_path" == /dev/zram* ]] && continue
                 d_path="$(readlink -f "$d_path" 2>/dev/null || echo "$d_path")"
                 rvdk_device_backs_os_or_swap "$d_path" && continue
-                if [[ "$FORCE_WIPE_RAID" == "false" ]] && ! rvdk_disk_is_blank "$d_path"; then
+                if ! rvdk_disk_is_blank "$d_path"; then
                     continue
                 fi
                 if (( d_size >= ARR_MIN_B && d_size <= ARR_MAX_B )); then
@@ -380,7 +398,7 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
             done < <(lsblk -b -dn -o PATH,SIZE,TYPE)
 
             if (( ${#CANDIDATE_DISKS[@]} != ARR_DISKS )); then
-                log_fatal "${ARR_NAME} requires ${ARR_DISKS} eligible blank disks between ${ARR_MIN_B} and ${ARR_MAX_B} bytes; found ${#CANDIDATE_DISKS[@]} (${CANDIDATE_DISKS[*]:-none}). Specify explicit \"devices\" or pass --force-wipe if re-initializing existing drives."
+                log_fatal "${ARR_NAME} requires ${ARR_DISKS} eligible blank disks between ${ARR_MIN_B} and ${ARR_MAX_B} bytes; found ${#CANDIDATE_DISKS[@]} (${CANDIDATE_DISKS[*]:-none}). Specify explicit \"devices\" (and pass --force-wipe if re-initializing existing drives)."
             fi
         fi
 
@@ -394,6 +412,20 @@ for (( i=0; i<ARRAY_COUNT; i++ )); do
         done
 
         if [[ "$FORCE_WIPE_RAID" == "true" ]]; then
+            if [[ "$ASSUME_YES" != "true" ]]; then
+                if [[ -t 0 ]]; then
+                    printf "\033[1;33m[CONFIRM]\033[0m --force-wipe will DESTROY existing partitions/data for array '%s' (label='%s') on: %s. Continue? [y/N]: " \
+                        "$ARR_NAME" "$ARR_LABEL" "${CANDIDATE_DISKS[*]}"
+                    _wipe_reply=""
+                    read -r _wipe_reply || true
+                    case "$_wipe_reply" in
+                        [Yy]|[Yy][Ee][Ss]) ;;
+                        *) log_fatal "Aborted by user." ;;
+                    esac
+                else
+                    log_fatal "Refusing destructive '--force-wipe' on '${ARR_NAME}' (${ARR_LABEL}: ${CANDIDATE_DISKS[*]}) without '--yes' (-y) when stdin is not a TTY."
+                fi
+            fi
             _btrfs_ensure_unmounted "$ARR_NAME" "$ARR_MOUNT" "${CANDIDATE_DISKS[@]}"
         fi
 

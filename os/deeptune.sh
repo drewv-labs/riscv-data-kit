@@ -78,6 +78,37 @@ if [[ -z "${_RVDK_PROGBAR_SH_LOADED:-}" ]]; then
     fi
 fi
 
+if ! typeset -f rvdk_backup_file >/dev/null 2>&1; then
+    rvdk_backup_file() {
+        local src_path="${1:-}"
+        local category="${2:-deeptune}"
+        [[ "$src_path" == /* && -f "$src_path" && ! -L "$src_path" ]] || return 1
+        [[ "$src_path" != *$'\n'* && "$src_path" != *$'\r'* && "$src_path" != *".."* ]] || return 1
+        [[ "$category" =~ ^[a-z0-9_-]+$ ]] || return 1
+
+        local backup_root="${RVDK_BACKUP_ROOT:-${RVDK_STATE_DIR:-/var/lib/rvdk}/backups}"
+        local encoded="${src_path#/}"
+        while [[ "$encoded" == /* ]]; do
+            encoded="${encoded#/}"
+        done
+        encoded="${encoded//\//__}"
+        local cat_dir="${backup_root}/${category}"
+        local orig_path="${cat_dir}/${encoded}.orig"
+        local sidecar_path="${cat_dir}/${encoded}.path"
+
+        if [[ -L "$backup_root" || -L "$cat_dir" || -L "$orig_path" || -L "$sidecar_path" ]]; then
+            log_fatal "Refusing symlink backup path under: ${cat_dir}"
+        fi
+        install -d -m 0755 "$cat_dir"
+        if [[ ! -f "$orig_path" ]]; then
+            cp -a "$src_path" "$orig_path"
+        fi
+        if [[ ! -f "$sidecar_path" ]]; then
+            printf '%s\n' "$src_path" | rvdk_atomic_write "$sidecar_path" 0644
+        fi
+    }
+fi
+
 rvdk_log_init "RVDK:OS-DEEPTUNE"
 
 if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
@@ -449,7 +480,8 @@ else
     systemd-tmpfiles --create --prefix /var/log/journal 2>/dev/null || true
 
     # Clear Armbian/OrangePi 20M SystemMaxUse override in /etc/systemd/journald.conf if present
-    if [[ -f /etc/systemd/journald.conf ]] && grep -qx 'SystemMaxUse=20M' /etc/systemd/journald.conf 2>/dev/null; then
+    if [[ -f /etc/systemd/journald.conf && ! -L /etc/systemd/journald.conf ]] && grep -qx 'SystemMaxUse=20M' /etc/systemd/journald.conf 2>/dev/null; then
+        rvdk_backup_file /etc/systemd/journald.conf deeptune
         _new_jconf="$(sed 's/^SystemMaxUse=20M$/#SystemMaxUse=/' /etc/systemd/journald.conf)"
         printf '%s\n' "$_new_jconf" | rvdk_atomic_write /etc/systemd/journald.conf 0644
     fi
@@ -619,13 +651,28 @@ USER_MASK_UNITS=(
     gcr-ssh-agent.socket
     gpg-agent-browser.socket
 )
+USER_MASK_BACKUP_ROOT="${RVDK_BACKUP_ROOT:-${RVDK_STATE_DIR:-/var/lib/rvdk}/backups}"
+USER_MASK_DIR="${USER_MASK_BACKUP_ROOT}/systemd-user"
+USER_MASK_LIST="${USER_MASK_DIR}/masked.list"
+USER_MASK_NEW=()
 USER_MASK_CHANGED="false"
 for uu in "${USER_MASK_UNITS[@]}"; do
     if [[ "$(readlink "/etc/systemd/user/${uu}" 2>/dev/null || true)" != "/dev/null" ]]; then
         ln -sf /dev/null "/etc/systemd/user/${uu}"
+        USER_MASK_NEW+=("$uu")
         USER_MASK_CHANGED="true"
     fi
 done
+if [[ ${#USER_MASK_NEW[@]} -gt 0 ]]; then
+    if [[ -L "$USER_MASK_BACKUP_ROOT" || -L "$USER_MASK_DIR" || -L "$USER_MASK_LIST" ]]; then
+        log_fatal "Refusing symlinked systemd-user backup path under ${USER_MASK_BACKUP_ROOT}"
+    fi
+    mkdir -p "$USER_MASK_DIR" && chmod 0755 "$USER_MASK_DIR"
+    {
+        [[ -f "$USER_MASK_LIST" ]] && cat "$USER_MASK_LIST"
+        printf '%s\n' "${USER_MASK_NEW[@]}"
+    } | awk 'NF && !seen[$0]++' | rvdk_atomic_write "$USER_MASK_LIST" 0644
+fi
 
 if pgrep -x "wireplumber|pipewire|pipewire-pulse" >/dev/null 2>&1 || pgrep -f "/usr/bin/pipewire" >/dev/null 2>&1; then
     pkill -TERM -x wireplumber 2>/dev/null || true

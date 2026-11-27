@@ -134,7 +134,7 @@ if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
 fi
 
 PERSIST_UNIT="/etc/systemd/system/rvdk-p550-hdmi-off.service"
-PLAT_DRV_BASE="/sys/bus/platform/drivers"
+PLAT_DRV_BASE="${RVDK_P550_PLAT_DRV_BASE:-/sys/bus/platform/drivers}"
 
 ACTION="toggle"
 PERSIST="false"
@@ -176,6 +176,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+while [[ "$PLAT_DRV_BASE" != "/" && "$PLAT_DRV_BASE" == */ ]]; do
+    PLAT_DRV_BASE="${PLAT_DRV_BASE%/}"
+done
+if [[ -z "$PLAT_DRV_BASE" || "$PLAT_DRV_BASE" != /* || "$PLAT_DRV_BASE" == "/" || "$PLAT_DRV_BASE" =~ (^|/)\.\.(/|$) || -L "$PLAT_DRV_BASE" ]]; then
+    log_fatal "Unsafe RVDK_P550_PLAT_DRV_BASE path: '${RVDK_P550_PLAT_DRV_BASE:-}'."
+fi
 
 if [[ "$ACTION" != "status" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
@@ -226,7 +233,7 @@ unbind_drv_matching() {
     local drv="$1"
     local d base
     local drv_dir="${PLAT_DRV_BASE}/${drv}"
-    [[ -d "$drv_dir" && -w "${drv_dir}/unbind" ]] || return 0
+    [[ -d "$drv_dir" && ! -L "$drv_dir" && -w "${drv_dir}/unbind" ]] || return 0
     for d in "${drv_dir}"/*; do
         [[ -L "$d" ]] || continue
         base="$(basename "$d")"
@@ -241,7 +248,7 @@ bind_drv_dev() {
     local drv="$1"
     local dev="$2"
     local drv_dir="${PLAT_DRV_BASE}/${drv}"
-    [[ -d "$drv_dir" && -w "${drv_dir}/bind" ]] || return 0
+    [[ -d "$drv_dir" && ! -L "$drv_dir" && -w "${drv_dir}/bind" ]] || return 0
     [[ -e "/sys/bus/platform/devices/${dev}" ]] || return 0
     if [[ ! -e "${drv_dir}/${dev}" ]]; then
         if printf '%s' "$dev" > "${drv_dir}/bind" 2>/dev/null; then

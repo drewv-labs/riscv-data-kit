@@ -544,27 +544,41 @@ main() {
     # 5. Converge Target `/etc/fstab`, `/boot/orangepiEnv.txt` & Hostname
     # --------------------------------------------------------------------------
     local fstab_out="${_EMMC_TMP_MNT}/etc/fstab"
+    local -a preserved_fstab_lines=()
+    if [[ -f /etc/fstab ]]; then
+        local _fstab_line
+        while IFS= read -r _fstab_line; do
+            [[ -n "$_fstab_line" ]] && preserved_fstab_lines+=("$_fstab_line")
+        done < <(awk '
+            /^[[:space:]]*#/ || NF < 3 { next }
+            $2 == "/" || $2 == "/boot" || $2 == "/tmp" || $3 == "swap" { next }
+            $1 ~ /mmcblk/ { next }
+            $3 ~ /^(proc|sysfs|devtmpfs|devpts|cgroup|cgroup2)$/ { next }
+            $3 == "tmpfs" && ($2 == "/run" || $2 ~ /^\/run\//) { next }
+            { print $0 }
+        ' /etc/fstab)
+    fi
+
     {
         printf "# Managed by RVDK (boards/orangepi/rv2/flash-emmc.sh | root=%s)\n" "$root_label"
         printf "UUID=%s\t/\text4\tdefaults,noatime,errors=remount-ro\t0\t1\n" "$emmc_uuid"
         printf "tmpfs\t/tmp\ttmpfs\tdefaults,nosuid\t0\t0\n"
-        if [[ -f /etc/fstab ]]; then
-            awk '
-                /^[[:space:]]*#/ || NF < 3 { next }
-                $2 == "/" || $2 == "/boot" || $2 == "/tmp" || $3 == "swap" { next }
-                $1 ~ /mmcblk/ { next }
-                $2 ~ /^\/mnt\// { print $0 }
-            ' /etc/fstab
+        if (( ${#preserved_fstab_lines[@]} > 0 )); then
+            printf "%s\n" "${preserved_fstab_lines[@]}"
         fi
     } > "$fstab_out"
     chmod 0644 "$fstab_out"
 
-    # Ensure mountpoint directories exist for any preserved /mnt/* NVMe LVM volumes
-    if [[ -f "$fstab_out" ]]; then
+    # Ensure mountpoint directories exist on the eMMC rootfs for all preserved entries
+    if (( ${#preserved_fstab_lines[@]} > 0 )); then
         local preserved_mp
         while IFS= read -r preserved_mp; do
-            [[ -n "$preserved_mp" ]] && mkdir -p "${_EMMC_TMP_MNT}${preserved_mp}"
-        done < <(awk '!/^[[:space:]]*#/ && $2 ~ /^\/mnt\// {print $2}' "$fstab_out")
+            [[ -n "$preserved_mp" && "$preserved_mp" == /* ]] || continue
+            [[ ! "$preserved_mp" =~ (^|/)\.\.(/|$) ]] || continue
+            [[ ! -L "${_EMMC_TMP_MNT}${preserved_mp}" ]] || continue
+            mkdir -p "${_EMMC_TMP_MNT}${preserved_mp}"
+            log_ok "Preserved fstab mountpoint on eMMC rootfs: ${preserved_mp}"
+        done < <(printf '%s\n' "${preserved_fstab_lines[@]}" | awk 'NF >= 2 { print $2 }')
     fi
     log_ok "Wrote de-collided eMMC /etc/fstab (UUID=${emmc_uuid})"
 

@@ -74,6 +74,52 @@ fi
 
 rvdk_log_init "RVDK:OPENWRT"
 
+if [[ -z "${_RVDK_TMPFILES+x}" ]]; then
+    _RVDK_TMPFILES=()
+fi
+if ! typeset -f _rvdk_cleanup_tmpfiles >/dev/null 2>&1; then
+    _rvdk_cleanup_tmpfiles() {
+        local _tf
+        for _tf in ${_RVDK_TMPFILES[@]+"${_RVDK_TMPFILES[@]}"}; do
+            [[ -n "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
+        done
+        _RVDK_TMPFILES=()
+    }
+fi
+if ! typeset -f _rvdk_untrack_tmpfile >/dev/null 2>&1; then
+    _rvdk_untrack_tmpfile() {
+        local target="${1:-}"
+        [[ -n "$target" ]] || return 0
+        local -a kept=()
+        local _tf
+        for _tf in ${_RVDK_TMPFILES[@]+"${_RVDK_TMPFILES[@]}"}; do
+            [[ -n "$_tf" && "$_tf" != "$target" ]] && kept+=("$_tf")
+        done
+        if [[ ${#kept[@]} -gt 0 ]]; then
+            _RVDK_TMPFILES=("${kept[@]}")
+        else
+            _RVDK_TMPFILES=()
+        fi
+    }
+fi
+if ! typeset -f rvdk_register_tmpfile >/dev/null 2>&1; then
+    rvdk_register_tmpfile() {
+        local tf="${1:-}"
+        [[ -n "$tf" ]] || return 0
+        if typeset -f _rvdk_install_cleanup_trap >/dev/null 2>&1; then
+            _rvdk_install_cleanup_trap "true"
+            _RVDK_TMPFILES+=("$tf")
+        else
+            _RVDK_TMPFILES+=("$tf")
+            if [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+                trap '_rvdk_cleanup_tmpfiles' EXIT
+                trap 'trap - EXIT INT; _rvdk_cleanup_tmpfiles; kill -INT $$' INT
+                trap 'trap - EXIT TERM; _rvdk_cleanup_tmpfiles; kill -TERM $$' TERM
+            fi
+        fi
+    }
+fi
+
 if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
     rvdk_sudo_preserve() {
         [[ $# -gt 0 ]] || return 1
@@ -356,20 +402,25 @@ if [[ -n "$TARGET_USER" && "$TARGET_USER" != "root" ]]; then
             SUDOERS_RULE="${TARGET_USER} ALL=(ALL) NOPASSWD: ALL"
             if [[ ! -f "$SUDOERS_FILE" ]] || ! grep -qxF "$SUDOERS_RULE" "$SUDOERS_FILE"; then
                 TMP_SUDOERS="$(mktemp "/etc/sudoers.d/.010_${TARGET_USER}-nopasswd.rvdk.XXXXXX")"
+                rvdk_register_tmpfile "$TMP_SUDOERS"
                 if ! printf '%s\n' "$SUDOERS_RULE" > "$TMP_SUDOERS" || ! chmod 0440 "$TMP_SUDOERS"; then
                     rm -f "$TMP_SUDOERS"
+                    _rvdk_untrack_tmpfile "$TMP_SUDOERS"
                     log_fatal "Failed to stage sudoers rule at ${TMP_SUDOERS}."
                 fi
                 if command -v visudo >/dev/null 2>&1; then
                     if ! visudo -cf "$TMP_SUDOERS" >/dev/null 2>&1; then
                         rm -f "$TMP_SUDOERS"
+                        _rvdk_untrack_tmpfile "$TMP_SUDOERS"
                         log_fatal "Generated sudoers rule failed visudo syntax check for '${TARGET_USER}'."
                     fi
                 fi
                 if ! mv -f "$TMP_SUDOERS" "$SUDOERS_FILE"; then
                     rm -f "$TMP_SUDOERS"
+                    _rvdk_untrack_tmpfile "$TMP_SUDOERS"
                     log_fatal "Failed to install validated sudoers rule to ${SUDOERS_FILE}."
                 fi
+                _rvdk_untrack_tmpfile "$TMP_SUDOERS"
                 log_ok "Configured passwordless sudo in ${SUDOERS_FILE}"
             else
                 log_skip "Passwordless sudo already active at ${SUDOERS_FILE}"
