@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PG18_FORGE = REPO_ROOT / "postgresql" / "18-6-io_uring" / "forge.sh"
 NTFY_FORGE = REPO_ROOT / "mods" / "ntfy" / "forge.sh"
+BUNDLE_CATALOG = REPO_ROOT / "catalog" / "bundles.json"
 README_PATH = REPO_ROOT / "README.md"
 
 VALID_TEST_SHA256 = "a" * 64
@@ -289,11 +291,90 @@ def _ntfy_helpers_src() -> str:
 
 
 class TestFailFastUnpinnedPolicy:
+    def test_catalog_bundles_json_lookup_and_validation(self, tmp_path: Path) -> None:
+        assert BUNDLE_CATALOG.is_file()
+        doc = json.loads(BUNDLE_CATALOG.read_text(encoding="utf-8"))
+        assert doc["schema_version"] == 1
+        assert doc["release_tag"] == "rvdk-v1"
+        assert "postgresql" in doc["bundles"]
+        assert "ntfy" in doc["bundles"]
+
+        cat_file = tmp_path / "bundles.json"
+        cat_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "release_tag": "rvdk-v1",
+                    "bundles": {
+                        "postgresql": {
+                            "18.6": {
+                                "starfive-jh7110": {
+                                    "bundle": "postgresql18-6-io_uring-starfive-jh7110.tar.zst",
+                                    "sha256": VALID_TEST_SHA256,
+                                    "release_tag": "rvdk-v1",
+                                },
+                                "wrong-tag": {
+                                    "bundle": "postgresql18-6-io_uring-wrong-tag.tar.zst",
+                                    "sha256": ALT_TEST_SHA256,
+                                    "release_tag": "rvdk-v999",
+                                },
+                            }
+                        },
+                        "ntfy": {
+                            "2.38.1": {
+                                "spacemit-k1": {
+                                    "bundle": "ntfy-2.38.1-spacemit-k1.tar.zst",
+                                    "sha256": ALT_TEST_SHA256,
+                                    "release_tag": "rvdk-v1",
+                                }
+                            }
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        pg_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+_REPO_ROOT="{REPO_ROOT}"
+RVDK_BUNDLE_CATALOG="{cat_file}"
+{_extract_bash_function(PG18_FORGE, "_pg_pinned_bundle_sha256")}
+printf 'HIT=%s\\n' "$(_pg_pinned_bundle_sha256 starfive-jh7110 postgresql18-6-io_uring-starfive-jh7110.tar.zst)"
+printf 'BAD_NAME=%s\\n' "$(_pg_pinned_bundle_sha256 starfive-jh7110 wrong.tar.zst)"
+printf 'BAD_TAG=%s\\n' "$(_pg_pinned_bundle_sha256 wrong-tag postgresql18-6-io_uring-wrong-tag.tar.zst)"
+printf 'MISS=%s\\n' "$(_pg_pinned_bundle_sha256 sifive-p550 postgresql18-6-io_uring-sifive-p550.tar.zst)"
+"""
+        )
+        assert pg_proc.returncode == 0, pg_proc.stderr
+        assert f"HIT={VALID_TEST_SHA256}\n" in pg_proc.stdout
+        assert "BAD_NAME=\n" in pg_proc.stdout
+        assert "BAD_TAG=\n" in pg_proc.stdout
+        assert "MISS=\n" in pg_proc.stdout
+
+        ntfy_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+_REPO_ROOT="{REPO_ROOT}"
+RVDK_BUNDLE_CATALOG="{cat_file}"
+NTFY_VERSION="2.38.1"
+{_extract_bash_function(NTFY_FORGE, "_ntfy_pinned_bundle_sha256")}
+printf 'HIT=%s\\n' "$(_ntfy_pinned_bundle_sha256 spacemit-k1 ntfy-2.38.1-spacemit-k1.tar.zst)"
+printf 'MISS=%s\\n' "$(_ntfy_pinned_bundle_sha256 sifive-p550 ntfy-2.38.1-sifive-p550.tar.zst)"
+"""
+        )
+        assert ntfy_proc.returncode == 0, ntfy_proc.stderr
+        assert f"HIT={ALT_TEST_SHA256}\n" in ntfy_proc.stdout
+        assert "MISS=\n" in ntfy_proc.stdout
+
     @pytest.mark.parametrize(
         "target_slug",
         ["starfive-jh7110", "sifive-p550", "spacemit-k1", "riscv64-generic"],
     )
-    def test_pg18_unpinned_target_fails_fast_without_cold_compile(
+    def test_pg18_unpinned_target_falls_back_to_source_build_by_default(
         self,
         tmp_path: Path,
         target_slug: str,
@@ -311,6 +392,7 @@ class TestFailFastUnpinnedPolicy:
         script = f"""
 set -Eeuo pipefail
 source "{REPO_ROOT}/lib/common.sh"
+_REPO_ROOT="{REPO_ROOT}"
 rvdk_prog() {{ :; }}
 PG_VERSION="18"
 TARGET_SLUG="{target_slug}"
@@ -321,6 +403,7 @@ PG_PREBUILT_DEB_URL=""
 BUNDLE_SHA256=""
 ALLOW_REMOTE_SHA="false"
 SKIP_BUNDLE_SHA="false"
+PREBUILT_ONLY="false"
 FORCE_BUILD="false"
 KEEP_BUILD_DIR="false"
 HAVE_VERIFIED_LOCAL_DEBS="false"
@@ -343,20 +426,18 @@ printf 'FORCE_BUILD=%s\\n' "$FORCE_BUILD"
             script,
             env={"PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(tmp_path)},
         )
-        assert proc.returncode != 0
+        assert proc.returncode == 0, proc.stderr
         assert "PINNED=\n" in proc.stdout
-        assert "[RVDK:FATAL]" in proc.stderr
-        assert "--bundle-sha256 <hex64>" in proc.stderr
-        assert "--allow-remote-sha256" in proc.stderr
-        assert "--force-build" in proc.stderr
-        assert "FORCE_BUILD=true" not in proc.stdout
+        assert "[WARN]" in proc.stdout
+        assert "catalog/bundles.json" in proc.stdout
+        assert "FORCE_BUILD=true\n" in proc.stdout
         assert not curl_log.exists(), "curl must not run when bundle digest is unpinned"
 
     @pytest.mark.parametrize(
         "target_slug",
         ["starfive-jh7110", "sifive-p550", "spacemit-k1", "riscv64-generic"],
     )
-    def test_ntfy_unpinned_target_fails_fast_without_cold_compile(
+    def test_ntfy_unpinned_target_falls_back_to_source_build_by_default(
         self,
         tmp_path: Path,
         target_slug: str,
@@ -375,6 +456,7 @@ printf 'FORCE_BUILD=%s\\n' "$FORCE_BUILD"
         script = f"""
 set -Eeuo pipefail
 source "{REPO_ROOT}/lib/common.sh"
+_REPO_ROOT="{REPO_ROOT}"
 rvdk_prog() {{ :; }}
 NTFY_VERSION="2.38.1"
 TARGET_SLUG="{target_slug}"
@@ -385,6 +467,7 @@ NTFY_PREBUILT_URL=""
 BUNDLE_SHA256=""
 ALLOW_REMOTE_SHA="false"
 SKIP_BUNDLE_SHA="false"
+PREBUILT_ONLY="false"
 FORCE_BUILD="false"
 KEEP_BUILD_DIR="false"
 NTFY_ENABLE_WEB="false"
@@ -409,14 +492,149 @@ printf 'FORCE_BUILD=%s\\n' "$FORCE_BUILD"
             script,
             env={"PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(tmp_path)},
         )
-        assert proc.returncode != 0
+        assert proc.returncode == 0, proc.stderr
         assert "PINNED=\n" in proc.stdout
+        assert "[WARN]" in proc.stdout
+        assert "catalog/bundles.json" in proc.stdout
+        assert "FORCE_BUILD=true\n" in proc.stdout
+        assert not curl_log.exists(), "curl must not run when bundle digest is unpinned"
+
+    @pytest.mark.parametrize(
+        ("mode", "custom_url"),
+        [
+            ("prebuilt_only", ""),
+            ("custom_url", "https://mirror.example.test/postgresql18-6-io_uring-starfive-jh7110.tar.zst"),
+        ],
+    )
+    def test_pg18_unpinned_fails_closed_on_prebuilt_only_or_custom_url(
+        self,
+        tmp_path: Path,
+        mode: str,
+        custom_url: str,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        curl_log = tmp_path / "curl.log"
+        _make_curl_shim(bin_dir, curl_log, {})
+
+        pg_lib = tmp_path / "pgdg"
+        repo_dir = pg_lib / "debs"
+        repo_dir.mkdir(parents=True)
+        bundle_name = "postgresql18-6-io_uring-starfive-jh7110.tar.zst"
+        release_base = "https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1"
+        bundle_url = custom_url or f"{release_base}/{bundle_name}"
+        prebuilt_only = "true" if mode == "prebuilt_only" else "false"
+
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+_REPO_ROOT="{REPO_ROOT}"
+rvdk_prog() {{ :; }}
+PG_VERSION="18"
+TARGET_SLUG="starfive-jh7110"
+BUNDLE_NAME="{bundle_name}"
+RVDK_RELEASE_BASE="{release_base}"
+BUNDLE_URL="{bundle_url}"
+PG_PREBUILT_DEB_URL="{custom_url}"
+BUNDLE_SHA256=""
+ALLOW_REMOTE_SHA="false"
+SKIP_BUNDLE_SHA="false"
+PREBUILT_ONLY="{prebuilt_only}"
+FORCE_BUILD="false"
+KEEP_BUILD_DIR="false"
+HAVE_VERIFIED_LOCAL_DEBS="false"
+PG_LIB_ROOT="{pg_lib}"
+BUILD_DIR="{pg_lib}/build"
+LOCAL_REPO_DIR="{repo_dir}"
+_PG_TMP_ARCHIVE=""
+_PG_TMP_KEY=""
+_PG_TMP_STAGE=""
+_PG_MIGRATING_DIR=""
+_PG_BUILD_ACTIVE="false"
+{_pg18_helpers_src()}
+rvdk_register_cleanup _rvdk_pg_cleanup
+{_extract_pg18_bundle_block()}
+printf 'FORCE_BUILD=%s\\n' "$FORCE_BUILD"
+"""
+        proc = _run_bash(
+            script,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(tmp_path)},
+        )
+        assert proc.returncode != 0
         assert "[RVDK:FATAL]" in proc.stderr
         assert "--bundle-sha256 <hex64>" in proc.stderr
         assert "--allow-remote-sha256" in proc.stderr
-        assert "--force-build" in proc.stderr
         assert "FORCE_BUILD=true" not in proc.stdout
-        assert not curl_log.exists(), "curl must not run when bundle digest is unpinned"
+        assert not curl_log.exists()
+
+    @pytest.mark.parametrize(
+        ("mode", "custom_url"),
+        [
+            ("prebuilt_only", ""),
+            ("custom_url", "https://mirror.example.test/ntfy-2.38.1-starfive-jh7110.tar.zst"),
+        ],
+    )
+    def test_ntfy_unpinned_fails_closed_on_prebuilt_only_or_custom_url(
+        self,
+        tmp_path: Path,
+        mode: str,
+        custom_url: str,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        curl_log = tmp_path / "curl.log"
+        _make_curl_shim(bin_dir, curl_log, {})
+
+        ntfy_lib = tmp_path / "ntfy"
+        bundle_dir = ntfy_lib / "bundles"
+        bundle_dir.mkdir(parents=True)
+        bundle_name = "ntfy-2.38.1-starfive-jh7110.tar.zst"
+        release_base = "https://github.com/drewv-labs/riscv-data-kit/releases/download/rvdk-v1"
+        bundle_url = custom_url or f"{release_base}/{bundle_name}"
+        local_bundle = bundle_dir / bundle_name
+        prebuilt_only = "true" if mode == "prebuilt_only" else "false"
+
+        script = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+_REPO_ROOT="{REPO_ROOT}"
+rvdk_prog() {{ :; }}
+NTFY_VERSION="2.38.1"
+TARGET_SLUG="starfive-jh7110"
+BUNDLE_NAME="{bundle_name}"
+RVDK_RELEASE_BASE="{release_base}"
+BUNDLE_URL="{bundle_url}"
+NTFY_PREBUILT_URL="{custom_url}"
+BUNDLE_SHA256=""
+ALLOW_REMOTE_SHA="false"
+SKIP_BUNDLE_SHA="false"
+PREBUILT_ONLY="{prebuilt_only}"
+FORCE_BUILD="false"
+KEEP_BUILD_DIR="false"
+NTFY_ENABLE_WEB="false"
+NTFY_LIB_ROOT="{ntfy_lib}"
+BUNDLE_DIR="{bundle_dir}"
+BUILD_DIR="{ntfy_lib}/build"
+LOCAL_BUNDLE="{local_bundle}"
+LOCAL_BUNDLE_SHA="{local_bundle}.sha256"
+_NTFY_TMP_ARCHIVE=""
+_NTFY_TMP_EXTRACT=""
+_NTFY_TMP_PKG=""
+_NTFY_TMP_GO_TGZ=""
+_NTFY_BUILD_ACTIVE="false"
+{_ntfy_helpers_src()}
+rvdk_register_cleanup _rvdk_ntfy_cleanup
+{_extract_ntfy_bundle_block()}
+printf 'FORCE_BUILD=%s\\n' "$FORCE_BUILD"
+"""
+        proc = _run_bash(
+            script,
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}", "TMPDIR": str(tmp_path)},
+        )
+        assert proc.returncode != 0
+        assert "[RVDK:FATAL]" in proc.stderr
+        assert "--bundle-sha256 <hex64>" in proc.stderr
+        assert "--allow-remote-sha256" in proc.stderr
+        assert "FORCE_BUILD=true" not in proc.stdout
+        assert not curl_log.exists()
 
     def test_allow_remote_sha256_fails_closed_on_empty_or_http_sidecar(
         self,

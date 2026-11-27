@@ -665,6 +665,7 @@ class TestExistingLayersIotDeepTuneParity:
             .replace("/etc/openwrt_release", str(sys_root / "etc" / "openwrt_release"))
             .replace("/var/log/journal", str(sys_root / "var" / "log" / "journal"))
             .replace("/var/log/sysstat", str(sys_root / "var" / "log" / "sysstat"))
+            .replace("/var/lib/rvdk", str(sys_root / "var" / "lib" / "rvdk"))
             .replace("/lib/systemd/system", str(sys_root / "lib" / "systemd" / "system"))
             .replace("/usr/lib/systemd/system", str(sys_root / "usr" / "lib" / "systemd" / "system"))
             .replace("/sys/kernel/mm/transparent_hugepage", str(tmp_path / "no_thp"))

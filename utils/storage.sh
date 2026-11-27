@@ -87,6 +87,7 @@ Size & Tuning Options:
   --pct-free <1..100>     Percentage of unallocated VG elastic pool extents ('grow' only)
   --vg <vg_name>          Explicit LVM Volume Group override (auto-detected by default)
   --weights <lv:w,...>    Comma-separated autotune weights (e.g. --weights lv_data:1.5,lv_secondary:1.0)
+  --json                  (status) Emit schema_version=1 JSON telemetry for VG and LVs
   --dry-run, -n           Compute and print exact LVM/FS resize plan without mutating disks
   --distribute-pool       (autotune) Proportionally distribute elastic pool even below high-water
 EOF
@@ -154,6 +155,7 @@ main() {
     local size_tb=""
     local pct_free=""
     local dry_run="false"
+    local output_json="false"
     local high_water=75
     local target_util=60
     local low_water=30
@@ -203,6 +205,8 @@ main() {
                 _require_arg "$@"; primary_mount="$2"; shift 2 ;;
             --nfs-mount|--secondary-mount)
                 _require_arg "$@"; secondary_mount="$2"; shift 2 ;;
+            --json)
+                output_json="true"; shift ;;
             --dry-run|-n)
                 dry_run="true"; shift ;;
             --high-water)
@@ -456,6 +460,76 @@ main() {
         if [[ "$any_lv" == "false" ]]; then
             printf "  • Logical Volumes    : (none provisioned in %s)\n" "$vg_name"
         fi
+    }
+
+    _storage_json_str() {
+        if typeset -f rvdk_json_escape >/dev/null 2>&1; then
+            rvdk_json_escape "${1-}"
+            return 0
+        fi
+        local s="${1-}"
+        local bs="\\"
+        s="${s//"$bs"/"$bs$bs"}"
+        s="${s//\"/\\\"}"
+        s="${s//$'\t'/\\t}"
+        s="${s//$'\r'/\\r}"
+        s="${s//$'\n'/\\n}"
+        printf '"%s"' "$s"
+    }
+
+    print_status_json() {
+        read_vg_metrics
+        local reserve_pct=0
+        (( vg_ext_total > 0 )) && reserve_pct=$(( (vg_ext_free * 100) / vg_ext_total ))
+
+        printf '{\n'
+        printf '  "schema_version": 1,\n'
+        printf '  "vg_name": %s,\n' "$(_storage_json_str "$vg_name")"
+        printf '  "vg_size_bytes": %s,\n' "${vg_size_b:-0}"
+        printf '  "vg_free_bytes": %s,\n' "${vg_free_b:-0}"
+        printf '  "vg_extent_bytes": %s,\n' "${vg_pe_b:-0}"
+        printf '  "vg_extents_total": %s,\n' "${vg_ext_total:-0}"
+        printf '  "vg_extents_free": %s,\n' "${vg_ext_free:-0}"
+        printf '  "vg_reserve_pct": %s,\n' "$reserve_pct"
+        printf '  "lvs": ['
+
+        local lv_item idx=0 mounted_bool mnt_json
+        while IFS= read -r lv_item; do
+            [[ -n "$lv_item" ]] || continue
+            probe_lv "$lv_item" ""
+            if (( idx > 0 )); then
+                printf ','
+            fi
+            printf '\n'
+            if [[ -n "$LV_MNT" ]]; then
+                mounted_bool="true"
+                mnt_json="$(_storage_json_str "$LV_MNT")"
+            else
+                mounted_bool="false"
+                mnt_json="null"
+            fi
+            printf '    {\n'
+            printf '      "name": %s,\n' "$(_storage_json_str "$lv_item")"
+            printf '      "path": %s,\n' "$(_storage_json_str "$LV_PATH")"
+            printf '      "size_bytes": %s,\n' "${LV_SIZE_B:-0}"
+            printf '      "extents": %s,\n' "${LV_EXT:-0}"
+            printf '      "mounted": %s,\n' "$mounted_bool"
+            printf '      "mount_point": %s,\n' "$mnt_json"
+            printf '      "fstype": %s,\n' "$(_storage_json_str "$LV_FSTYPE")"
+            printf '      "fs_size_bytes": %s,\n' "${FS_SIZE_B:-0}"
+            printf '      "fs_used_bytes": %s,\n' "${FS_USED_B:-0}"
+            printf '      "fs_avail_bytes": %s,\n' "${FS_AVAIL_B:-0}"
+            printf '      "fs_util_pct": %s\n' "${FS_UTIL_PCT:-0}"
+            printf '    }'
+            idx=$(( idx + 1 ))
+        done < <(list_vg_lvs)
+
+        if (( idx > 0 )); then
+            printf '\n  ]\n'
+        else
+            printf ']\n'
+        fi
+        printf '}\n'
     }
 
     extend_lv_online() {
@@ -858,7 +932,11 @@ main() {
 
     case "$subcmd" in
         status|list|info|show)
-            print_status_report
+            if [[ "$output_json" == "true" ]]; then
+                print_status_json
+            else
+                print_status_report
+            fi
             ;;
         grow|extend|add)
             [[ -z "$target_lv" ]] && log_fatal "Missing --lv <lv_name>. Usage: sudo rvdk storage grow --lv <lv_name> --gb <N>"

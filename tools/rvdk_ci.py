@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -81,6 +82,7 @@ BINARY_EXTENSIONS = {
 STAGE_ITEMS = (
     "bootstrap.sh",
     "install-cli.sh",
+    "catalog",
     "lib",
     "os",
     "bsp",
@@ -564,6 +566,167 @@ def check_kit_board_aliases(repo_root: Path) -> list[str]:
     return errors
 
 
+FORBIDDEN_SUDO_PRESERVE_VARS: frozenset[str] = frozenset(
+    {
+        "RVDK_ENGINE_DIR",
+        "RVDK_BASE_URL",
+        "RVDK_REPO_URL",
+        "RVDK_BOARDS_DIR",
+        "RVDK_ENV_FILE",
+        "RVDK_SYSTEMD_UNIT_DIR",
+        "RVDK_RELEASE_BASE",
+        "RVDK_MIRROR_URL",
+        "RVDK_STATE_DIR",
+        "RVDK_BACKUP_ROOT",
+        "RVDK_KIT_CACHE_FILE",
+        "RVDK_P550_PLAT_DRV_BASE",
+        "RVDK_PROGBAR_LIB",
+        "RVDK_APT_LIB",
+        "XDG_CACHE_HOME",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "PATH",
+    }
+)
+
+
+def check_bundle_catalog(repo_root: Path) -> list[str]:
+    """Validate catalog/bundles.json schema and SHA-256 entries."""
+    errors: list[str] = []
+    catalog_path = repo_root / "catalog" / "bundles.json"
+    if not catalog_path.is_file():
+        errors.append("catalog/bundles.json: missing declarative bundle catalog")
+        return errors
+
+    try:
+        data = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"catalog/bundles.json: invalid JSON ({exc})")
+        return errors
+
+    if not isinstance(data, dict):
+        errors.append("catalog/bundles.json: root must be a JSON object")
+        return errors
+
+    if data.get("schema_version") != 1:
+        errors.append(f"catalog/bundles.json: schema_version must be 1, got {data.get('schema_version')!r}")
+
+    release_tag = data.get("release_tag")
+    tag_re = re.compile(r"^[A-Za-z0-9._-]+$")
+    if not isinstance(release_tag, str) or not tag_re.match(release_tag):
+        errors.append(f"catalog/bundles.json: invalid top-level release_tag {release_tag!r}")
+
+    bundles = data.get("bundles")
+    if not isinstance(bundles, dict):
+        errors.append("catalog/bundles.json: bundles must be a JSON object")
+        return errors
+
+    sha256_re = re.compile(r"^[0-9a-f]{64}$")
+    for mod_name, versions in bundles.items():
+        if not isinstance(mod_name, str) or not mod_name or not isinstance(versions, dict):
+            errors.append(f"catalog/bundles.json: module {mod_name!r} must map to an object of versions")
+            continue
+        for ver, targets in versions.items():
+            if not isinstance(ver, str) or not ver or not isinstance(targets, dict):
+                errors.append(f"catalog/bundles.json: {mod_name}.{ver} must map to an object of target slugs")
+                continue
+            for slug, entry in targets.items():
+                prefix = f"catalog/bundles.json: bundles.{mod_name}.{ver}.{slug}"
+                if not isinstance(slug, str) or not slug or not isinstance(entry, dict):
+                    errors.append(f"{prefix} must be a JSON object")
+                    continue
+                bundle_file = entry.get("bundle")
+                if not isinstance(bundle_file, str) or not bundle_file.strip():
+                    errors.append(f"{prefix}.bundle must be a non-empty string")
+                sha = entry.get("sha256")
+                if not isinstance(sha, str) or not sha256_re.match(sha):
+                    errors.append(f"{prefix}.sha256 must be a 64-character lowercase hex digest")
+                entry_tag = entry.get("release_tag")
+                if not isinstance(entry_tag, str) or not tag_re.match(entry_tag):
+                    errors.append(f"{prefix}.release_tag must be a valid release tag string")
+
+    return errors
+
+
+def _extract_allowlist_entries(text: str, pattern: re.Pattern[str]) -> list[str] | None:
+    match = pattern.search(text)
+    if match is None:
+        return None
+    tokens: list[str] = []
+    for raw_line in match.group(1).splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        tokens.extend(line.split())
+    return tokens
+
+
+def check_sudo_preserve_allowlists(repo_root: Path) -> list[str]:
+    """Enforce exact parity across all rvdk_sudo_preserve allowlists and ban steering vars."""
+    errors: list[str] = []
+    common_path = repo_root / "lib" / "common.sh"
+    if not common_path.is_file():
+        errors.append("lib/common.sh: missing canonical _RVDK_SUDO_PRESERVE_ALLOWLIST")
+        return errors
+
+    canonical_re = re.compile(
+        r"^_RVDK_SUDO_PRESERVE_ALLOWLIST=\(\n(.*?)\n\)",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    common_entries = _extract_allowlist_entries(common_path.read_text(encoding="utf-8"), canonical_re)
+    if common_entries is None or not common_entries:
+        errors.append("lib/common.sh: missing or empty _RVDK_SUDO_PRESERVE_ALLOWLIST")
+        return errors
+
+    canonical_set = set(common_entries)
+    if len(canonical_set) != len(common_entries):
+        errors.append("lib/common.sh: _RVDK_SUDO_PRESERVE_ALLOWLIST contains duplicate entries")
+
+    bad_canonical = sorted(canonical_set & FORBIDDEN_SUDO_PRESERVE_VARS)
+    if bad_canonical:
+        errors.append(
+            f"lib/common.sh: _RVDK_SUDO_PRESERVE_ALLOWLIST contains forbidden steering/injection var(s): {bad_canonical}"
+        )
+
+    inline_re = re.compile(
+        r"^[ \t]*local -a (?:_allow|_allowlist)=\(\n(.*?)\n[ \t]*\)",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    for sh in collect_sh_files(repo_root):
+        rel = sh.relative_to(repo_root)
+        if str(rel) == "lib/common.sh":
+            continue
+        text = sh.read_text(encoding="utf-8")
+        if "rvdk_sudo_preserve()" not in text:
+            continue
+        entries = _extract_allowlist_entries(text, inline_re)
+        if entries is None:
+            if "--preserve-env" in text:
+                errors.append(
+                    f"{rel}: defines rvdk_sudo_preserve() with --preserve-env but no parsable inline allowlist array"
+                )
+            continue
+        entry_set = set(entries)
+        if len(entry_set) != len(entries):
+            errors.append(f"{rel}: inline rvdk_sudo_preserve allowlist contains duplicate entries")
+        bad_inline = sorted(entry_set & FORBIDDEN_SUDO_PRESERVE_VARS)
+        if bad_inline:
+            errors.append(
+                f"{rel}: inline rvdk_sudo_preserve allowlist contains forbidden steering/injection var(s): {bad_inline}"
+            )
+        if entry_set != canonical_set:
+            missing = sorted(canonical_set - entry_set)
+            extra = sorted(entry_set - canonical_set)
+            errors.append(
+                f"{rel}: inline rvdk_sudo_preserve allowlist out of sync with lib/common.sh "
+                f"(missing={missing}, extra={extra})"
+            )
+
+    return errors
+
+
 def check_forbidden_patterns(repo_root: Path) -> list[str]:
     errors: list[str] = []
     self_path = (repo_root / "tools" / "rvdk_ci.py").resolve()
@@ -728,6 +891,14 @@ def bundle_dist(
                 sh_path.write_text(rendered, encoding="utf-8")
                 bundled_count += 1
 
+    sha_lines: list[str] = []
+    for sh_file in collect_sh_files(out_real):
+        rel_sh = sh_file.relative_to(out_real).as_posix()
+        digest = hashlib.sha256(sh_file.read_bytes()).hexdigest()
+        sha_lines.append(f"{digest}  {rel_sh}")
+    if sha_lines:
+        (out_real / "SHA256SUMS").write_text("\n".join(sha_lines) + "\n", encoding="utf-8")
+
     if not quiet:
         print(f"[RVDK:BUNDLE] Staged static site in {out_real} ({bundled_count} standalone scripts inlined).")
     errors = check_bundled_invariants(out_real)
@@ -741,6 +912,7 @@ def bundle_dist(
 def run_checks(repo_root: Path, skip_shellcheck: bool = False) -> int:
     all_errors: list[str] = []
     all_errors.extend(check_manifests(repo_root))
+    all_errors.extend(check_bundle_catalog(repo_root))
     all_errors.extend(check_kit_board_aliases(repo_root))
     all_errors.extend(check_symlinks(repo_root))
     all_errors.extend(check_bash_syntax(repo_root, repo_root))
@@ -748,6 +920,7 @@ def run_checks(repo_root: Path, skip_shellcheck: bool = False) -> int:
         all_errors.extend(check_shellcheck(repo_root, repo_root, external_sources=True))
     all_errors.extend(check_forbidden_patterns(repo_root))
     all_errors.extend(check_sudo_dash_e(repo_root, repo_root))
+    all_errors.extend(check_sudo_preserve_allowlists(repo_root))
 
     with tempfile.TemporaryDirectory(prefix="rvdk_ci_bundle_") as tmp_dir:
         bundle_errs = bundle_dist(

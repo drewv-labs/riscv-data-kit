@@ -1567,3 +1567,46 @@ run_headless_debloat
         assert p2.returncode == 0, f"stdout={p2.stdout}\nstderr={p2.stderr}"
         assert "[SKIP]" in p2.stdout
 
+
+
+class TestPhase5SudoPreservePrivilegeBoundary:
+    def test_steering_env_vars_never_preserved_across_sudo_boundary(self, tmp_path: Path) -> None:
+        steering_vars = (
+            "RVDK_ENGINE_DIR",
+            "RVDK_BASE_URL",
+            "RVDK_REPO_URL",
+            "RVDK_BOARDS_DIR",
+            "RVDK_ENV_FILE",
+            "RVDK_SYSTEMD_UNIT_DIR",
+            "RVDK_RELEASE_BASE",
+            "RVDK_MIRROR_URL",
+            "RVDK_STATE_DIR",
+            "RVDK_BACKUP_ROOT",
+            "RVDK_KIT_CACHE_FILE",
+            "RVDK_P550_PLAT_DRV_BASE",
+        )
+        bin_dir = tmp_path / "bin"
+        sudo_log = tmp_path / "sudo.log"
+        _write_exe(
+            bin_dir / "sudo",
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{sudo_log}"\nexit 0\n',
+        )
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_TUNE": "edge",
+            **{var: f"/evil/{var}" for var in steering_vars},
+        }
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_sudo_preserve true
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        sudo_line = sudo_log.read_text(encoding="utf-8").strip()
+        assert "--preserve-env=" in sudo_line
+        assert "RVDK_TUNE" in sudo_line
+        for var in steering_vars:
+            assert var not in sudo_line, f"Steering var {var} leaked into sudo args: {sudo_line}"

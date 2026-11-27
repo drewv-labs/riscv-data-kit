@@ -794,3 +794,87 @@ class TestConsolidatedCommonHelpersBundling:
         syn = subprocess.run([_find_bash(), "-n"], input=rendered, capture_output=True, text=True, check=False)
         assert syn.returncode == 0, syn.stderr
 
+
+
+class TestBundleCatalogAndSudoAllowlistCI:
+    def test_repo_bundle_catalog_and_sudo_allowlists_pass(self) -> None:
+        assert rvdk_ci.check_bundle_catalog(REPO_ROOT) == []
+        assert rvdk_ci.check_sudo_preserve_allowlists(REPO_ROOT) == []
+
+    def test_check_bundle_catalog_rejects_bad_schema_sha_and_bundle(self, tmp_path: Path) -> None:
+        cat_dir = tmp_path / "catalog"
+        cat_dir.mkdir()
+        cat_file = cat_dir / "bundles.json"
+
+        # Valid catalog with pinned entry
+        cat_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "release_tag": "rvdk-v1",
+                    "bundles": {
+                        "postgresql": {
+                            "18.6": {
+                                "debian-13-riscv64": {
+                                    "bundle": "rvdk-pg18.6-debian-13-riscv64.tar.zst",
+                                    "sha256": VALID_SHA256,
+                                    "release_tag": "rvdk-v1",
+                                }
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert rvdk_ci.check_bundle_catalog(tmp_path) == []
+
+        # Bad schema_version + bad hex sha256 + missing bundle
+        cat_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "release_tag": "bad tag!",
+                    "bundles": {
+                        "postgresql": {
+                            "18.6": {
+                                "debian-13-riscv64": {
+                                    "bundle": "",
+                                    "sha256": "NOT_HEX",
+                                }
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        errs = rvdk_ci.check_bundle_catalog(tmp_path)
+        assert any("schema_version" in e for e in errs), errs
+        assert any("release_tag" in e for e in errs), errs
+        assert any("bundle" in e for e in errs), errs
+        assert any("64-character lowercase hex" in e for e in errs), errs
+
+    def test_check_sudo_preserve_allowlists_catches_drift_and_steering_vars(
+        self, tmp_path: Path
+    ) -> None:
+        repo = tmp_path / "repo"
+        (repo / "lib").mkdir(parents=True)
+        (repo / "os").mkdir(parents=True)
+        common_src = (REPO_ROOT / "lib" / "common.sh").read_text(encoding="utf-8")
+        (repo / "lib" / "common.sh").write_text(common_src, encoding="utf-8")
+        (repo / "os" / "bootstrap-apt.sh").write_text(
+            (REPO_ROOT / "os" / "bootstrap-apt.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        assert rvdk_ci.check_sudo_preserve_allowlists(repo) == []
+
+        # Drift inline fallback allowlist in os/bootstrap-apt.sh
+        apt_txt = (repo / "os" / "bootstrap-apt.sh").read_text(encoding="utf-8")
+        (repo / "os" / "bootstrap-apt.sh").write_text(
+            apt_txt.replace("RVDK_NO_PROGBAR", "RVDK_NO_PROGBAR RVDK_BASE_URL", 1),
+            encoding="utf-8",
+        )
+        errs = rvdk_ci.check_sudo_preserve_allowlists(repo)
+        assert any("RVDK_BASE_URL" in e for e in errs), errs
+        assert any("out of sync with lib/common.sh" in e for e in errs), errs

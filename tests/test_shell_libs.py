@@ -2299,3 +2299,215 @@ exec "{real_uname}" "$@"
             check=False,
         )
         assert p_bad.returncode != 0
+
+
+class TestPhase5BspAndBootstrapHardening:
+    def test_bsp_converge_warns_and_skips_unreadable_mmc_sysfs_without_guessing(
+        self, tmp_path: Path
+    ) -> None:
+        sys_block = tmp_path / "sys" / "block"
+        (sys_block / "mmcblk0" / "device").mkdir(parents=True)
+        # Intentionally omit device/type so /sys/block/mmcblk0/device/type is unreadable
+        dev_dir = tmp_path / "dev"
+        dev_dir.mkdir()
+        (dev_dir / "mmcblk0").write_text("", encoding="utf-8")
+        (dev_dir / "mmcblk0p1").write_text("", encoding="utf-8")
+
+        bsp_src = (REPO_ROOT / "lib" / "bsp.sh").read_text(encoding="utf-8")
+        patched_bsp = tmp_path / "bsp_sysfs_test.sh"
+        patched_bsp.write_text(
+            bsp_src.replace("/sys/block/mmcblk*", f"{sys_block}/mmcblk*")
+            .replace("/sys/block/${_b}/device/type", f"{sys_block}/${{_b}}/device/type")
+            .replace('[[ -b "/dev/${_b}" ]]', f'[[ -e "{dev_dir}/${{_b}}" ]]'),
+            encoding="utf-8",
+        )
+        bin_dir = tmp_path / "bin"
+        _write_exe(bin_dir / "findmnt", f'#!/usr/bin/env bash\nprintf "%s\\n" "{dev_dir}/mmcblk0p1"\n')
+        _write_exe(bin_dir / "lsblk", '#!/usr/bin/env bash\nprintf "mmcblk0\\n"\n')
+        _write_exe(bin_dir / "e2label", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "blkid", "#!/usr/bin/env bash\nexit 0\n")
+
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{patched_bsp}"
+rvdk_bsp_converge_mmc_root_labels
+""",
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "[WARN]" in proc.stdout
+        assert "skipping mmcblk0 without guessing SD/eMMC identity" in proc.stdout
+
+    def test_bootstrap_need_root_scoping_and_fetch_and_run_tls_sha256_gate(
+        self, tmp_path: Path
+    ) -> None:
+        boot_src = (REPO_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+        # Extract the NEED_ROOT computation block up to _escalate_root_if_needed
+        end_idx = boot_src.index("_escalate_root_if_needed() {")
+        need_root_snippet = boot_src[:end_idx]
+        # Strip zsh re-exec and header lines up to NEED_ROOT="true"
+        start_idx = need_root_snippet.index('NEED_ROOT="true"')
+        need_root_block = need_root_snippet[start_idx:]
+
+        for args, expected in [
+            ("mods/nvme-4kn --dry-run", "true"),
+            ("os --stage-dir /tmp/stage", "true"),
+            ("day0 --board p550 --stage-dir /tmp/stage", "true"),
+            ("day0 --board p4 --stage-dir /tmp/stage", "false"),
+            ("uninstall --dry-run", "false"),
+            ("storage status", "false"),
+            ("kit --status", "false"),
+        ]:
+            proc = _run_bash(
+                f"""
+set -Eeuo pipefail
+set -- {args}
+{need_root_block}
+printf '%s\\n' "$NEED_ROOT"
+"""
+            )
+            assert proc.returncode == 0, f"args={args}: {proc.stderr}"
+            assert proc.stdout.strip() == expected, f"args={args}: expected {expected}, got {proc.stdout.strip()}"
+
+        # Behavioral test of _rvdk_bootstrap_fetch_and_run (TLS 1.2+ flags + SHA256SUMS verification)
+        fetch_start = boot_src.index("_rvdk_bootstrap_sha256() {")
+        fetch_end = boot_src.index("print_cli_help() {")
+        fetch_helpers = boot_src[fetch_start:fetch_end]
+
+        payload = "#!/usr/bin/env bash\necho REMOTE_EXECUTED_OK\n"
+        import hashlib
+
+        good_sha = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        bad_sha = "0" * 64
+
+        bin_dir = tmp_path / "bin"
+        curl_log = tmp_path / "curl.log"
+        sums_file = tmp_path / "remote_sums.txt"
+        sums_file.write_text(f"{bad_sha}  install-cli.sh\n", encoding="utf-8")
+
+        _write_exe(
+            bin_dir / "curl",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{curl_log}"
+out=""
+url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) url="$1"; shift ;;
+    esac
+done
+if [[ "$url" == */SHA256SUMS ]]; then
+    cp "{sums_file}" "$out"
+    exit 0
+fi
+cat <<'EOF' > "$out"
+{payload.rstrip()}
+EOF
+exit 0
+""",
+        )
+
+        # 1. Digest mismatch MUST fail closed and never execute payload
+        p_bad = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+RVDK_BASE_URL="https://rvdk.drewv-labs.dev"
+{fetch_helpers}
+_rvdk_bootstrap_fetch_and_run "install-cli.sh"
+""",
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert p_bad.returncode != 0
+        assert "SHA-256 verification failed" in p_bad.stderr
+        assert "REMOTE_EXECUTED_OK" not in p_bad.stdout
+        curl_calls = curl_log.read_text(encoding="utf-8").splitlines()
+        assert all("--proto =https --tlsv1.2" in c for c in curl_calls), curl_calls
+
+        # 2. Matching SHA-256 passes verification and executes payload cleanly
+        sums_file.write_text(f"{good_sha}  install-cli.sh\n", encoding="utf-8")
+        p_ok = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+RVDK_BASE_URL="https://rvdk.drewv-labs.dev"
+{fetch_helpers}
+_rvdk_bootstrap_fetch_and_run "install-cli.sh"
+""",
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert p_ok.returncode == 0, p_ok.stderr
+        assert "REMOTE_EXECUTED_OK" in p_ok.stdout
+
+
+class TestPhase6GoMigrationReadiness:
+    def test_rvdk_kit_json_schema_v1_and_special_char_escaping(self, tmp_path: Path) -> None:
+        dt_env = tmp_path / "deeptune.env"
+        dt_env.write_text('RVDK_TUNE="edge"\n', encoding="utf-8")
+
+        proc = _run_bash(
+            f'bash "{REPO_ROOT}/bootstrap.sh" kit --board sifive/p550 --os ubuntu --no-cache --json',
+            env={
+                "PATH": os.environ["PATH"],
+                "RVDK_DEEPTUNE_ENV": str(dt_env),
+                "RVDK_KIT_CACHE_FILE": str(tmp_path / "missing_kit.env"),
+            },
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        doc = json.loads(proc.stdout)
+        assert doc["schema_version"] == 1
+        assert doc["board"] == "sifive/p550"
+        assert doc["board_tag"] == "p550"
+        assert doc["soc"] == "eswin/eic7700x"
+        assert doc["soc_slug"] == "eswin-eic7700x"
+        assert doc["arch"] == "riscv64"
+        assert doc["active_tune"] == "edge"
+        assert "os/deeptune.sh" in doc["deeptune_chain"]
+        assert "bsp/eswin/eic7700x/deeptune.sh" in doc["deeptune_chain"]
+        assert "boards/sifive/p550/deeptune.sh" in doc["deeptune_chain"]
+        assert "hdmi" in doc["quirks"]
+        assert "fusb" in doc["quirks"]
+        assert doc["cpu_harts"] is None or isinstance(doc["cpu_harts"], int)
+
+        # Verify pure-Bash JSON escaper handles quotes, backslashes, tabs, newlines
+        esc_proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+rvdk_json_escape $'hello "world" \\\\ path\\twith\\nnewline'
+"""
+        )
+        assert esc_proc.returncode == 0, esc_proc.stderr
+        assert json.loads(esc_proc.stdout) == 'hello "world" \\ path\twith\nnewline'
+
+    def test_cn_mirror_hosts_consolidated_single_source_of_truth(self) -> None:
+        needle = "mirrors\\.tuna\\.tsinghua\\.edu\\.cn"
+        common_text = (REPO_ROOT / "lib" / "common.sh").read_text(encoding="utf-8")
+        apt_text = (REPO_ROOT / "lib" / "apt.sh").read_text(encoding="utf-8")
+        cli_text = (REPO_ROOT / "install-cli.sh").read_text(encoding="utf-8")
+        owrt_text = (REPO_ROOT / "os" / "bootstrap-openwrt.sh").read_text(encoding="utf-8")
+
+        assert needle in common_text
+        assert needle not in apt_text
+        assert needle not in cli_text
+        assert needle not in owrt_text
+        assert "rvdk_cn_mirror_hosts_regex" in apt_text
+        assert "rvdk_cn_mirror_hosts_regex" in cli_text
+        assert "rvdk_cn_mirror_hosts_regex" in owrt_text
+
+        # Runtime check: lib/apt.sh standalone sourcing resolves CN regex from lib/common.sh
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/apt.sh"
+tmpf="$(mktemp)"
+trap 'rm -f "$tmpf"' EXIT
+printf 'deb http://mirrors.tuna.tsinghua.edu.cn/debian trixie main\\n' > "$tmpf"
+_rvdk_apt_rewrite_stream "$tmpf" https
+"""
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "deb https://deb.debian.org/debian trixie main"

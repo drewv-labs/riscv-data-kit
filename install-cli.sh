@@ -41,8 +41,10 @@ Usage:
   curl -fsSL https://rvdk.drewv-labs.dev/install-cli.sh | sudo bash [-s -- --quiet]
 
 Options:
-  -q, --quiet   Suppress post-install banner
-  -h, --help    Show this help message and exit
+  -q, --quiet             Suppress post-install banner
+      --branch <branch>   Track a specific git branch (default: main)
+      --ref <tag|commit>  Pin engine checkout to an immutable tag or commit SHA
+  -h, --help              Show this help message and exit
 EOF
         exit 0
     fi
@@ -180,17 +182,46 @@ while [[ "$ENGINE_DIR" != "/" && "$ENGINE_DIR" == */ ]]; do ENGINE_DIR="${ENGINE
 ENGINE_PARENT="$(dirname "$ENGINE_DIR")"
 REPO_URL="${RVDK_REPO_URL:-https://github.com/drewv-labs/riscv-data-kit.git}"
 REPO_BRANCH="${RVDK_BRANCH:-main}"
+REPO_REF="${RVDK_REF:-}"
 QUIET_MODE="false"
 
-for arg in "$@"; do
-    case "$arg" in
-        -q|--quiet) QUIET_MODE="true" ;;
-        *) log_fatal "Unknown argument: ${arg} (try --help)" ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -q|--quiet)
+            QUIET_MODE="true"
+            shift
+            ;;
+        --branch)
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '--branch' requires a branch name."
+            REPO_BRANCH="$2"
+            shift 2
+            ;;
+        --branch=*)
+            REPO_BRANCH="${1#*=}"
+            [[ -n "$REPO_BRANCH" ]] || log_fatal "Option '--branch' requires a branch name."
+            shift
+            ;;
+        --ref)
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && log_fatal "Option '--ref' requires a tag or commit SHA."
+            REPO_REF="$2"
+            shift 2
+            ;;
+        --ref=*)
+            REPO_REF="${1#*=}"
+            [[ -n "$REPO_REF" ]] || log_fatal "Option '--ref' requires a tag or commit SHA."
+            shift
+            ;;
+        *)
+            log_fatal "Unknown argument: $1 (try --help)"
+            ;;
     esac
 done
 
-if [[ ! "$REPO_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+if [[ ! "$REPO_BRANCH" =~ ^[a-zA-Z0-9._/-]+$ || "$REPO_BRANCH" == -* || "$REPO_BRANCH" == *".."* ]]; then
     log_fatal "Invalid RVDK_BRANCH name: '${REPO_BRANCH}'."
+fi
+if [[ -n "$REPO_REF" ]] && [[ ! "$REPO_REF" =~ ^[a-zA-Z0-9._/-]+$ || "$REPO_REF" == -* || "$REPO_REF" == *".."* ]]; then
+    log_fatal "Invalid --ref value: '${REPO_REF}'."
 fi
 
 # 0. Recover cold-RTC clocks (< 2026-01-01 floor) on batteryless Linux SBCs
@@ -205,7 +236,11 @@ normalize_pkg_mirrors_early() {
         return 0
     fi
 
-    local cn_hosts="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sohu\\.com|mirrors\\.zju\\.edu\\.cn|mirrors\\.nju\\.edu\\.cn|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirrors\\.shanghaitech\\.edu\\.cn|mirrors\\.hit\\.edu\\.cn|mirrors\\.lzu\\.edu\\.cn|mirrors\\.cqu\\.edu\\.cn|mirrors\\.neusoft\\.edu\\.cn|mirrors\\.xjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn|mirror\\.lzu\\.edu\\.cn|cn\\.archive\\.ubuntu\\.com|hk\\.archive\\.ubuntu\\.com|ftp\\.cn\\.debian\\.org|ftp\\.hk\\.debian\\.org"
+    local cn_hosts=""
+    if typeset -f rvdk_cn_mirror_hosts_regex >/dev/null 2>&1; then
+        cn_hosts="$(rvdk_cn_mirror_hosts_regex)"
+    fi
+    [[ -n "$cn_hosts" ]] || return 0
     local scheme="http"
     [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/ssl/certs/ca-bundle.crt ]] && scheme="https"
 
@@ -294,7 +329,23 @@ else
     chmod 0755 "$CACHE_DIR" 2>/dev/null || true
 fi
 
-if [[ -d "${ENGINE_DIR}/.git" ]]; then
+if [[ -n "$REPO_REF" ]]; then
+    if [[ -d "${ENGINE_DIR}/.git" ]]; then
+        log_info "Pinning RVDK engine in ${ENGINE_DIR} to ref '${REPO_REF}'..."
+        chown -R 0:0 "$ENGINE_DIR" 2>/dev/null || true
+        git -C "$ENGINE_DIR" fetch --tags origin "$REPO_REF" -q 2>/dev/null || git -C "$ENGINE_DIR" fetch --tags origin -q
+    else
+        log_info "Cloning ${REPO_URL} into ${ENGINE_DIR} (pinned ref '${REPO_REF}')..."
+        rm -rf "$ENGINE_DIR"
+        git clone "$REPO_URL" "$ENGINE_DIR" -q
+        git -C "$ENGINE_DIR" fetch --tags origin "$REPO_REF" -q 2>/dev/null || true
+    fi
+    if git -C "$ENGINE_DIR" rev-parse --verify "${REPO_REF}^{commit}" >/dev/null 2>&1; then
+        git -C "$ENGINE_DIR" checkout --detach --force "${REPO_REF}^{commit}" -q
+    else
+        git -C "$ENGINE_DIR" checkout --detach --force FETCH_HEAD -q
+    fi
+elif [[ -d "${ENGINE_DIR}/.git" ]]; then
     log_info "Updating RVDK engine in ${ENGINE_DIR} (${REPO_BRANCH})..."
     chown -R 0:0 "$ENGINE_DIR" 2>/dev/null || true
     git -C "$ENGINE_DIR" fetch origin "$REPO_BRANCH" -q

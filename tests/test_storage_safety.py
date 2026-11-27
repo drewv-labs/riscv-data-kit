@@ -569,6 +569,36 @@ lv_weight_for lv_a
             assert "division by zero" not in proc_one.stderr.lower()
             assert proc_one.stdout.strip() == "0"
 
+    def test_storage_status_json_schema_v1(self, tmp_path: Path) -> None:
+        env = self._setup_autotune_env(tmp_path)
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{STORAGE_SH}"
+rvdk_require_root() {{ :; }}
+main status --vg vg_rvdk --json
+""",
+            env=env,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        doc = json.loads(proc.stdout)
+        assert doc["schema_version"] == 1
+        assert doc["vg_name"] == "vg_rvdk"
+        assert doc["vg_size_bytes"] == 107374182400
+        assert doc["vg_free_bytes"] == 21474836480
+        assert doc["vg_extent_bytes"] == 4194304
+        assert doc["vg_extents_total"] == 25600
+        assert doc["vg_extents_free"] == 5120
+        assert doc["vg_reserve_pct"] == 20
+        assert len(doc["lvs"]) == 2
+        lv_a = doc["lvs"][0]
+        assert lv_a["name"] == "lv_a"
+        assert lv_a["path"] == "/dev/vg_rvdk/lv_a"
+        assert lv_a["mounted"] is True
+        assert lv_a["mount_point"] == "/mnt/lv_a"
+        assert lv_a["fstype"] == "xfs"
+        assert lv_a["fs_util_pct"] == 85
+
 
 class TestBtrfsRaidSafety:
     def _prepare_btrfs_raid_script(self, tmp_path: Path, fstab_path: Path) -> Path:
@@ -584,6 +614,8 @@ class TestBtrfsRaidSafety:
             .replace('[[ -b "$_arr_src" ]]', '[[ -e "$_arr_src" ]]')
             .replace('[[ -b "$explicit_dev" ]]', '[[ -e "$explicit_dev" ]]')
             .replace('[[ -b "$_canon_dev" ]]', '[[ -e "$_canon_dev" ]]')
+            .replace('[[ ! -b "$dev" ]]', '[[ ! -e "$dev" ]]')
+            .replace('[[ -b "$dev" ]]', '[[ -e "$dev" ]]')
             .replace("/etc/fstab", str(fstab_path))
             .replace("mountpoint -q", "_rvdk_test_mountpoint_q")
         )
@@ -802,6 +834,149 @@ source "{script_path}" --json '{array_json}'
         fstab_lines = fstab.read_text(encoding="utf-8").splitlines()
         assert len(fstab_lines) == 2
         assert fstab_lines[1].startswith(f"LABEL=RVDK_RAID1  {mnt_path}  btrfs  ")
+
+    def test_force_wipe_hardening_ignores_config_env_blocks_autodiscovery_and_requires_yes(
+        self, tmp_path: Path
+    ) -> None:
+        fstab = tmp_path / "fstab"
+        fstab.write_text("# fstab\n", encoding="utf-8")
+        script_path = self._prepare_btrfs_raid_script(tmp_path, fstab)
+        bin_dir = tmp_path / "bin"
+        _make_jq_shim(bin_dir)
+
+        fake_sda = tmp_path / "sda"
+        fake_sdb = tmp_path / "sdb"
+        fake_sda.write_text("", encoding="utf-8")
+        fake_sdb.write_text("", encoding="utf-8")
+
+        wipefs_log = tmp_path / "wipefs.log"
+        mkfs_log = tmp_path / "mkfs.log"
+        _write_exe(bin_dir / "wipefs", f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{wipefs_log}"\nexit 0\n')
+        _write_exe(bin_dir / "mkfs.btrfs", f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{mkfs_log}"\nexit 0\n')
+        _write_exe(bin_dir / "btrfs", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "mount", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "umount", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "findmnt", "#!/usr/bin/env bash\nexit 1\n")
+        _write_exe(bin_dir / "udevadm", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "partprobe", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "blkid",
+            f"""#!/usr/bin/env bash
+case "$*" in
+    "-L RVDK_RAID1") exit 2 ;;
+    "-s TYPE -o value {fake_sda}"|"-s TYPE -o value {fake_sdb}") printf 'ext4\\n' ;;
+    "-s UUID -o value {fake_sda}"|"-s UUID -o value {fake_sdb}") printf 'uuid-existing\\n' ;;
+    *) exit 2 ;;
+esac
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "lsblk",
+            f"""#!/usr/bin/env bash
+case "$*" in
+    *"-rn -o PATH,TYPE"*) printf '%s disk\\n' "${{@: -1}}" ;;
+    *"-dn -o FSTYPE"*) printf 'ext4\\n' ;;
+    *"-dn -o PTTYPE"*) printf 'gpt\\n' ;;
+    *"-dn -o MOUNTPOINTS"*) printf '\\n' ;;
+    *"-b -dn -o PATH,SIZE,TYPE"*)
+        printf '%s 100000000000 disk\\n' "{fake_sda}"
+        printf '%s 100000000000 disk\\n' "{fake_sdb}"
+        ;;
+esac
+exit 0
+""",
+        )
+
+        mnt_path = tmp_path / "mnt_raid1"
+        explicit_json = json.dumps(
+            [
+                {
+                    "name": "vault_raid1",
+                    "label": "RVDK_RAID1",
+                    "mount": str(mnt_path),
+                    "profile": "raid1",
+                    "devices": [str(fake_sda), str(fake_sdb)],
+                }
+            ]
+        )
+        autodisc_json = json.dumps(
+            [
+                {
+                    "name": "vault_auto",
+                    "label": "RVDK_RAID1",
+                    "mount": str(mnt_path),
+                    "profile": "raid1",
+                    "disks": 2,
+                    "min_bytes": 50000000000,
+                    "max_bytes": 200000000000,
+                }
+            ]
+        )
+
+        # 1. FORCE_WIPE_RAID=true in config.env MUST be ignored (no silent persistence)
+        cfg_env = tmp_path / "config.env"
+        cfg_env.write_text("FORCE_WIPE_RAID=true\n", encoding="utf-8")
+        base_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_ENV_FILE": str(cfg_env),
+            "RVDK_NO_PROGBAR": "1",
+        }
+        p_cfg = _run_bash(
+            f"""
+set -Eeuo pipefail
+_rvdk_test_mountpoint_q() {{ return 1; }}
+source "{script_path}" --json '{explicit_json}' --yes
+""",
+            env=base_env,
+        )
+        assert p_cfg.returncode != 0
+        assert "not blank" in p_cfg.stderr.lower() or "force-wipe" in p_cfg.stderr.lower()
+        assert not wipefs_log.exists()
+        assert not mkfs_log.exists()
+
+        # 2. --force-wipe without explicit .devices[] (auto-discovery) MUST fail closed
+        p_auto = _run_bash(
+            f"""
+set -Eeuo pipefail
+_rvdk_test_mountpoint_q() {{ return 1; }}
+source "{script_path}" --json '{autodisc_json}' --force-wipe --yes
+""",
+            env=base_env,
+        )
+        assert p_auto.returncode != 0
+        assert "without explicit .devices[]" in p_auto.stderr
+        assert not wipefs_log.exists()
+        assert not mkfs_log.exists()
+
+        # 3. --force-wipe with explicit .devices[] in non-TTY without --yes MUST fail closed
+        p_nontty = _run_bash(
+            f"""
+set -Eeuo pipefail
+_rvdk_test_mountpoint_q() {{ return 1; }}
+source "{script_path}" --json '{explicit_json}' --force-wipe
+""",
+            env=base_env,
+            stdin_text="y\n",
+        )
+        assert p_nontty.returncode != 0
+        assert "not a TTY" in p_nontty.stderr
+        assert "--yes" in p_nontty.stderr
+        assert not wipefs_log.exists()
+        assert not mkfs_log.exists()
+
+        # 4. --force-wipe --yes with explicit .devices[] passes confirmation gate and invokes wipefs + mkfs.btrfs
+        p_ok = _run_bash(
+            f"""
+set -Eeuo pipefail
+_rvdk_test_mountpoint_q() {{ return 1; }}
+source "{script_path}" --json '{explicit_json}' --force-wipe --yes
+""",
+            env=base_env,
+        )
+        assert p_ok.returncode == 0, f"stdout={p_ok.stdout}\nstderr={p_ok.stderr}"
+        assert wipefs_log.exists() and str(fake_sda) in wipefs_log.read_text(encoding="utf-8")
+        assert mkfs_log.exists() and "RVDK_RAID1" in mkfs_log.read_text(encoding="utf-8")
 
 
 class TestNvme4knTargetAndWipeConfirmation:

@@ -184,6 +184,16 @@ rvdk_register_cleanup() {
     _rvdk_install_cleanup_trap "true"
 }
 
+# Register a temporary file path for automatic cleanup on EXIT/INT/TERM.
+# Usage: rvdk_register_tmpfile <path>
+rvdk_register_tmpfile() {
+    local tf="${1:-}"
+    [[ -n "$tf" ]] || return 1
+    _rvdk_install_cleanup_trap "false"
+    _RVDK_TMPFILES+=("$tf")
+    return 0
+}
+
 # Atomically write stdin to <target_path> via same-directory temp file + mv -f.
 # Usage: rvdk_atomic_write <target_path> <octal_mode> [<owner:group>]
 rvdk_atomic_write() {
@@ -266,10 +276,7 @@ _RVDK_SUDO_PRESERVE_ALLOWLIST=(
     RVDK_ALLOW_CIDR
     RVDK_APT_DISTRO_DEFAULT
     RVDK_ARCH
-    RVDK_BACKUP_ROOT
-    RVDK_BASE_URL
     RVDK_BOARD
-    RVDK_BOARDS_DIR
     RVDK_BOARD_QUIRKS
     RVDK_BOARD_TAG
     RVDK_BOOT_BACKUP_DIR
@@ -279,23 +286,18 @@ _RVDK_SUDO_PRESERVE_ALLOWLIST=(
     RVDK_DEEPTUNE_ENV
     RVDK_DEEPTUNE_LAYERS
     RVDK_DT_MODEL
-    RVDK_ENGINE_DIR
-    RVDK_ENV_FILE
     RVDK_FLASH_FORCE_RAW
     RVDK_HOSTNAME
     RVDK_KEEP_VENDOR_MIRRORS
-    RVDK_KIT_CACHE_FILE
     RVDK_LOCALE
     RVDK_MAX_VALID_EPOCH
     RVDK_MIN_VALID_EPOCH
-    RVDK_MIRROR_URL
     RVDK_MMU
     RVDK_NO_APT_UPDATE
     RVDK_NO_PROGBAR
     RVDK_OS_ID
     RVDK_OS_VERSION_ID
     RVDK_P550_HDMI_STATE_FILE
-    RVDK_P550_PLAT_DRV_BASE
     RVDK_PARENT_BADGE_SGR
     RVDK_PARENT_BAR_SGR
     RVDK_PARENT_LABEL
@@ -305,15 +307,11 @@ _RVDK_SUDO_PRESERVE_ALLOWLIST=(
     RVDK_PROGBAR_SESSION
     RVDK_PROG_BASE
     RVDK_PROG_SPAN
-    RVDK_RELEASE_BASE
-    RVDK_REPO_URL
     RVDK_SECONDARY_NIC
     RVDK_SKIP_NET_GUARD
     RVDK_SOC
     RVDK_SOC_SLUG
-    RVDK_STATE_DIR
     RVDK_SUB_STATE
-    RVDK_SYSTEMD_UNIT_DIR
     RVDK_TIMEZONE
     RVDK_TUNE
     RVDK_TUNE_MODE
@@ -1037,4 +1035,29 @@ rvdk_sync_cold_clock() {
         fi
     fi
     return 0
+}
+
+# Canonical ERE alternation of regional CN/HK package mirrors rewritten onto
+# signed US-first canonical upstream endpoints (single source of truth shared
+# by lib/apt.sh, install-cli.sh, and os/bootstrap-openwrt.sh; zero inner
+# capture groups for deterministic sed \1/\2 backreferences).
+RVDK_CN_MIRROR_HOSTS_RE='repo\.huaweicloud\.com|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.bfsu\.edu\.cn|mirrors\.ustc\.edu\.cn|mirrors\.aliyun\.com|mirrors\.163\.com|mirrors\.cloud\.tencent\.com|mirrors\.sohu\.com|mirrors\.zju\.edu\.cn|mirrors\.nju\.edu\.cn|mirrors\.sjtug\.sjtu\.edu\.cn|mirrors\.shanghaitech\.edu\.cn|mirrors\.hit\.edu\.cn|mirrors\.lzu\.edu\.cn|mirrors\.cqu\.edu\.cn|mirrors\.neusoft\.edu\.cn|mirrors\.xjtu\.edu\.cn|mirror\.iscas\.ac\.cn|mirror\.sjtu\.edu\.cn|mirror\.lzu\.edu\.cn|cn\.archive\.ubuntu\.com|hk\.archive\.ubuntu\.com|ftp\.cn\.debian\.org|ftp\.hk\.debian\.org'
+
+rvdk_cn_mirror_hosts_regex() {
+    printf '%s\n' "$RVDK_CN_MIRROR_HOSTS_RE"
+}
+
+# Pure-Bash RFC 8259 JSON string escaper (emits quoted JSON string without
+# trailing newline). Works on minimal RISC-V/OpenWrt/macOS hosts without jq/python3.
+rvdk_json_escape() {
+    local s="${1-}"
+    local bs="\\"
+    s="${s//"$bs"/"$bs$bs"}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    printf '"%s"' "$s"
 }

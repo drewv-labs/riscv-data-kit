@@ -115,17 +115,22 @@ if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
     rvdk_sudo_preserve() {
         [[ $# -gt 0 ]] || return 1
         local -a _allowlist=(
+            RVDK_ALLOW_CIDR
+            RVDK_APT_DISTRO_DEFAULT
             RVDK_ARCH
-            RVDK_BACKUP_ROOT
             RVDK_BOARD
+            RVDK_BOARD_QUIRKS
             RVDK_BOARD_TAG
+            RVDK_BOOT_BACKUP_DIR
+            RVDK_BRANCH
+            RVDK_CACHE_DIR
             RVDK_DEEPTUNE_CHAIN
             RVDK_DEEPTUNE_ENV
             RVDK_DEEPTUNE_LAYERS
             RVDK_DT_MODEL
-            RVDK_ENV_FILE
+            RVDK_FLASH_FORCE_RAW
+            RVDK_HOSTNAME
             RVDK_KEEP_VENDOR_MIRRORS
-            RVDK_KIT_CACHE_FILE
             RVDK_LOCALE
             RVDK_MAX_VALID_EPOCH
             RVDK_MIN_VALID_EPOCH
@@ -134,6 +139,7 @@ if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
             RVDK_NO_PROGBAR
             RVDK_OS_ID
             RVDK_OS_VERSION_ID
+            RVDK_P550_HDMI_STATE_FILE
             RVDK_PARENT_BADGE_SGR
             RVDK_PARENT_BAR_SGR
             RVDK_PARENT_LABEL
@@ -144,11 +150,11 @@ if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
             RVDK_PROG_BASE
             RVDK_PROG_SPAN
             RVDK_SECONDARY_NIC
+            RVDK_SKIP_NET_GUARD
             RVDK_SOC
             RVDK_SOC_SLUG
-            RVDK_STATE_DIR
             RVDK_SUB_STATE
-            RVDK_SYSTEMD_UNIT_DIR
+            RVDK_TIMEZONE
             RVDK_TUNE
             RVDK_TUNE_MODE
         )

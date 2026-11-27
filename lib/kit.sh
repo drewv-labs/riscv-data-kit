@@ -745,3 +745,90 @@ rvdk_kit_print_summary() {
     printf "  • DeepTune Chain    : %s\n" "$chain_str"
     printf "  • Board Quirks      : %s\n" "$quirks_str"
 }
+
+_rvdk_kit_json_str() {
+    if typeset -f rvdk_json_escape >/dev/null 2>&1; then
+        rvdk_json_escape "${1-}"
+        return 0
+    fi
+    local s="${1-}"
+    local bs="\\"
+    s="${s//"$bs"/"$bs$bs"}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    printf '"%s"' "$s"
+}
+
+rvdk_kit_print_json() {
+    local repo_root="$1"
+    local -a chain_items=()
+    local s rel
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        rel="${s#"${repo_root}/"}"
+        chain_items+=("$rel")
+    done < <(rvdk_collect_deeptune_scripts "$repo_root")
+
+    local active_tune=""
+    local dt_env="${RVDK_DEEPTUNE_ENV:-/etc/rvdk/deeptune.env}"
+    if [[ ! -r "$dt_env" && -r /var/lib/rvdk/deeptune.conf ]]; then
+        dt_env="/var/lib/rvdk/deeptune.conf"
+    fi
+    if [[ -r "$dt_env" ]]; then
+        local RVDK_TUNE=""
+        rvdk_kv_load "$dt_env" RVDK_TUNE || true
+        active_tune="${RVDK_TUNE:-}"
+    fi
+
+    local -a quirks=()
+    if [[ -n "${RVDK_BOARD:-}" && -d "${repo_root}/boards/${RVDK_BOARD}/quirks" ]]; then
+        local qf
+        for qf in "${repo_root}/boards/${RVDK_BOARD}/quirks"/*.sh; do
+            [[ -f "$qf" ]] || continue
+            quirks+=("$(basename "$qf" .sh)")
+        done
+    fi
+
+    local harts_json="null"
+    if [[ "${RVDK_CPU_HARTS:-}" =~ ^[0-9]+$ ]]; then
+        harts_json="$(( 10#${RVDK_CPU_HARTS} ))"
+    fi
+
+    local chain_json="[" i
+    for (( i = 0; i < ${#chain_items[@]}; i++ )); do
+        (( i > 0 )) && chain_json+=", "
+        chain_json+="$(_rvdk_kit_json_str "${chain_items[i]}")"
+    done
+    chain_json+="]"
+
+    local quirks_json="["
+    for (( i = 0; i < ${#quirks[@]}; i++ )); do
+        (( i > 0 )) && quirks_json+=", "
+        quirks_json+="$(_rvdk_kit_json_str "${quirks[i]}")"
+    done
+    quirks_json+="]"
+
+    printf '{\n'
+    printf '  "schema_version": 1,\n'
+    printf '  "kit_schema": %s,\n' "$(_rvdk_kit_json_str "${RVDK_KIT_SCHEMA:-}")"
+    printf '  "dt_model": %s,\n' "$(_rvdk_kit_json_str "${RVDK_DT_MODEL:-}")"
+    printf '  "board": %s,\n' "$(_rvdk_kit_json_str "${RVDK_BOARD:-}")"
+    printf '  "board_tag": %s,\n' "$(_rvdk_kit_json_str "${RVDK_BOARD_TAG:-}")"
+    printf '  "soc": %s,\n' "$(_rvdk_kit_json_str "${RVDK_SOC:-}")"
+    printf '  "soc_slug": %s,\n' "$(_rvdk_kit_json_str "${RVDK_SOC_SLUG:-}")"
+    printf '  "arch": %s,\n' "$(_rvdk_kit_json_str "${RVDK_ARCH:-}")"
+    printf '  "mmu": %s,\n' "$(_rvdk_kit_json_str "${RVDK_MMU:-}")"
+    printf '  "factory_user": %s,\n' "$(_rvdk_kit_json_str "${RVDK_FACTORY_USER:-}")"
+    printf '  "os_id": %s,\n' "$(_rvdk_kit_json_str "${RVDK_OS_ID:-}")"
+    printf '  "os_version_id": %s,\n' "$(_rvdk_kit_json_str "${RVDK_OS_VERSION_ID:-}")"
+    printf '  "primary_nic": %s,\n' "$(_rvdk_kit_json_str "${RVDK_PRIMARY_NIC:-}")"
+    printf '  "cpu_harts": %s,\n' "$harts_json"
+    printf '  "kit_cache_file": %s,\n' "$(_rvdk_kit_json_str "${RVDK_KIT_CACHE_FILE:-}")"
+    printf '  "kit_source": %s,\n' "$(_rvdk_kit_json_str "${RVDK_KIT_SOURCE:-}")"
+    printf '  "active_tune": %s,\n' "$(_rvdk_kit_json_str "$active_tune")"
+    printf '  "deeptune_chain": %s,\n' "$chain_json"
+    printf '  "quirks": %s\n' "$quirks_json"
+    printf '}\n'
+}

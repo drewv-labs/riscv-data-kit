@@ -70,7 +70,7 @@ if [[ $# -gt 0 ]]; then
             storage)
                 for _arg in "$@"; do
                     case "$_arg" in
-                        status|--status|--dry-run) NEED_ROOT="false" ;;
+                        status|--status|--json|--dry-run) NEED_ROOT="false" ;;
                     esac
                 done
                 ;;
@@ -104,15 +104,36 @@ if [[ $# -gt 0 ]]; then
                     esac
                 done
                 ;;
+            day0|bsp)
+                _has_stage_dir="false"
+                _is_host_stage_target="false"
+                for _arg in "$@"; do
+                    case "$_arg" in
+                        --stage-dir|--stage-dir=*) _has_stage_dir="true" ;;
+                        p4|esp32p4|espressif/esp32p4|esp32-p4-wifi6|waveshare/esp32-p4-wifi6|esp-idf|nuttx|linux-nommu|--board=p4|--board=*esp32-p4*|--soc=*esp32p4*|--os=esp-idf|--os=nuttx|--os=linux-nommu)
+                            _is_host_stage_target="true"
+                            ;;
+                    esac
+                done
+                if [[ "$_has_stage_dir" == "true" && "$_is_host_stage_target" == "true" ]]; then
+                    NEED_ROOT="false"
+                fi
+                ;;
+            bsp/espressif/esp32p4/*|boards/waveshare/esp32-p4-wifi6/*)
+                for _arg in "$@"; do
+                    case "$_arg" in
+                        --stage-dir|--stage-dir=*|--stage-only|--dry-run|status|--status)
+                            NEED_ROOT="false"
+                            ;;
+                    esac
+                done
+                ;;
             *)
                 for _arg in "$@"; do
                     case "$_arg" in
-                        --stage-dir|--stage-dir=*|--stage-only|--dry-run)
-                            NEED_ROOT="false"
-                            ;;
                         status|--status)
                             case "$1" in
-                                bsp/*|boards/*|utils/*|util/*|install)
+                                bsp/*|boards/*|utils/*|util/*)
                                     NEED_ROOT="false"
                                     ;;
                             esac
@@ -122,6 +143,15 @@ if [[ $# -gt 0 ]]; then
                 if [[ "$NEED_ROOT" == "true" && "$1" == "install" ]]; then
                     case "${2:-}" in
                         flash|boards/*/flash-*.sh|boards/*/flash-*) NEED_ROOT="false" ;;
+                        bsp/espressif/esp32p4/*|boards/waveshare/esp32-p4-wifi6/*)
+                            for _arg in "$@"; do
+                                case "$_arg" in
+                                    --stage-dir|--stage-dir=*|--stage-only|--dry-run|status|--status)
+                                        NEED_ROOT="false"
+                                        ;;
+                                esac
+                            done
+                            ;;
                     esac
                 fi
                 ;;
@@ -217,6 +247,69 @@ link_rvdk_cli() {
     fi
 }
 
+_rvdk_bootstrap_sha256() {
+    local file_path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file_path" | awk '{print tolower($1)}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file_path" | awk '{print tolower($1)}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file_path" | awk '{print tolower($NF)}'
+    else
+        return 1
+    fi
+}
+
+_rvdk_bootstrap_fetch_and_run() {
+    local rel_script="$1"
+    shift || true
+    local base_url="${RVDK_BASE_URL%/}"
+    local script_url="${base_url}/${rel_script}"
+    local tmp_script="" tmp_sums=""
+    tmp_script="$(mktemp "${TMPDIR:-/tmp}/.rvdk-remote.XXXXXX")"
+    tmp_sums="$(mktemp "${TMPDIR:-/tmp}/.rvdk-sums.XXXXXX")"
+    if typeset -f rvdk_register_tmpfile >/dev/null 2>&1; then
+        rvdk_register_tmpfile "$tmp_script"
+        rvdk_register_tmpfile "$tmp_sums"
+    fi
+
+    if ! curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp_script" "$script_url"; then
+        rm -f "$tmp_script" "$tmp_sums" 2>/dev/null || true
+        log_fatal "Failed to download '${script_url}' over TLS 1.2+."
+    fi
+
+    if curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp_sums" "${base_url}/SHA256SUMS" 2>/dev/null && [[ -s "$tmp_sums" ]]; then
+        local expected_sha="" actual_sha=""
+        expected_sha="$(awk -v target="$rel_script" '
+            NF >= 2 {
+                p = $2
+                sub(/^\*/, "", p)
+                sub(/^\.\//, "", p)
+                if (p == target) {
+                    print tolower($1)
+                    exit
+                }
+            }
+        ' "$tmp_sums" 2>/dev/null || true)"
+        if [[ -n "$expected_sha" ]]; then
+            if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
+                rm -f "$tmp_script" "$tmp_sums" 2>/dev/null || true
+                log_fatal "Malformed SHA-256 entry for '${rel_script}' in ${base_url}/SHA256SUMS."
+            fi
+            actual_sha="$(_rvdk_bootstrap_sha256 "$tmp_script" 2>/dev/null || true)"
+            if [[ -z "$actual_sha" || "$actual_sha" != "$expected_sha" ]]; then
+                rm -f "$tmp_script" "$tmp_sums" 2>/dev/null || true
+                log_fatal "SHA-256 verification failed for '${rel_script}' (expected ${expected_sha}, got ${actual_sha:-unavailable})."
+            fi
+        fi
+    fi
+
+    local rc=0
+    bash "$tmp_script" "$@" || rc=$?
+    rm -f "$tmp_script" "$tmp_sums" 2>/dev/null || true
+    return "$rc"
+}
+
 print_cli_help() {
     cat <<'EOF'
 Usage:
@@ -282,8 +375,8 @@ if [[ "${1:-}" == "update" || "${1:-}" == "self-update" ]]; then
     if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
         exec bash "${CANDIDATE_ROOT}/install-cli.sh" "$@"
     else
-        curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- "$@"
-        exit 0
+        _rvdk_bootstrap_fetch_and_run "install-cli.sh" "$@"
+        exit $?
     fi
 fi
 
@@ -300,8 +393,8 @@ case "${1:-}" in
             exec bash "${ENGINE_DIR}/utils/uninstall.sh" ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
         else
             rvdk_sync_cold_clock
-            curl -fsSL "${RVDK_BASE_URL}/utils/uninstall.sh" | bash -s -- ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
-            exit 0
+            _rvdk_bootstrap_fetch_and_run "utils/uninstall.sh" ${_UNINSTALL_ARGS[@]+"${_UNINSTALL_ARGS[@]}"} "$@"
+            exit $?
         fi
         ;;
 esac
@@ -335,7 +428,7 @@ else
         link_rvdk_cli "${ENGINE_DIR}/bootstrap.sh"
         rm -rf "$CANDIDATE_ROOT" 2>/dev/null || true
     else
-        curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
+        _rvdk_bootstrap_fetch_and_run "install-cli.sh" --quiet
     fi
     LOCAL_ROOT="$ENGINE_DIR"
 fi
@@ -378,7 +471,7 @@ if [[ "${1:-}" == "flash" ]]; then
     exec bash "$FLASH_LIB" "$@"
 fi
 
-# 2.2 `rvdk kit [status|--refresh|--env]`
+# 2.2 `rvdk kit [status|--refresh|--env|--json]`
 if [[ "${1:-}" == "kit" ]]; then
     _escalate_root_if_needed
     shift
@@ -389,6 +482,7 @@ if [[ "${1:-}" == "kit" ]]; then
             status|--status|show) KIT_MODE="summary"; shift ;;
             --motd|--body)        KIT_MODE="motd"; shift ;;
             --env|env)            KIT_MODE="env"; shift ;;
+            --json|json)          KIT_MODE="json"; shift ;;
             --refresh|refresh)    KIT_ARGS+=("--refresh"); shift ;;
             --no-cache)           KIT_ARGS+=("--no-cache"); shift ;;
             --soc|--board|--os)   KIT_ARGS+=("$1" "${2:-}"); shift 2 ;;
@@ -396,6 +490,7 @@ if [[ "${1:-}" == "kit" ]]; then
                 cat <<'EOF'
 Usage:
   rvdk kit [status]          Show resolved Board, SoC, OS, NIC, DeepTune chain & Quirks
+  rvdk kit --json            Emit schema_version=1 JSON summary of resolved Kit state
   sudo rvdk kit --refresh    Re-probe hardware/OS and update /etc/rvdk/kit.env
   rvdk kit --env             Print shell-escaped RVDK_KIT_* variables
 EOF
@@ -407,6 +502,8 @@ EOF
     rvdk_kit_resolve ${KIT_ARGS[@]+"${KIT_ARGS[@]}"}
     if [[ "$KIT_MODE" == "env" ]]; then
         rvdk_kit_print_env
+    elif [[ "$KIT_MODE" == "json" ]]; then
+        rvdk_kit_print_json "$LOCAL_ROOT"
     elif [[ "$KIT_MODE" == "motd" ]]; then
         rvdk_kit_print_summary "$LOCAL_ROOT" --motd
     else

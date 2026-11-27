@@ -124,25 +124,31 @@ if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
     rvdk_sudo_preserve() {
         [[ $# -gt 0 ]] || return 1
         local -a _allowlist=(
+            RVDK_ALLOW_CIDR
+            RVDK_APT_DISTRO_DEFAULT
             RVDK_ARCH
-            RVDK_BACKUP_ROOT
             RVDK_BOARD
+            RVDK_BOARD_QUIRKS
             RVDK_BOARD_TAG
+            RVDK_BOOT_BACKUP_DIR
+            RVDK_BRANCH
+            RVDK_CACHE_DIR
+            RVDK_DEEPTUNE_CHAIN
             RVDK_DEEPTUNE_ENV
+            RVDK_DEEPTUNE_LAYERS
             RVDK_DT_MODEL
-            RVDK_ENV_FILE
+            RVDK_FLASH_FORCE_RAW
             RVDK_HOSTNAME
             RVDK_KEEP_VENDOR_MIRRORS
-            RVDK_KIT_CACHE_FILE
             RVDK_LOCALE
             RVDK_MAX_VALID_EPOCH
             RVDK_MIN_VALID_EPOCH
-            RVDK_MIRROR_URL
             RVDK_MMU
             RVDK_NO_APT_UPDATE
             RVDK_NO_PROGBAR
             RVDK_OS_ID
             RVDK_OS_VERSION_ID
+            RVDK_P550_HDMI_STATE_FILE
             RVDK_PARENT_BADGE_SGR
             RVDK_PARENT_BAR_SGR
             RVDK_PARENT_LABEL
@@ -152,10 +158,10 @@ if ! typeset -f rvdk_sudo_preserve >/dev/null 2>&1; then
             RVDK_PROGBAR_SESSION
             RVDK_PROG_BASE
             RVDK_PROG_SPAN
+            RVDK_SECONDARY_NIC
             RVDK_SKIP_NET_GUARD
             RVDK_SOC
             RVDK_SOC_SLUG
-            RVDK_STATE_DIR
             RVDK_SUB_STATE
             RVDK_TIMEZONE
             RVDK_TUNE
@@ -271,12 +277,15 @@ rvdk_sync_cold_clock
 # 0. Normalize OpenWrt package feeds & pure UCI NTP/dnsmasq servers onto US-first endpoints
 #    Invariant: NEVER touch `/etc/config/network` and NEVER directly awk/sed `/etc/config/*`.
 if [[ "${RVDK_KEEP_VENDOR_MIRRORS:-0}" != "1" && "${RVDK_KEEP_VENDOR_MIRRORS:-false}" != "true" ]]; then
-    OWRT_CN_HOSTS="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sohu\\.com|mirrors\\.zju\\.edu\\.cn|mirrors\\.nju\\.edu\\.cn|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirrors\\.shanghaitech\\.edu\\.cn|mirrors\\.hit\\.edu\\.cn|mirrors\\.lzu\\.edu\\.cn|mirrors\\.cqu\\.edu\\.cn|mirrors\\.neusoft\\.edu\\.cn|mirrors\\.xjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn|mirror\\.lzu\\.edu\\.cn|cn\\.archive\\.ubuntu\\.com|hk\\.archive\\.ubuntu\\.com|ftp\\.cn\\.debian\\.org|ftp\\.hk\\.debian\\.org"
+    OWRT_CN_HOSTS=""
+    if typeset -f rvdk_cn_mirror_hosts_regex >/dev/null 2>&1; then
+        OWRT_CN_HOSTS="$(rvdk_cn_mirror_hosts_regex)"
+    fi
     OWRT_SCHEME="http"
     [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/ssl/certs/ca-bundle.crt ]] && OWRT_SCHEME="https"
     OWRT_FEED_CHANGED="false"
     for _of in /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf /etc/apk/repositories; do
-        [[ -f "$_of" ]] || continue
+        [[ -n "$OWRT_CN_HOSTS" && -f "$_of" ]] || continue
         _rendered_of="$(sed -E "/^[[:space:]]*#/! s@https?://(${OWRT_CN_HOSTS})/openwrt([[:space:]/]|$)@${OWRT_SCHEME}://downloads.openwrt.org\\2@g" "$_of")"
         if ! printf '%s\n' "$_rendered_of" | cmp -s - "$_of" 2>/dev/null; then
             mkdir -p /var/lib/rvdk/backups/openwrt

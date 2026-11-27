@@ -580,6 +580,182 @@ exec "{real_uname}" "$@"
         assert "/etc/apt/a.list" not in proc.stdout
         assert "/etc/config/network" not in proc.stdout
 
+    def test_uninstall_purge_removes_rv2_dropins_and_unmasks_recorded_user_units(
+        self, tmp_path: Path
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        real_uname = shutil.which("uname") or "/usr/bin/uname"
+        _write_exe(
+            bin_dir / "uname",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-s" ]]; then
+    printf 'Linux\\n'
+    exit 0
+fi
+exec "{real_uname}" "$@"
+""",
+        )
+        _write_exe(bin_dir / "systemctl", "#!/usr/bin/env bash\nexit 0\n")
+
+        sys_unit_dir = tmp_path / "etc" / "systemd" / "system"
+        user_unit_dir = tmp_path / "etc" / "systemd" / "user"
+        backup_root = tmp_path / "var" / "lib" / "rvdk" / "backups"
+        irq_d = sys_unit_dir / "spacemit-k1-irq-affinity.service.d"
+        cpu_d = sys_unit_dir / "spacemit-k1-cpufreq-iot.service.d"
+        irq_d.mkdir(parents=True)
+        cpu_d.mkdir(parents=True)
+        (irq_d / "90-rvdk-orangepi-rv2.conf").write_text("[Service]\n", encoding="utf-8")
+        (cpu_d / "90-rvdk-orangepi-rv2.conf").write_text("[Service]\n", encoding="utf-8")
+
+        user_unit_dir.mkdir(parents=True)
+        (user_unit_dir / "tracker-miner-fs-3.service").symlink_to("/dev/null")
+        (user_unit_dir / "non_null.service").write_text("[Unit]\n", encoding="utf-8")
+        (user_unit_dir / "user_existing.service").symlink_to("/dev/null")
+        (backup_root / "systemd-user").mkdir(parents=True)
+        (backup_root / "systemd-user" / "masked.list").write_text(
+            "tracker-miner-fs-3.service\n../escape.service\nnon_null.service\n",
+            encoding="utf-8",
+        )
+
+        # Also stage deeptune backups of journald.conf & cpufrequtils to verify dry-run restore plan
+        (backup_root / "deeptune").mkdir(parents=True)
+        (backup_root / "deeptune" / "etc__systemd__journald.conf.orig").write_text("[Journal]\n", encoding="utf-8")
+        (backup_root / "deeptune" / "etc__systemd__journald.conf.path").write_text(
+            "/etc/systemd/journald.conf\n", encoding="utf-8"
+        )
+        (backup_root / "deeptune" / "etc__default__cpufrequtils.orig").write_text("GOVERNOR=ondemand\n", encoding="utf-8")
+        (backup_root / "deeptune" / "etc__default__cpufrequtils.path").write_text(
+            "/etc/default/cpufrequtils\n", encoding="utf-8"
+        )
+
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RVDK_ENGINE_DIR": str(tmp_path / "safe" / "engine"),
+            "RVDK_CACHE_DIR": str(tmp_path / "safe" / "cache"),
+            "RVDK_STATE_DIR": str(tmp_path / "safe" / "state"),
+            "RVDK_BACKUP_ROOT": str(backup_root),
+            "RVDK_SYSTEMD_UNIT_DIR": str(sys_unit_dir),
+            "RVDK_SYSTEMD_USER_UNIT_DIR": str(user_unit_dir),
+        }
+
+        # 1. Dry-run verifies journald.conf + cpufrequtils backup restore + drop-ins + unmask plan
+        p_dry = _run_bash(f'"{REPO_ROOT}/utils/uninstall.sh" --purge --dry-run -y', env=env)
+        assert p_dry.returncode == 0, p_dry.stderr
+        assert "-> /etc/systemd/journald.conf" in p_dry.stdout
+        assert "-> /etc/default/cpufrequtils" in p_dry.stdout
+        assert "90-rvdk-orangepi-rv2.conf" in p_dry.stdout
+        assert f"Would unmask systemd user unit: {user_unit_dir}/tracker-miner-fs-3.service" in p_dry.stdout
+        assert f"Would unmask systemd user unit: {user_unit_dir}/../escape.service" not in p_dry.stdout
+        assert "Skipped unsafe unit entry in" in p_dry.stdout
+
+        # 2. Live execution against isolated temp dirs (sandbox remove_path strictly to tmp_path)
+        uninstall_src = (REPO_ROOT / "utils" / "uninstall.sh").read_text(encoding="utf-8")
+        patched_uninstall = tmp_path / "uninstall_live.sh"
+        patched_uninstall.write_text(
+            uninstall_src.replace(
+                'rvdk_require_root "$script_self" ${orig_args[@]+"${orig_args[@]}"}',
+                "true",
+                1,
+            ).replace(
+                '    remove_path() {\n        local p="$1"',
+                f'    remove_path() {{\n        local p="$1"\n        [[ "$p" == "{tmp_path}"/* ]] || return 0',
+                1,
+            ).replace(
+                "                restore_preserved_backups\n",
+                "                true # skip host /etc restore in sandboxed live test\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        p_live = _run_bash(f'bash "{patched_uninstall}" --purge -y', env=env)
+        assert p_live.returncode == 0, f"stdout={p_live.stdout}\nstderr={p_live.stderr}"
+        assert not irq_d.exists(), "Empty spacemit-k1-irq-affinity.service.d should be removed"
+        assert not cpu_d.exists(), "Empty spacemit-k1-cpufreq-iot.service.d should be removed"
+        assert not (user_unit_dir / "tracker-miner-fs-3.service").exists()
+        assert (user_unit_dir / "non_null.service").is_file(), "Non-/dev/null regular file must not be removed"
+        assert (user_unit_dir / "user_existing.service").is_symlink(), "Unrecorded user mask must remain intact"
+
+    def test_install_cli_ref_pinning_detached_checkout_and_rejects_malformed_ref(
+        self, tmp_path: Path
+    ) -> None:
+        # Build a tiny local git repository with 2 commits and a tag v1.0.0
+        upstream = tmp_path / "upstream"
+        upstream.mkdir()
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "RVDK Test",
+            "GIT_AUTHOR_EMAIL": "ci@rvdk.drewv-labs.dev",
+            "GIT_COMMITTER_NAME": "RVDK Test",
+            "GIT_COMMITTER_EMAIL": "ci@rvdk.drewv-labs.dev",
+        }
+        subprocess.run(["git", "init", "-b", "main", str(upstream)], check=True, capture_output=True, env=git_env)
+        (upstream / "bootstrap.sh").write_text("#!/usr/bin/env bash\necho v1\n", encoding="utf-8")
+        (upstream / "bootstrap.sh").chmod(0o755)
+        subprocess.run(["git", "-C", str(upstream), "add", "bootstrap.sh"], check=True, capture_output=True, env=git_env)
+        subprocess.run(["git", "-C", str(upstream), "commit", "-m", "v1"], check=True, capture_output=True, env=git_env)
+        commit1 = subprocess.run(
+            ["git", "-C", str(upstream), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_env,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(upstream), "tag", "v1.0.0"], check=True, capture_output=True, env=git_env)
+
+        (upstream / "bootstrap.sh").write_text("#!/usr/bin/env bash\necho v2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(upstream), "add", "bootstrap.sh"], check=True, capture_output=True, env=git_env)
+        subprocess.run(["git", "-C", str(upstream), "commit", "-m", "v2"], check=True, capture_output=True, env=git_env)
+
+        install_src = (REPO_ROOT / "install-cli.sh").read_text(encoding="utf-8")
+        bin_dir_out = tmp_path / "local_bin"
+        bin_dir_out.mkdir()
+        patched_cli = tmp_path / "install_cli_test.sh"
+        patched_cli.write_text(
+            install_src.replace("if [[ $EUID -ne 0 ]]; then", "if false; then", 1)
+            .replace('RVDK_ENGINE_DIR="${RVDK_ENGINE_DIR:-/opt/rvdk}"', f'RVDK_ENGINE_DIR="{tmp_path / "opt" / "rvdk"}"', 1)
+            .replace("/usr/local/bin/rvdk", str(bin_dir_out / "rvdk"))
+            .replace("/usr/local/bin", str(bin_dir_out))
+            .replace("/usr/bin/rvdk", str(bin_dir_out / "rvdk_usr"))
+            .replace("chown -R", "true # chown -R")
+            .replace('if [[ "$(uname -s)" == "Linux" ]]; then', "if false; then"),
+            encoding="utf-8",
+        )
+        env = {
+            "PATH": os.environ["PATH"],
+            "RVDK_ENGINE_DIR": str(tmp_path / "opt" / "rvdk"),
+            "RVDK_REPO_URL": str(upstream),
+            "RVDK_NO_PROGBAR": "1",
+        }
+
+        # 1. Malformed --ref rejected
+        p_bad = _run_bash(f'bash "{patched_cli}" --ref "bad;ref"', env=env)
+        assert p_bad.returncode != 0
+        assert "Invalid --ref value" in p_bad.stderr
+
+        # 2. Fresh clone pinned to tag v1.0.0 checks out detached HEAD at commit1
+        p_tag = _run_bash(f'bash "{patched_cli}" --ref v1.0.0', env=env)
+        assert p_tag.returncode == 0, f"stdout={p_tag.stdout}\nstderr={p_tag.stderr}"
+        engine_dir = tmp_path / "opt" / "rvdk"
+        head_after_tag = subprocess.run(
+            ["git", "-C", str(engine_dir), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert head_after_tag == commit1
+        assert "echo v1" in (engine_dir / "bootstrap.sh").read_text(encoding="utf-8")
+
+        # 3. Re-run pinned to explicit commit SHA remains converged on commit1
+        p_sha = _run_bash(f'bash "{patched_cli}" --ref "{commit1}"', env=env)
+        assert p_sha.returncode == 0, f"stdout={p_sha.stdout}\nstderr={p_sha.stderr}"
+        head_after_sha = subprocess.run(
+            ["git", "-C", str(engine_dir), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert head_after_sha == commit1
+
 
 class TestStorageAutotuneGrantCap:
     def test_autotune_awk_caps_last_hungry_grant_at_want_i(self) -> None:

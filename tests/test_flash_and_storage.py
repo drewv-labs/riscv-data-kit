@@ -1883,12 +1883,25 @@ if [[ "${{1:-}}" == "-U" ]]; then
         echo "tune2fs: filesystem is mounted" >&2
         exit 1
     fi
+    if [[ ! -f "{state_dir}/fsck_clean" ]]; then
+        echo "Please run 'e2fsck -f $target_dev' first." >&2
+        exit 1
+    fi
     printf '%s' "${{2:-}}" > "{state_dir}/emmc_uuid"
 fi
 exit 0
 """,
         )
-        _write_exe(bin_dir / "e2fsck", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "e2fsck",
+            f"""#!/usr/bin/env bash
+printf 'e2fsck %s\\n' "$*" >> "{ops_log}"
+if [[ "$*" == *"-pf"* ]]; then
+    touch "{state_dir}/fsck_clean"
+fi
+exit 0
+""",
+        )
         _write_exe(bin_dir / "uuidgen", f"#!/usr/bin/env bash\nprintf '%s\\n' '{new_uuid}'\n")
         _write_exe(bin_dir / "sync", "#!/usr/bin/env bash\nexit 0\n")
         _write_exe(
@@ -1911,6 +1924,7 @@ src="$1"
 tgt="$2"
 printf 'mount %s %s\\n' "$src" "$tgt" >> "{ops_log}"
 if [[ "$src" == "{emmc_root}" ]]; then
+    rm -f "{state_dir}/fsck_clean"
     cp -a "{peer_root_backing}/." "$tgt/"
     printf '%s' "$tgt" > "{mnt_map}/root.tgt"
     printf '%s' "$src" > "{mnt_map}/root.dev"
@@ -1991,13 +2005,17 @@ rvdk_bsp_converge_mmc_root_labels
         assert list(mnt_tmp.iterdir()) == []
 
         ops2 = ops_log.read_text(encoding="utf-8").splitlines()
-        assert len(ops2) == 6, ops2
-        assert ops2[0].startswith(f"mount {emmc_root} ")
-        assert ops2[1].startswith(f"mount {emmc_boot} ") and ops2[1].endswith("/boot")
-        assert ops2[2].startswith("umount ") and ops2[2].endswith("/boot")
-        assert ops2[3].startswith("umount ") and not ops2[3].endswith("/boot")
-        assert ops2[4] == f"tune2fs -U {new_uuid} {emmc_root}"
-        assert ops2[5] == f"e2label {emmc_root} rvdk_emmc_root"
+        # Pre-mount e2fsck -pf, mount root, mount /boot, umount /boot, umount root,
+        # post-unmount e2fsck -pf, tune2fs -U, e2label
+        assert len(ops2) == 8, ops2
+        assert ops2[0] == f"e2fsck -pf {emmc_root}"
+        assert ops2[1].startswith(f"mount {emmc_root} ")
+        assert ops2[2].startswith(f"mount {emmc_boot} ") and ops2[2].endswith("/boot")
+        assert ops2[3].startswith("umount ") and ops2[3].endswith("/boot")
+        assert ops2[4].startswith("umount ") and not ops2[4].endswith("/boot")
+        assert ops2[5] == f"e2fsck -pf {emmc_root}"
+        assert ops2[6] == f"tune2fs -U {new_uuid} {emmc_root}"
+        assert ops2[7] == f"e2label {emmc_root} rvdk_emmc_root"
 
         assert (peer_root_backing / "etc" / "fstab").read_text(encoding="utf-8") == (
             f"UUID={new_uuid}\t/\text4\tdefaults\t0\t1\n"
@@ -2380,6 +2398,8 @@ if [[ "$*" == *"-s UUID -o value"* ]]; then
     else
         printf '22222222-3333-4444-5555-666666666666\\n'
     fi
+elif [[ "$*" == *"-s LABEL -o value"* ]]; then
+    printf 'rvdk_emmc_root\\n'
 fi
 exit 0
 """,
@@ -2497,3 +2517,667 @@ exit 0
         assert "trixie" in sd["image"].lower()
         assert "trixie" in sd["description"].lower()
 
+
+
+class TestPhase5FlashAndStorageRegressions:
+    def test_bsp_converge_rolls_back_configs_when_tune2fs_fails(self, tmp_path: Path) -> None:
+        helper = TestBspConvergeMmcPeerSafety()
+        patched_bsp, sys_block, dev_dir, mnt_tmp, bin_dir, _ = helper._prepare_bsp_harness(tmp_path)
+        helper._add_mmc_node(sys_block, dev_dir, "mmcblk0", "SD", ["mmcblk0p1"])
+        helper._add_mmc_node(sys_block, dev_dir, "mmcblk2", "MMC", ["mmcblk2p1", "mmcblk2p2"])
+
+        sd_p1 = dev_dir / "mmcblk0p1"
+        emmc_boot = dev_dir / "mmcblk2p1"
+        emmc_root = dev_dir / "mmcblk2p2"
+        old_uuid = "11111111-2222-3333-4444-555555555555"
+        new_uuid = "22222222-3333-4444-5555-666666666666"
+
+        peer_root_backing = tmp_path / "peer_root"
+        (peer_root_backing / "etc").mkdir(parents=True)
+        (peer_root_backing / "boot").mkdir(parents=True)
+        orig_fstab = f"UUID={old_uuid}\t/\text4\tdefaults\t0\t1\nLABEL=armbi_root\t/mnt/clone\text4\tro\t0\t2\n"
+        (peer_root_backing / "etc" / "fstab").write_text(orig_fstab, encoding="utf-8")
+
+        peer_boot_backing = tmp_path / "peer_boot"
+        peer_boot_backing.mkdir()
+        orig_env = f"rootdev=UUID={old_uuid}\nrootfstype=ext4\n"
+        (peer_boot_backing / "orangepiEnv.txt").write_text(orig_env, encoding="utf-8")
+
+        mnt_map = tmp_path / "mnt_map"
+        mnt_map.mkdir()
+        ops_log = tmp_path / "ops.log"
+
+        _write_exe(
+            bin_dir / "findmnt",
+            f'#!/usr/bin/env bash\nif [[ "$*" == *"-n -o SOURCE /"* ]]; then printf "%s\\n" "{sd_p1}"; fi\nexit 0\n',
+        )
+        _write_exe(
+            bin_dir / "lsblk",
+            f"""#!/usr/bin/env bash
+if [[ "$*" == *"{dev_dir}/mmcblk2"* ]]; then
+    printf 'PATH="%s" TYPE="disk" FSTYPE="" SIZE="16000000000" LABEL=""\\n' "{dev_dir}/mmcblk2"
+    printf 'PATH="%s" TYPE="part" FSTYPE="ext4" SIZE="134217728" LABEL="armbi_boot"\\n' "{emmc_boot}"
+    printf 'PATH="%s" TYPE="part" FSTYPE="ext4" SIZE="15000000000" LABEL="armbi_root"\\n' "{emmc_root}"
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "blkid",
+            f"""#!/usr/bin/env bash
+node="${{@: -1}}"
+case "$*" in
+    *"-s TYPE -o value"*) printf 'ext4\\n' ;;
+    *"-s UUID -o value"*) printf '%s\\n' "{old_uuid}" ;;
+    *"-s LABEL -o value"*)
+        if [[ "$node" == "{sd_p1}" ]]; then printf 'rvdk_sd_root\\n'
+        elif [[ "$node" == "{emmc_boot}" ]]; then printf 'armbi_boot\\n'
+        else printf 'armbi_root\\n'
+        fi
+        ;;
+esac
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "e2label",
+            f"""#!/usr/bin/env bash
+if [[ $# -ge 2 ]]; then printf 'e2label %s\\n' "$*" >> "{ops_log}"; exit 0; fi
+if [[ "${{1:-}}" == "{sd_p1}" ]]; then printf 'rvdk_sd_root\\n'; else printf 'armbi_root\\n'; fi
+""",
+        )
+        _write_exe(
+            bin_dir / "tune2fs",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-l" ]]; then printf 'Default mount options:    user_xattr acl\\n'; exit 0; fi
+printf 'tune2fs %s\\n' "$*" >> "{ops_log}"
+exit 1
+""",
+        )
+        _write_exe(bin_dir / "e2fsck", f'#!/usr/bin/env bash\nprintf "e2fsck %s\\n" "$*" >> "{ops_log}"\nexit 0\n')
+        _write_exe(bin_dir / "uuidgen", f"#!/usr/bin/env bash\nprintf '%s\\n' '{new_uuid}'\n")
+        _write_exe(bin_dir / "sync", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "mountpoint",
+            f"""#!/usr/bin/env bash
+tgt="${{@: -1}}"
+[[ -f "{mnt_map}/boot.tgt" && "$(cat "{mnt_map}/boot.tgt")" == "$tgt" ]] && exit 0
+[[ -f "{mnt_map}/root.tgt" && "$(cat "{mnt_map}/root.tgt")" == "$tgt" ]] && exit 0
+exit 1
+""",
+        )
+        _write_exe(
+            bin_dir / "mount",
+            f"""#!/usr/bin/env bash
+src="$1"; tgt="$2"
+printf 'mount %s %s\\n' "$src" "$tgt" >> "{ops_log}"
+if [[ "$src" == "{emmc_root}" ]]; then
+    cp -a "{peer_root_backing}/." "$tgt/"
+    printf '%s' "$tgt" > "{mnt_map}/root.tgt"
+    exit 0
+elif [[ "$src" == "{emmc_boot}" ]]; then
+    cp -a "{peer_boot_backing}/." "$tgt/"
+    printf '%s' "$tgt" > "{mnt_map}/boot.tgt"
+    exit 0
+fi
+exit 1
+""",
+        )
+        _write_exe(
+            bin_dir / "umount",
+            f"""#!/usr/bin/env bash
+tgt="${{@: -1}}"
+printf 'umount %s\\n' "$tgt" >> "{ops_log}"
+if [[ -f "{mnt_map}/boot.tgt" && "$(cat "{mnt_map}/boot.tgt")" == "$tgt" ]]; then
+    rm -rf "{peer_boot_backing}/"*
+    cp -a "$tgt/." "{peer_boot_backing}/"
+    rm -rf "$tgt/"*
+    rm -f "{mnt_map}/boot.tgt"
+    exit 0
+fi
+if [[ -f "{mnt_map}/root.tgt" && "$(cat "{mnt_map}/root.tgt")" == "$tgt" ]]; then
+    rm -rf "{peer_root_backing}/"*
+    cp -a "$tgt/." "{peer_root_backing}/"
+    rm -rf "$tgt/"*
+    rm -f "{mnt_map}/root.tgt"
+    exit 0
+fi
+exit 1
+""",
+        )
+
+        proc = _run_bash(
+            f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{patched_bsp}"
+rvdk_bsp_converge_mmc_root_labels
+""",
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert proc.returncode != 0
+        assert "tune2fs -U failed" in proc.stderr
+        assert (peer_root_backing / "etc" / "fstab").read_text(encoding="utf-8") == orig_fstab
+        assert (peer_boot_backing / "orangepiEnv.txt").read_text(encoding="utf-8") == orig_env
+        assert list(mnt_tmp.iterdir()) == []
+        ops = ops_log.read_text(encoding="utf-8").splitlines()
+        assert all(not line.startswith("e2label ") for line in ops), ops
+
+    def test_flash_postprocess_raw_ordering_boot_fail_symlink_and_rollback(self, tmp_path: Path) -> None:
+        dev_dir = tmp_path / "dev"
+        dev_dir.mkdir()
+        mmc1 = dev_dir / "mmcblk1"
+        mmc1p1 = dev_dir / "mmcblk1p1"  # boot
+        mmc1p2 = dev_dir / "mmcblk1p2"  # root
+        mmc2p2 = dev_dir / "mmcblk2p2"  # colliding peer
+        for node in (mmc1, mmc1p1, mmc1p2, mmc2p2):
+            node.write_text("", encoding="utf-8")
+
+        old_uuid = "11111111-2222-3333-4444-555555555555"
+        new_uuid = "22222222-3333-4444-5555-666666666666"
+
+        root_backing = tmp_path / "root_backing"
+        (root_backing / "etc").mkdir(parents=True)
+        (root_backing / "boot" / "boot" / "extlinux").mkdir(parents=True)
+        boot_backing = tmp_path / "boot_backing"
+        (boot_backing / "boot" / "extlinux").mkdir(parents=True)
+
+        orig_fstab = f"UUID={old_uuid}\t/\text4\tdefaults\t0\t1\n"
+        orig_uenv = f"root=UUID={old_uuid}\n"
+        orig_extlinux = f"append root=UUID={old_uuid} rw\n"
+        (root_backing / "etc" / "fstab").write_text(orig_fstab, encoding="utf-8")
+        (boot_backing / "uEnv.txt").write_text(orig_uenv, encoding="utf-8")
+        (boot_backing / "boot" / "extlinux" / "extlinux.conf").write_text(orig_extlinux, encoding="utf-8")
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        (state_dir / "fail_boot_mount").write_text("1", encoding="utf-8")
+        (state_dir / "fail_tune2fs").write_text("0", encoding="utf-8")
+        mnt_map = tmp_path / "mnt_map"
+        mnt_map.mkdir()
+        ops_log = tmp_path / "ops.log"
+        mnt_tmp = tmp_path / "mnt_tmp"
+        mnt_tmp.mkdir()
+
+        flash_src = (REPO_ROOT / "lib" / "flash.sh").read_text(encoding="utf-8")
+        patched_flash = tmp_path / "flash_postproc_test.sh"
+        patched_flash.write_text(
+            flash_src.replace('[[ -b "$root_slice" ]]', '[[ -e "$root_slice" ]]')
+            .replace('[[ -b "$boot_slice" ]]', '[[ -e "$boot_slice" ]]')
+            .replace('[[ -n "$lp_path" && -b "$lp_path" ]]', '[[ -n "$lp_path" && -e "$lp_path" ]]')
+            .replace('[[ -n "$cand" && -b "$cand" ]]', '[[ -n "$cand" && -e "$cand" ]]')
+            .replace('[[ -b "$p" ]]', '[[ -e "$p" ]]')
+            .replace("/tmp/rvdk_postflash.XXXXXX", f"{mnt_tmp}/rvdk_postflash.XXXXXX")
+            .replace('source "${_FLASH_LIB_DIR}/common.sh"', f'source "{REPO_ROOT}/lib/common.sh"')
+            .replace('source "${_FLASH_LIB_DIR}/storage_guard.sh"', f'source "{REPO_ROOT}/lib/storage_guard.sh"'),
+            encoding="utf-8",
+        )
+
+        bin_dir = tmp_path / "bin"
+        _make_linux_uname_shim(bin_dir)
+        _write_exe(bin_dir / "sudo", '#!/usr/bin/env bash\nexec "$@"\n')
+        _write_exe(bin_dir / "partprobe", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "udevadm", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "sync", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "uuidgen", f"#!/usr/bin/env bash\nprintf '%s\\n' '{new_uuid}'\n")
+        _write_exe(
+            bin_dir / "lsblk",
+            f"""#!/usr/bin/env bash
+if [[ "$*" == *"-P -n -o PATH,TYPE,FSTYPE,SIZE"* ]]; then
+    printf 'PATH="%s" TYPE="disk" FSTYPE="" SIZE="16000000000"\\n' "{mmc1}"
+    printf 'PATH="%s" TYPE="part" FSTYPE="ext4" SIZE="134217728"\\n' "{mmc1p1}"
+    printf 'PATH="%s" TYPE="part" FSTYPE="ext4" SIZE="15000000000"\\n' "{mmc1p2}"
+    exit 0
+fi
+if [[ "$*" == *"-rn -o PATH,TYPE"* ]]; then
+    printf '%s disk\\n%s part\\n%s part\\n' "{mmc1}" "{mmc1p1}" "{mmc1p2}"
+    exit 0
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "blkid",
+            f"""#!/usr/bin/env bash
+node="${{@: -1}}"
+case "$*" in
+    *"-s UUID -o value"*) printf '%s\\n' "{old_uuid}" ;;
+    *"-s LABEL -o value"*)
+        if [[ "$node" == "{mmc1p1}" ]]; then
+            printf 'armbi_boot\\n'
+        else
+            printf 'armbi_root\\n'
+        fi
+        ;;
+    *"-t UUID={old_uuid} -o device"*) printf '%s\\n%s\\n' "{mmc1p2}" "{mmc2p2}" ;;
+esac
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "e2label",
+            f"""#!/usr/bin/env bash
+if [[ "$#" -ge 2 ]]; then
+    printf '%s' "$2" > "{state_dir}/cur_label"
+elif [[ -f "{state_dir}/cur_label" ]]; then
+    cat "{state_dir}/cur_label"
+    printf '\\n'
+else
+    printf 'armbi_root\\n'
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "e2fsck",
+            f"""#!/usr/bin/env bash
+printf 'e2fsck %s\\n' "$*" >> "{ops_log}"
+if [[ "$*" == *"-pf"* ]]; then
+    touch "{state_dir}/fsck_clean"
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "tune2fs",
+            f"""#!/usr/bin/env bash
+if [[ "${{1:-}}" == "-l" ]]; then
+    dev="${{2:-}}"
+    if [[ "$dev" == "{mmc1p1}" ]]; then
+        printf 'Filesystem magic number:  0xEF53\\nFilesystem volume name:   armbi_boot\\nBlock count:              32768\\nBlock size:               4096\\nFilesystem features:      has_journal metadata_csum\\n'
+    else
+        printf 'Filesystem magic number:  0xEF53\\nFilesystem volume name:   armbi_root\\nBlock count:              1048576\\nBlock size:               4096\\nFilesystem features:      has_journal metadata_csum\\n'
+    fi
+    exit 0
+fi
+printf 'tune2fs %s\\n' "$*" >> "{ops_log}"
+if [[ "${{1:-}}" == "-U" ]]; then
+    if [[ "$(cat "{state_dir}/fail_tune2fs")" == "1" ]]; then
+        exit 1
+    fi
+    if [[ ! -f "{state_dir}/fsck_clean" ]]; then
+        echo "Please run e2fsck -f first." >&2
+        exit 1
+    fi
+fi
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "mountpoint",
+            f"""#!/usr/bin/env bash
+tgt="${{@: -1}}"
+[[ -f "{mnt_map}/boot.tgt" && "$(cat "{mnt_map}/boot.tgt")" == "$tgt" ]] && exit 0
+[[ -f "{mnt_map}/root.tgt" && "$(cat "{mnt_map}/root.tgt")" == "$tgt" ]] && exit 0
+exit 1
+""",
+        )
+        _write_exe(
+            bin_dir / "mount",
+            f"""#!/usr/bin/env bash
+src="$1"; tgt="$2"
+printf 'mount %s %s\\n' "$src" "$tgt" >> "{ops_log}"
+if [[ "$src" == "{mmc1p2}" ]]; then
+    rm -f "{state_dir}/fsck_clean"
+    cp -a "{root_backing}/." "$tgt/"
+    printf '%s' "$tgt" > "{mnt_map}/root.tgt"
+    exit 0
+elif [[ "$src" == "{mmc1p1}" ]]; then
+    if [[ "$(cat "{state_dir}/fail_boot_mount")" == "1" ]]; then
+        exit 32
+    fi
+    cp -a "{boot_backing}/." "$tgt/"
+    printf '%s' "$tgt" > "{mnt_map}/boot.tgt"
+    exit 0
+fi
+exit 1
+""",
+        )
+        _write_exe(
+            bin_dir / "umount",
+            f"""#!/usr/bin/env bash
+tgt="${{@: -1}}"
+printf 'umount %s\\n' "$tgt" >> "{ops_log}"
+if [[ -f "{mnt_map}/boot.tgt" && "$(cat "{mnt_map}/boot.tgt")" == "$tgt" ]]; then
+    rm -rf "{boot_backing}/"*
+    cp -a "$tgt/." "{boot_backing}/"
+    rm -rf "$tgt/"*
+    rm -f "{mnt_map}/boot.tgt"
+    exit 0
+fi
+if [[ -f "{mnt_map}/root.tgt" && "$(cat "{mnt_map}/root.tgt")" == "$tgt" ]]; then
+    rm -rf "{root_backing}/"*
+    cp -a "$tgt/." "{root_backing}/"
+    rm -rf "$tgt/"*
+    rm -f "{mnt_map}/root.tgt"
+    exit 0
+fi
+exit 0
+""",
+        )
+
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        run_cmd = f"""
+set -Eeuo pipefail
+source "{REPO_ROOT}/lib/common.sh"
+source "{REPO_ROOT}/lib/storage_guard.sh"
+source "{patched_flash}"
+_rvdk_flash_postprocess_raw "Linux" "{mmc1}" "2" "rvdk_sd_root" "false" "false" "riscv64"
+"""
+
+        # 1. /boot mount failure must be fatal and perform ZERO tune2fs -U calls
+        p_boot_fail = _run_bash(run_cmd, env=env)
+        assert p_boot_fail.returncode != 0
+        assert "Failed to mount separate /boot partition" in p_boot_fail.stderr
+        ops_fail = ops_log.read_text(encoding="utf-8").splitlines()
+        assert all(not line.startswith("tune2fs -U") for line in ops_fail), ops_fail
+
+        # 2. Symlinked boot/uEnv.txt is never followed and parent-dir symlink escaping mount root aborts before tune2fs -U
+        ops_log.unlink()
+        (state_dir / "fail_boot_mount").write_text("0", encoding="utf-8")
+        outside_uenv = tmp_path / "outside_uEnv.txt"
+        outside_uenv.write_text(orig_uenv, encoding="utf-8")
+        (boot_backing / "uEnv.txt").unlink()
+        (boot_backing / "uEnv.txt").symlink_to(outside_uenv)
+        outside_ext_dir = tmp_path / "outside_extlinux"
+        outside_ext_dir.mkdir()
+        (outside_ext_dir / "extlinux.conf").write_text(orig_extlinux, encoding="utf-8")
+        shutil.rmtree(boot_backing / "boot" / "extlinux")
+        (boot_backing / "boot" / "extlinux").symlink_to(outside_ext_dir)
+        p_sym = _run_bash(run_cmd, env=env)
+        assert p_sym.returncode != 0
+        assert "Failed to update target boot configuration files" in p_sym.stderr
+        assert outside_uenv.read_text(encoding="utf-8") == orig_uenv
+        assert (outside_ext_dir / "extlinux.conf").read_text(encoding="utf-8") == orig_extlinux
+        ops_sym = ops_log.read_text(encoding="utf-8").splitlines()
+        assert all(not line.startswith("tune2fs -U") for line in ops_sym), ops_sym
+
+        # 3. tune2fs -U failure rolls back rewritten fstab, uEnv.txt, and boot/extlinux/extlinux.conf
+        ops_log.unlink()
+        (boot_backing / "uEnv.txt").unlink()
+        (boot_backing / "uEnv.txt").write_text(orig_uenv, encoding="utf-8")
+        ext_path = boot_backing / "boot" / "extlinux"
+        if ext_path.is_symlink() or ext_path.is_file():
+            ext_path.unlink()
+        elif ext_path.is_dir():
+            shutil.rmtree(ext_path)
+        ext_path.mkdir(parents=True)
+        (boot_backing / "boot" / "extlinux" / "extlinux.conf").write_text(orig_extlinux, encoding="utf-8")
+        (state_dir / "fail_tune2fs").write_text("1", encoding="utf-8")
+        p_rb = _run_bash(run_cmd, env=env)
+        assert p_rb.returncode != 0
+        assert (root_backing / "etc" / "fstab").read_text(encoding="utf-8") == orig_fstab
+        assert (boot_backing / "uEnv.txt").read_text(encoding="utf-8") == orig_uenv
+        assert (boot_backing / "boot" / "extlinux" / "extlinux.conf").read_text(encoding="utf-8") == orig_extlinux
+
+        # 4. Happy path: rewrites fstab, uEnv.txt, boot/extlinux/extlinux.conf; runs e2fsck -pf post-unmount before tune2fs -U
+        ops_log.unlink()
+        (state_dir / "fail_tune2fs").write_text("0", encoding="utf-8")
+        p_ok = _run_bash(run_cmd, env=env)
+        assert p_ok.returncode == 0, p_ok.stderr
+        assert (root_backing / "etc" / "fstab").read_text(encoding="utf-8") == f"UUID={new_uuid}\t/\text4\tdefaults\t0\t1\n"
+        assert (boot_backing / "uEnv.txt").read_text(encoding="utf-8") == f"root=UUID={new_uuid}\n"
+        assert (boot_backing / "boot" / "extlinux" / "extlinux.conf").read_text(encoding="utf-8") == f"append root=UUID={new_uuid} rw\n"
+        ops_ok = ops_log.read_text(encoding="utf-8").splitlines()
+        tune_idx = max(i for i, line in enumerate(ops_ok) if line == f"tune2fs -U {new_uuid} {mmc1p2}")
+        mount_idx = max(i for i, line in enumerate(ops_ok[:tune_idx]) if line.startswith(f"mount {mmc1p2} "))
+        umount_idx = max(i for i, line in enumerate(ops_ok[:tune_idx]) if line.startswith("umount ") and "rvdk_postflash" in line)
+        fsck_idx = max(i for i, line in enumerate(ops_ok[:tune_idx]) if line == f"e2fsck -pf {mmc1p2}")
+        assert mount_idx < umount_idx < fsck_idx < tune_idx, ops_ok
+
+    def test_esp32p4_linux_flash_sd_vfat_rejects_cp_preserve(self, tmp_path: Path) -> None:
+        dev_dir = tmp_path / "dev"
+        dev_dir.mkdir()
+        sdb = dev_dir / "sdb"
+        sdb1 = dev_dir / "sdb1"
+        sdb.write_text("", encoding="utf-8")
+        sdb1.write_text("", encoding="utf-8")
+
+        stage_dir = tmp_path / "stage_src"
+        (stage_dir / "config").mkdir(parents=True)
+        (stage_dir / "config" / "rvdk-kit.env").write_text("RVDK_BOARD=waveshare/esp32-p4-wifi6\n", encoding="utf-8")
+
+        vfat_mnt_backing = tmp_path / "vfat_mnt"
+        vfat_mnt_backing.mkdir()
+        mnt_tmp = tmp_path / "mnt_tmp"
+        mnt_tmp.mkdir()
+        cp_log = tmp_path / "cp.log"
+
+        bin_dir = tmp_path / "bin"
+        _make_linux_uname_shim(bin_dir)
+        real_cp = shutil.which("cp") or "/bin/cp"
+        _write_exe(
+            bin_dir / "cp",
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{cp_log}"
+for arg in "$@"; do
+    case "$arg" in
+        -a|-p|--archive|--preserve|--preserve=*)
+            echo "cp: failed to preserve ownership on vfat: Operation not permitted" >&2
+            exit 1
+            ;;
+    esac
+done
+# macOS BSD cp lacks --no-preserve; strip GNU-only --no-preserve=* before delegating
+args=()
+for arg in "$@"; do
+    [[ "$arg" == --no-preserve=* ]] && continue
+    args+=("$arg")
+done
+exec "{real_cp}" "${{args[@]}}"
+""",
+        )
+        _write_exe(bin_dir / "sudo", '#!/usr/bin/env bash\nexec "$@"\n')
+        _write_exe(bin_dir / "parted", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "mkfs.vfat", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "wipefs", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "partprobe", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "udevadm", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "sync", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "eject", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(bin_dir / "findmnt", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "lsblk",
+            f"""#!/usr/bin/env bash
+case "$*" in
+    *"-rn -o PATH,TYPE"*) printf '%s disk\\n%s part\\n' "{sdb}" "{sdb1}" ;;
+    *"-dn -o TYPE"*) printf 'disk\\n' ;;
+    *"-dn -o RM"*) printf '1\\n' ;;
+    *"-dn -o HOTPLUG"*) printf '1\\n' ;;
+    *"-dn -o TRAN"*) printf 'usb\\n' ;;
+    *"-b -dn -o SIZE"*) printf '32000000000\\n' ;;
+    *"-dn -o VENDOR,MODEL,SIZE"*) printf 'USB SD 32G\\n' ;;
+    *"-dn -o SIZE,MODEL"*) printf '32G USB_SD\\n' ;;
+    *"-dn -o MOUNTPOINTS"*) printf '\\n' ;;
+esac
+exit 0
+""",
+        )
+        _write_exe(bin_dir / "mount", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "umount",
+            f"""#!/usr/bin/env bash
+tgt="${{@: -1}}"
+if [[ "$tgt" == *"/rvdk_p4_sd_mnt."* && -d "$tgt" ]]; then
+    "{real_cp}" -R "$tgt/." "{vfat_mnt_backing}/"
+    rm -rf "$tgt/"*
+fi
+exit 0
+""",
+        )
+
+        rvdk_ci = _load_rvdk_ci()
+        flash_sd_src = rvdk_ci.render_standalone_script(
+            (REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "flash-sd.sh").read_text(encoding="utf-8"),
+            REPO_ROOT,
+        )
+        fake_board_dir = tmp_path / "repo" / "boards" / "waveshare" / "esp32-p4-wifi6"
+        fake_board_dir.mkdir(parents=True)
+        (tmp_path / "repo" / "bsp").symlink_to(REPO_ROOT / "bsp")
+        (tmp_path / "repo" / "lib").symlink_to(REPO_ROOT / "lib")
+        (fake_board_dir / "deeptune.sh").symlink_to(REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "deeptune.sh")
+        (fake_board_dir / "media.json").symlink_to(REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "media.json")
+        (fake_board_dir / "quirks").symlink_to(REPO_ROOT / "boards" / "waveshare" / "esp32-p4-wifi6" / "quirks")
+        patched_sd = fake_board_dir / "p4_flash_sd_linux.sh"
+        patched_sd.write_text(
+            flash_sd_src.replace('[[ -b "$arg" ]]', '[[ -e "$arg" ]]')
+            .replace('! -b "$RESOLVED_BLOCK_DEV"', '! -e "$RESOLVED_BLOCK_DEV"')
+            .replace('[[ -b "$PART_DEV" ]]', '[[ -e "$PART_DEV" ]]')
+            .replace("/tmp/rvdk_p4_sd_mnt.XXXXXX", f"{mnt_tmp}/rvdk_p4_sd_mnt.XXXXXX"),
+            encoding="utf-8",
+        )
+
+        proc = _run_bash(
+            f'bash "{patched_sd}" "{sdb}" --stage-dir "{stage_dir}" -y --noprogbar',
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        assert (vfat_mnt_backing / "config" / "rvdk-kit.env").is_file()
+        cp_calls = cp_log.read_text(encoding="utf-8").splitlines()
+        assert any("--no-preserve=mode,ownership" in c for c in cp_calls), cp_calls
+
+    def test_rv2_flash_emmc_preserves_custom_fstab_mounts_and_creates_dirs(self, tmp_path: Path) -> None:
+        dev_dir = tmp_path / "dev"
+        dev_dir.mkdir()
+        sd_root = dev_dir / "mmcblk0p1"
+        emmc_dev = dev_dir / "mmcblk2"
+        emmc_p1 = dev_dir / "mmcblk2p1"
+        for node in (sd_root, emmc_dev, emmc_p1):
+            node.write_text("", encoding="utf-8")
+
+        uboot_dir = tmp_path / "uboot"
+        uboot_dir.mkdir()
+        for fn in ("bootinfo_emmc.bin", "bootinfo_sd.bin", "FSBL.bin", "u-boot-opensbi.itb"):
+            (uboot_dir / fn).write_bytes(b"uboot")
+
+        host_fstab = tmp_path / "host_fstab"
+        host_fstab.write_text(
+            "# Host fstab\n"
+            "UUID=11111111-2222-3333-4444-555555555555\t/\text4\tdefaults\t0\t1\n"
+            "UUID=aaaa-bbbb\t/boot\text4\tdefaults\t0\t2\n"
+            "tmpfs\t/tmp\ttmpfs\tdefaults\t0\t0\n"
+            "tmpfs\t/run/user\ttmpfs\tdefaults\t0\t0\n"
+            "proc\t/proc\tproc\tdefaults\t0\t0\n"
+            "/dev/mmcblk0p2\t/mnt/sd_extra\text4\tdefaults\t0\t2\n"
+            "/swapfile\tnone\tswap\tsw\t0\t0\n"
+            "UUID=33333333-4444-5555-6666-777777777777\t/srv/data\txfs\tdefaults,noatime\t0\t2\n"
+            "UUID=44444444-5555-6666-7777-888888888888\t/var/lib/postgresql\text4\tdefaults,noatime\t0\t2\n",
+            encoding="utf-8",
+        )
+
+        emmc_backing = tmp_path / "emmc_backing"
+        emmc_backing.mkdir()
+        mnt_tmp = tmp_path / "mnt_tmp"
+        mnt_tmp.mkdir()
+
+        bin_dir = tmp_path / "bin"
+        _make_linux_uname_shim(bin_dir)
+        _write_exe(
+            bin_dir / "findmnt",
+            f'#!/usr/bin/env bash\nif [[ "$*" == *"-n -o SOURCE /"* && "$*" != *"/boot"* && "$*" != *"/usr"* && "$*" != *"/var"* && "$*" != *"/home"* && "$*" != *"/etc"* && "$*" != *"/opt"* && "$*" != *"/root"* && "$*" != *"/srv"* ]]; then printf "%s\\n" "{sd_root}"; fi\nexit 0\n',
+        )
+        _write_exe(
+            bin_dir / "lsblk",
+            f"""#!/usr/bin/env bash
+case "$*" in
+    *"-rn -o PATH,TYPE"*) printf '%s disk\\n%s part\\n' "{emmc_dev}" "{emmc_p1}" ;;
+    *"-no PKNAME"*) printf 'mmcblk0\\n' ;;
+    *"-dn -o TYPE"*) printf 'disk\\n' ;;
+    *"-b -dn -o SIZE"*) printf '16000000000\\n' ;;
+    *"-dn -o SIZE"*) printf '16G\\n' ;;
+esac
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "blkid",
+            f"""#!/usr/bin/env bash
+node="${{@: -1}}"
+if [[ "$*" == *"-s UUID -o value"* ]]; then
+    if [[ "$node" == "{sd_root}" ]]; then
+        printf '11111111-2222-3333-4444-555555555555\\n'
+    else
+        printf '22222222-3333-4444-5555-666666666666\\n'
+    fi
+elif [[ "$*" == *"-s LABEL -o value"* ]]; then
+    printf 'rvdk_emmc_root\\n'
+fi
+exit 0
+""",
+        )
+        _write_exe(bin_dir / "df", "#!/usr/bin/env bash\nprintf 'Filesystem 1M-blocks Used\\n/dev/root 8000 500\\n'\n")
+        _write_exe(bin_dir / "mountpoint", "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "mount",
+            """#!/usr/bin/env bash
+tgt="${@: -1}"
+mkdir -p "$tgt/etc" "$tgt/boot"
+exit 0
+""",
+        )
+        _write_exe(
+            bin_dir / "umount",
+            f"""#!/usr/bin/env bash
+tgt="${{@: -1}}"
+if [[ "$tgt" == *"/rvdk_rv2_emmc."* && -d "$tgt" ]]; then
+    cp -R "$tgt/." "{emmc_backing}/"
+    rm -rf "$tgt/"*
+fi
+exit 0
+""",
+        )
+        for cmd in ("partprobe", "blockdev", "udevadm", "wipefs", "parted", "dd", "mkfs.ext4", "sync", "rsync", "systemctl"):
+            _write_exe(bin_dir / cmd, "#!/usr/bin/env bash\nexit 0\n")
+        _write_exe(
+            bin_dir / "e2label",
+            f"""#!/usr/bin/env bash
+if [[ "${{#}}" -eq 1 ]]; then
+    if [[ "$1" == "{sd_root}" ]]; then
+        printf 'rvdk_sd_root\\n'
+    else
+        printf 'rvdk_emmc_root\\n'
+    fi
+fi
+exit 0
+""",
+        )
+
+        rvdk_ci = _load_rvdk_ci()
+        emmc_src = rvdk_ci.render_standalone_script(
+            (REPO_ROOT / "boards" / "orangepi" / "rv2" / "flash-emmc.sh").read_text(encoding="utf-8"),
+            REPO_ROOT,
+        )
+        emmc_patched = tmp_path / "flash_emmc_fstab.sh"
+        emmc_patched.write_text(
+            emmc_src.replace(
+                'rvdk_require_root "${BASH_SOURCE[0]:-}" ${orig_args[@]+"${orig_args[@]}"}',
+                "true",
+                1,
+            )
+            .replace('! -b "$live_root"', '! -e "$live_root"')
+            .replace('! -b "$target_dev"', '! -e "$target_dev"')
+            .replace('! -b "$emmc_part"', '! -e "$emmc_part"')
+            .replace("/usr/lib/u-boot/platform_install.sh", str(tmp_path / "no_platform_install.sh"))
+            .replace("/usr/lib/linux-u-boot-*", str(uboot_dir))
+            .replace("if [[ -f /etc/fstab ]]; then", f'if [[ -f "{host_fstab}" ]]; then')
+            .replace("' /etc/fstab)", f'\' "{host_fstab}")')
+            .replace("/tmp/rvdk_rv2_emmc.XXXXXX", f"{mnt_tmp}/rvdk_rv2_emmc.XXXXXX"),
+            encoding="utf-8",
+        )
+
+        proc = _run_bash(
+            f'bash "{emmc_patched}" --force -y "{emmc_dev}"',
+            env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout}\nstderr={proc.stderr}"
+        out_fstab = (emmc_backing / "etc" / "fstab").read_text(encoding="utf-8")
+        assert "UUID=22222222-3333-4444-5555-666666666666\t/\text4" in out_fstab
+        assert "UUID=33333333-4444-5555-6666-777777777777\t/srv/data\txfs\tdefaults,noatime\t0\t2" in out_fstab
+        assert "UUID=44444444-5555-6666-7777-888888888888\t/var/lib/postgresql\text4\tdefaults,noatime\t0\t2" in out_fstab
+        assert "/mnt/sd_extra" not in out_fstab
+        assert "/swapfile" not in out_fstab
+        assert "/run/user" not in out_fstab
+        assert "\tproc\t" not in out_fstab
+        assert "/boot" not in out_fstab
+        assert (emmc_backing / "srv" / "data").is_dir()
+        assert (emmc_backing / "var" / "lib" / "postgresql").is_dir()

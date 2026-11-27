@@ -85,7 +85,23 @@ _rvdk_apt_run_update() {
 _rvdk_apt_rewrite_stream() {
     local in_file="$1"
     local scheme="$2"
-    local cn_hosts="repo\\.huaweicloud\\.com|mirrors\\.tuna\\.tsinghua\\.edu\\.cn|mirrors\\.bfsu\\.edu\\.cn|mirrors\\.ustc\\.edu\\.cn|mirrors\\.aliyun\\.com|mirrors\\.163\\.com|mirrors\\.cloud\\.tencent\\.com|mirrors\\.sohu\\.com|mirrors\\.zju\\.edu\\.cn|mirrors\\.nju\\.edu\\.cn|mirrors\\.sjtug\\.sjtu\\.edu\\.cn|mirrors\\.shanghaitech\\.edu\\.cn|mirrors\\.hit\\.edu\\.cn|mirrors\\.lzu\\.edu\\.cn|mirrors\\.cqu\\.edu\\.cn|mirrors\\.neusoft\\.edu\\.cn|mirrors\\.xjtu\\.edu\\.cn|mirror\\.iscas\\.ac\\.cn|mirror\\.sjtu\\.edu\\.cn|mirror\\.lzu\\.edu\\.cn|cn\\.archive\\.ubuntu\\.com|hk\\.archive\\.ubuntu\\.com|ftp\\.cn\\.debian\\.org|ftp\\.hk\\.debian\\.org"
+    if ! typeset -f rvdk_cn_mirror_hosts_regex >/dev/null 2>&1; then
+        local _apt_lib_dir=""
+        if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+            _apt_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+            if [[ -f "${_apt_lib_dir}/common.sh" ]]; then
+                # shellcheck source=lib/common.sh
+                source "${_apt_lib_dir}/common.sh"
+            fi
+        fi
+    fi
+    local cn_hosts=""
+    if typeset -f rvdk_cn_mirror_hosts_regex >/dev/null 2>&1; then
+        cn_hosts="$(rvdk_cn_mirror_hosts_regex)"
+    else
+        cat "$in_file"
+        return 0
+    fi
 
     if [[ "$scheme" == "https" ]]; then
         sed -E \
